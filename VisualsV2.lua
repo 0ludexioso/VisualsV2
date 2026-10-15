@@ -296,7 +296,7 @@ end
 
 loadConfig()
 
-env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-15-inventory-audio-2"}
+env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-15-runtime-fixes-3"}
 env.VisualsV2Runtime.RegisterReset = function(callback)
     if type(callback) == "function" then table.insert(env.VisualsV2Runtime.Resetters, callback) end
 end
@@ -1361,6 +1361,7 @@ local defaultMoves = {
 }
 
 local session, generation = nil, 0
+local animationDiagnostics = {loadErrors = 0, runtimeErrors = 0}
 local updateMotion, refreshRuntime
 local function valid(s)
     return alive and runtimeAlive and enabled() and session == s and s.token == generation
@@ -1375,16 +1376,19 @@ local function restoreWeights(s)
         pcall(function() track:AdjustWeight(weight, 0.12) end)
     end
 end
-local function dropRecord(s, kind)
+local function dropRecord(s, kind, keepWeights)
     local record = s.tracks[kind]
     if not record then return end
     s.tracks[kind] = nil; record.disposed = true
     if record.loopConnection then record.loopConnection:Disconnect(); record.loopConnection = nil end
-    if s.current == record then s.current = nil; restoreWeights(s) end
+    if s.current == record then
+        s.current = nil
+        if not keepWeights then restoreWeights(s) end
+    end
     if record.track then
-        s.ownTracks[record.track] = nil
         stopTrack(record.track)
         pcall(function() record.track:Destroy() end)
+        s.ownTracks[record.track] = nil
     end
     if record.animation then pcall(function() record.animation:Destroy() end) end
 end
@@ -1393,6 +1397,9 @@ local function closeSession()
     local old = session; session = nil
     if not old then return end
     for _, connection in ipairs(old.connections) do pcall(function() connection:Disconnect() end) end
+    for _, connections in pairs(old.trackConnections or {}) do
+        for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
+    end
     restoreWeights(old)
     for kind in pairs(old.tracks) do dropRecord(old, kind) end
     if old.references then pcall(function() old.references:Destroy() end) end
@@ -1414,19 +1421,44 @@ local function movementGroup(group)
     if group == "animation1" or group == "animation2" then return nil end
     return group and aliases[group]
 end
+local function equippedToolAnimation(s, id)
+    if not id then return false end
+    -- MM2 sometimes loads a detached copy instead of the Animation below the
+    -- equipped Tool. Match its source ID so firing does not yield locomotion.
+    for _, tool in ipairs(s.character:GetChildren()) do
+        if tool:IsA("Tool") then
+            local animations = tool:FindFirstChild("Animations")
+            if animations then
+                for _, animation in ipairs(animations:GetDescendants()) do
+                    if animation:IsA("Animation") and cleanAnimationId(animation.AnimationId) == id then return true end
+                end
+            end
+        end
+    end
+    return false
+end
 local function nativeKind(s, track)
     if s.ownTracks[track] then return nil end
     local animation = track.Animation
     if not animation or animation:FindFirstAncestorOfClass("Tool") then return nil end
     local group = animationGroup(animation, s.character)
-    if group and (emoteGroups[group] or group:find("emote", 1, true)) then return nil end
+    if group and (toolGroups[group] or emoteGroups[group] or group:find("emote", 1, true)) then return nil end
     local id = cleanAnimationId(animation.AnimationId)
     if id and s.emoteIds[id] then return nil end
     local kind = movementGroup(group)
     if kind then return kind end
+    if s.nativeAnimations[animation] then return s.nativeAnimations[animation] end
     if id and s.nativeIds[id] then return s.nativeIds[id] end
-
-    return id and defaultMoves[id]
+    if id and defaultMoves[id] then return defaultMoves[id] end
+    -- Animate and avatar packages can pass detached/cloned Animation instances to
+    -- the Animator. Their names still identify locomotion even without ancestry.
+    if (not animation.Parent or group) and (track.Priority == Enum.AnimationPriority.Core
+        or track.Priority == Enum.AnimationPriority.Idle or track.Priority == Enum.AnimationPriority.Movement) then
+        local name = tostring(animation.Name or ""):lower():gsub("[%s_]", "")
+        local trackName = tostring(track.Name or ""):lower():gsub("[%s_]", "")
+        local namedKind = aliases[name] or aliases[trackName]
+        if namedKind and not equippedToolAnimation(s, id) then return namedKind end
+    end
 end
 local function isToolTrack(s, track)
     local animation = track.Animation
@@ -1436,6 +1468,7 @@ local function isToolTrack(s, track)
     if group and toolGroups[group] then return true end
     local id = cleanAnimationId(animation.AnimationId)
     if id and toolAnimationIds[id] then return true end
+    if equippedToolAnimation(s, id) then return true end
     local name = (tostring(track.Name or "") .. " " .. tostring(animation.Name or "")):lower():gsub("[%s_]", "")
     return name:find("toolnone", 1, true) ~= nil or name:find("toolhold", 1, true) ~= nil
         or name:find("customhold", 1, true) ~= nil or name:find("scopehold", 1, true) ~= nil
@@ -1443,26 +1476,94 @@ local function isToolTrack(s, track)
 end
 local function isEmote(s, track)
     if s.ownTracks[track] or nativeKind(s, track) then return false end
-    if isToolTrack(s, track) then
-
-        return track.Priority == Enum.AnimationPriority.Core
+    local animation = track.Animation
+    if animation then
+        local group = animationGroup(animation, s.character)
+        local id = cleanAnimationId(animation.AnimationId)
+        if group and (emoteGroups[group] or group:find("emote", 1, true)) or id and s.emoteIds[id] then return true end
     end
-
+    if isToolTrack(s, track) then return false end
     return true
 end
-local function collectNativeIds(s)
-    for _, child in ipairs(s.character:GetChildren()) do
-        if child ~= s.references and child:IsA("LuaSourceContainer") then
-            for _, animation in ipairs(child:GetDescendants()) do
-                if animation:IsA("Animation") then
-                    local group = animationGroup(animation, s.character)
-                    local kind = movementGroup(group)
-                    local id = cleanAnimationId(animation.AnimationId)
-                    if id and kind then s.nativeIds[id] = kind end
+local collectNativeIds
+local function queueNativeRefresh(s)
+    if not valid(s) or s.nativeRefreshQueued then return end
+    s.nativeRefreshQueued = true
+    task.defer(function()
+        s.nativeRefreshQueued = false
+        if not valid(s) then return end
+        collectNativeIds(s)
+        updateMotion(s)
+    end)
+end
+local function rememberNativeAnimation(s, animation)
+    local group = animationGroup(animation, s.character)
+    local kind = movementGroup(group)
+    local id = cleanAnimationId(animation.AnimationId)
+    if group and (toolGroups[group] or emoteGroups[group] or group:find("emote", 1, true)) then
+        s.nativeAnimations[animation] = nil
+        if id and (emoteGroups[group] or group:find("emote", 1, true)) then s.emoteIds[id] = true end
+    elseif kind then
+        s.nativeAnimations[animation] = kind
+        if id then s.nativeIds[id] = kind end
+    end
+end
+collectNativeIds = function(s)
+    for _, animation in ipairs(s.character:GetDescendants()) do
+        if animation:IsA("Animation") and not animation:IsDescendantOf(s.references) then
+            rememberNativeAnimation(s, animation)
+            if not s.sourceWatches[animation] then
+                s.sourceWatches[animation] = true
+                local function changed()
+                    if not valid(s) then return end
+                    rememberNativeAnimation(s, animation)
+                    queueNativeRefresh(s)
                 end
+                table.insert(s.connections, animation:GetPropertyChangedSignal("AnimationId"):Connect(changed))
+                table.insert(s.connections, animation:GetPropertyChangedSignal("Name"):Connect(changed))
+                table.insert(s.connections, animation.AncestryChanged:Connect(changed))
+            end
+            local parent = animation.Parent
+            while parent and parent ~= s.character do
+                if not s.sourceWatches[parent] then
+                    s.sourceWatches[parent] = true
+                    table.insert(s.connections, parent:GetPropertyChangedSignal("Name"):Connect(function() queueNativeRefresh(s) end))
+                end
+                parent = parent.Parent
             end
         end
     end
+end
+local function suppressNativeTrack(s, track)
+    if not track.IsPlaying or not nativeKind(s, track) then return false end
+    local weight = tonumber(track.WeightTarget) or 0
+    if s.weights[track] == nil or weight > 0 then s.weights[track] = weight end
+    -- A high-priority native track also wins during a fade to zero. Remove its
+    -- weight immediately; the replacement track supplies the transition fade.
+    if weight > 0 or (tonumber(track.WeightCurrent) or 0) > 0 then track:AdjustWeight(0, 0) end
+    return true
+end
+local function watchTrack(s, track)
+    if s.ownTracks[track] or s.trackConnections[track] then return end
+    local connections = {}
+    s.trackConnections[track] = connections
+    local function changed()
+        if not valid(s) then return end
+        local current = s.current
+        if current and current.track and current.track.IsPlaying and current.track.Length > 0 then
+            suppressNativeTrack(s, track)
+        end
+        if not s.updating then updateMotion(s) end
+    end
+    table.insert(connections, track:GetPropertyChangedSignal("WeightTarget"):Connect(changed))
+    table.insert(connections, track.Stopped:Connect(function()
+        task.defer(function() if valid(s) then updateMotion(s) end end)
+    end))
+    table.insert(connections, track.Destroying:Connect(function()
+        for _, connection in ipairs(connections) do connection:Disconnect() end
+        s.trackConnections[track] = nil
+        s.weights[track] = nil
+    end))
 end
 local function playbackTargets()
     local result = {}
@@ -1521,6 +1622,8 @@ end
 local function reportLoadError(s, record)
     if not valid(s) or record.disposed or record.notified then return end
     record.notified = true
+    animationDiagnostics.loadErrors = animationDiagnostics.loadErrors + 1
+    animationDiagnostics.lastError = "Could not load " .. record.kind .. " animation " .. record.rawId
     shared.Notify("Error: Could not load the " .. record.kind .. " animation (" .. record.rawId .. "). Check its ID and animation access.", 0)
 end
 local function loadRecord(s, kind)
@@ -1536,8 +1639,9 @@ local function loadRecord(s, kind)
         if not stillCurrent() then return false end
         if record.loopConnection then record.loopConnection:Disconnect(); record.loopConnection = nil end
         if record.track then
-            s.ownTracks[record.track] = nil; stopTrack(record.track)
+            stopTrack(record.track)
             pcall(function() record.track:Destroy() end)
+            s.ownTracks[record.track] = nil
             record.track = nil
         end
         if record.animation then record.animation:Destroy() end
@@ -1625,13 +1729,6 @@ local function desiredMotion(s)
     if not s.targets[kind] then kind = kind == "run" and "walk" or "run" end
     return kind, math.clamp(speed / (kind == "walk" and 8 or 16), 0.1, 3)
 end
-local function sameMovement(native, active)
-    if active == "idle2" then return native == "idle" end
-    if active == "swim" or active == "swimidle" then return native == "swim" or native == "swimidle" end
-    if active == "walk" or active == "run" then return native == "walk" or native == "run" end
-    if active == "fall" then return native == "fall" or native == "jump" end
-    return native == active
-end
 local function motionStep(s)
     if not valid(s) or not s.ready then return end
     local playing = s.animator:GetPlayingAnimationTracks()
@@ -1646,13 +1743,12 @@ local function motionStep(s)
         restoreWeights(s); return
     end
     if s.current and s.current.kind ~= kind then
-        stopTrack(s.current.track); s.current = nil; restoreWeights(s)
+        stopTrack(s.current.track); s.current = nil
     end
     local record = loadRecord(s, kind)
-    if not record or not record.track or record.pending or record.failed then return end
+    if not record or not record.track or record.pending or record.failed then restoreWeights(s); return end
     if s.current ~= record then
         if s.current then stopTrack(s.current.track) end
-        restoreWeights(s)
         s.current = record
         record.lastJump = nil
     end
@@ -1671,14 +1767,7 @@ local function motionStep(s)
 
     local suppressed = {}
     for _, native in ipairs(playing) do
-        local nativeMotion = nativeKind(s, native)
-        if native.IsPlaying and nativeMotion and sameMovement(nativeMotion, kind) then
-            local weight = native.WeightTarget
-            if s.weights[native] == nil then s.weights[native] = weight end
-            if weight > 0 then s.weights[native] = weight end
-            native:AdjustWeight(0, 0.12)
-            suppressed[native] = true
-        end
+        if suppressNativeTrack(s, native) then suppressed[native] = true end
     end
     for native, weight in pairs(s.weights) do
         if not suppressed[native] then
@@ -1690,9 +1779,11 @@ end
 updateMotion = function(s)
     if not valid(s) or s.updating then return end
     s.updating = true
-    local ok = pcall(motionStep, s)
+    local ok, err = pcall(motionStep, s)
     s.updating = false
     if not ok then
+        animationDiagnostics.runtimeErrors = animationDiagnostics.runtimeErrors + 1
+        animationDiagnostics.lastError = tostring(err)
         if s.current then stopTrack(s.current.track); s.current = nil end
         restoreWeights(s)
     end
@@ -1704,16 +1795,21 @@ local function refreshTargets(s)
     local oldTargets = s.targets or {}
     if targets.idle ~= oldTargets.idle or targets.idle2 ~= oldTargets.idle2 then s.idleVariant = nil end
     for kind, record in pairs(s.tracks) do
-        if targets[kind] ~= record.rawId then dropRecord(s, kind) end
+        if targets[kind] ~= record.rawId then dropRecord(s, kind, true) end
     end
     s.targets = targets
+    -- Load the selected slots before the first jump/fall transition needs them.
+    -- Each loader checks this session and its target before installing a track.
+    for kind in pairs(targets) do loadRecord(s, kind) end
     updateMotion(s)
 end
 local function bindCharacter(character)
     closeSession()
     if not alive or not runtimeAlive or not enabled() or LocalPlayer.Character ~= character then return end
     local s = {character = character, token = generation, binding = true, connections = {}, tracks = {}, weights = {},
-        ownTracks = setmetatable({}, {__mode = "k"}), nativeIds = {}, emoteIds = {}, jumpCount = 0, jumpedAt = -math.huge}
+        ownTracks = setmetatable({}, {__mode = "k"}), nativeIds = {}, emoteIds = {},
+        nativeAnimations = setmetatable({}, {__mode = "k"}), sourceWatches = setmetatable({}, {__mode = "k"}),
+        trackConnections = {}, jumpCount = 0, jumpedAt = -math.huge}
     session = s
     table.insert(s.connections, character.DescendantAdded:Connect(function(child)
         if not valid(s) then return end
@@ -1746,28 +1842,45 @@ local function bindCharacter(character)
         connect(humanoid.Died, function() if session == s then closeSession() end end)
         connect(animator.AnimationPlayed, function(track)
             if s.ownTracks[track] then return end
+            watchTrack(s, track)
             updateMotion(s)
             task.defer(function() if valid(s) then updateMotion(s) end end)
         end)
         connect(character.DescendantAdded, function(child)
             if child:IsA("Animation") and not child:IsDescendantOf(s.references) then
-                local group = animationGroup(child, character)
-                local id = cleanAnimationId(child.AnimationId)
-                local kind = movementGroup(group)
-                if kind and id then s.nativeIds[id] = kind end
+                queueNativeRefresh(s)
             end
         end)
         local elapsed = 0
         connect(RunService.Heartbeat, function(dt)
+            -- Some engine-driven weight changes do not emit a property event.
+            -- Check only the few tracks we already suppressed between state scans.
+            local current = s.current
+            if current and current.track and current.track.IsPlaying and current.track.Length > 0 then
+                for native in pairs(s.weights) do
+                    if (tonumber(native.WeightTarget) or 0) > 0 or (tonumber(native.WeightCurrent) or 0) > 0 then
+                        suppressNativeTrack(s, native)
+                    end
+                end
+            end
             elapsed = elapsed + dt
             if elapsed < 0.1 then return end
             elapsed = 0
             updateMotion(s)
         end)
+        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do watchTrack(s, track) end
         refreshTargets(s)
-        task.spawn(function()
+        local function refreshDescription()
+          task.spawn(function()
             local ok, description = pcall(function() return humanoid:GetAppliedDescription() end)
             if not ok or not description or not valid(s) then return end
+            local properties = {IdleAnimation = "idle", WalkAnimation = "walk", RunAnimation = "run",
+                JumpAnimation = "jump", ClimbAnimation = "climb", FallAnimation = "fall", SwimAnimation = "swim"}
+            for property, kind in pairs(properties) do
+                local success, value = pcall(function() return description[property] end)
+                local id = success and cleanAnimationId(value)
+                if id and id ~= "" then s.nativeIds[id] = kind end
+            end
             local success, emotes = pcall(function() return description:GetEmotes() end)
             if success and type(emotes) == "table" then
                 for _, ids in pairs(emotes) do
@@ -1776,7 +1889,18 @@ local function bindCharacter(character)
                     end
                 end
             end
-        end)
+            updateMotion(s)
+          end)
+        end
+        refreshDescription()
+        local ok, applied = pcall(function() return humanoid.ApplyDescriptionFinished end)
+        if ok and applied then connect(applied, refreshDescription) end
+        local hasAppearanceEvent, appearanceEvent = pcall(function() return LocalPlayer.CharacterAppearanceLoaded end)
+        if hasAppearanceEvent and appearanceEvent then
+            connect(appearanceEvent, function(loadedCharacter)
+                if loadedCharacter == character then collectNativeIds(s); refreshDescription() end
+            end)
+        end
     end)
 end
 refreshRuntime = function()
@@ -1797,6 +1921,25 @@ RootMaid:GiveTask(LocalPlayer.CharacterRemoving:Connect(function(character)
     if session and session.character == character then closeSession() end
 end))
 RootMaid:GiveTask(closeSession)
+env.VisualsV2Runtime.FEAnimations = {GetDiagnostics = function()
+    local result = {enabled = enabled(), presetsEnabled = presetsEnabled, customEnabled = customEnabled,
+        loadErrors = animationDiagnostics.loadErrors, runtimeErrors = animationDiagnostics.runtimeErrors,
+        lastError = animationDiagnostics.lastError, ready = session and session.ready == true or false,
+        targets = {}, recognizedTracks = 0, toolTracks = 0, emoteTracks = 0, suppressedTracks = 0}
+    local s = session
+    if not s then return result end
+    result.current = s.current and s.current.kind
+    for kind, id in pairs(s.targets or {}) do result.targets[kind] = id end
+    for _ in pairs(s.weights) do result.suppressedTracks = result.suppressedTracks + 1 end
+    if s.animator then
+        for _, track in ipairs(s.animator:GetPlayingAnimationTracks()) do
+            if nativeKind(s, track) then result.recognizedTracks = result.recognizedTracks + 1
+            elseif isToolTrack(s, track) then result.toolTracks = result.toolTracks + 1
+            elseif isEmote(s, track) then result.emoteTracks = result.emoteTracks + 1 end
+        end
+    end
+    return result
+end}
 
 local presetToggle = addToggle(feAnimSection, "Enable Preset Animations", presetsEnabled, function(value)
     if not alive or not runtimeAlive then return end
@@ -11346,11 +11489,20 @@ local liveBeams={}
 local nativeSounds=setmetatable({}, {__mode="k"})
 local shotRemotes=setmetatable({}, {__mode="k"})
 local nativeAssets={Shot={},Reload={}}
+local nativeShotAnimations={}
 local vanillaAssets={Shot="10209803",Reload="4753414199"}
 local audioTransport
 local soundService=game:GetService("SoundService")
 local sharedShotRemotes=setmetatable({}, {__mode="k"})
 local shotVisual
+local externalWatches=setmetatable({}, {__mode="k"})
+local externalSources=env.VisualsV2KnownShotSources
+if type(externalSources)~="table" then
+    externalSources=setmetatable({}, {__mode="k"})
+    env.VisualsV2KnownShotSources=externalSources
+end
+local observeExternalShot
+local watchExternalSound
 local soundProperties={"SoundId","Volume","PlaybackSpeed","RollOffMinDistance","RollOffMaxDistance","RollOffMode"}
 local beamProperties={"Color","Texture","Width0","Width1","LightEmission","LightInfluence","Transparency",
     "TextureLength","TextureMode","TextureSpeed","Segments","CurveSize0","CurveSize1"}
@@ -11376,6 +11528,8 @@ for id in pairs(originals.Metadata.Gun or {}) do
             local id=behavior[key] and assetId(behavior[key].SoundId)
             if id then nativeAssets[kind][id]=true end
         end
+        local animation=behavior.animations and assetId(behavior.animations.Shoot)
+        if animation then nativeShotAnimations[animation]=true end
     end
 end
 local function behaviorFor(id)
@@ -11402,6 +11556,8 @@ local function captureHostAudio(record)
         if value==record.applied[key] and record.saved[key]~=nil then value=record.saved[key] end
         settings[key]=value
     end
+    -- ODH may retain a muted source and play a separate audible clone.
+    if kind=="Shot" and (tonumber(settings.Volume) or 0)<=0 then return end
     for _,child in ipairs(sound:GetChildren()) do
         if child:IsA("EqualizerSoundEffect") then
             settings.equalizer={Enabled=child.Enabled,LowGain=child.LowGain,MidGain=child.MidGain,
@@ -11477,6 +11633,14 @@ local function routeNativeAudio(record)
     if record.writing then return end
     local sound,state=record.sound,record.state
     captureHostAudio(record)
+    if record.external then
+        -- Centralized controllers can reuse a shared template for several players.
+        -- Intercept its local dispatch without changing the shared sound properties.
+        local id=assetId(sound.SoundId)
+        record.externalShot=not state.customShoot and id and id~=vanillaAssets.Shot
+            and not nativeAssets.Shot[id] and id or nil
+        return
+    end
     if not replacementReady(state,record.kind) then
         restoreNativeAudio(record)
         if state.customShoot then
@@ -11539,7 +11703,13 @@ local function clear(tool,preserveAudio)
     if not state then return end
     states[tool]=nil
     for _,connection in ipairs(state.connections) do connection:Disconnect() end
-    for sound,record in pairs(state.sounds) do nativeSounds[sound]=nil;restoreNativeAudio(record) end
+    for sound,record in pairs(state.sounds) do
+        nativeSounds[sound]=nil
+        local watch=externalWatches[sound]
+        if watch and watch.record==record then watch.record=nil;watch.writing=true end
+        restoreNativeAudio(record)
+        if watch then watch.writing=false end
+    end
     for remote in pairs(state.remotes) do shotRemotes[remote]=nil end
     for object,values in pairs(state.saved) do
         liveBeams[object]=nil
@@ -11551,6 +11721,7 @@ local function clear(tool,preserveAudio)
 end
 makeSound=function(state,kind,settings)
     if not settings then return end
+    local fresh=state.overlays[kind]==nil
     local sound=state.overlays[kind] or Instance.new("Sound")
     local previousId=sound.SoundId
     sound.Name="VisualsV2_"..kind.."Overlay"
@@ -11573,12 +11744,19 @@ makeSound=function(state,kind,settings)
     end
     sound.Parent=state.audioHost
     state.overlays[kind]=sound
+    if fresh and kind=="Shot" then
+        state.connections[#state.connections+1]=sound.Played:Connect(function()
+            state.overlayShotEvents=(state.overlayShotEvents or 0)+1
+        end)
+    end
     if previousId==sound.SoundId and sound.IsLoaded then return end
     task.spawn(function()
         if states[state.tool]~=state or not sound.Parent then return end
+        if kind=="Shot" then state.shotLoadAttempts=(state.shotLoadAttempts or 0)+1 end
         local ok,reason=pcall(function() game:GetService("ContentProvider"):PreloadAsync({sound}) end)
         if states[state.tool]==state and (not ok or not sound.IsLoaded) then
             state.soundError=kind.." "..sound.SoundId..": "..tostring(ok and "Asset was not loaded" or reason)
+            if kind=="Shot" then state.shotLoadFailures=(state.shotLoadFailures or 0)+1 end
         end
         if states[state.tool]==state then
             for _,record in pairs(state.sounds) do if record.kind==kind then routeNativeAudio(record) end end
@@ -11601,6 +11779,7 @@ local function confirmed(state,kind,source,authorized)
     end
     local settings=kind=="Shot" and state.behavior.shoot or state.behavior.reload
     if not settings or not replacementReady(state,kind) then return end
+    if kind=="Shot" and source and source.Volume<=0 then source=false end
     if source==nil then
         if state.evidence[kind] or now-(state.lastPlay[kind] or -math.huge)<0.12 then return end
         local token={}
@@ -11636,7 +11815,11 @@ local function confirmed(state,kind,source,authorized)
         local sound=state.overlays[kind]
         if sound and sound.Parent then
             local ok,err=pcall(function() sound.TimePosition=0;sound:Play() end)
-            if ok then state.plays[kind]=state.plays[kind]+1 else state.soundError=tostring(err) end
+            if ok then state.plays[kind]=state.plays[kind]+1
+            else
+                state.soundError=tostring(err)
+                if kind=="Shot" then state.shotPlaybackErrors=(state.shotPlaybackErrors or 0)+1 end
+            end
         end
     end)
 end
@@ -11676,6 +11859,137 @@ local function configureObject(tool,state,object)
         for _,key in ipairs(beamProperties) do write(state,object,key,state.behavior.beam[key]) end
     end
 end
+local function externalShotState(sound,controller,localPlayback)
+    if typeof(sound)~="Instance" or not sound:IsA("Sound") or owned(sound,nil)
+        or sound.Name:sub(1,10)=="VisualsV2_" then return nil end
+    if not localPlayback and sound.Parent and not sound:IsDescendantOf(soundService)
+        and not sound:IsDescendantOf(workspace) then return nil end
+    local id=assetId(sound.SoundId)
+    if id==vanillaAssets.Reload or id and nativeAssets.Reload[id]
+        or hostAudio.Reload and id==assetId(hostAudio.Reload.SoundId) then return nil end
+    local name=sound.Name:lower():gsub("[^%w]","")
+    local known=id and (id==vanillaAssets.Shot or nativeAssets.Shot[id]
+        or hostAudio.Shot and id==assetId(hostAudio.Shot.SoundId))
+    if not known and not shotNames[name] then return nil end
+    local now=os.clock()
+    -- PlayLocalSound clones storage templates; their model coordinates are not
+    -- the position of the local playback emitter.
+    local part=not (localPlayback and not sound:IsDescendantOf(workspace)) and sound.Parent or nil
+    while part and not part:IsA("BasePart") and not part:IsA("Attachment") do part=part.Parent end
+    for tool,state in pairs(states) do
+        if tool.Parent==LocalPlayer.Character and not sound:IsDescendantOf(tool) then
+            local context=math.max(state.inputAt or -math.huge,state.remoteAt or -math.huge,
+                state.animationShotAt or -math.huge,state.tracerAt or -math.huge)
+            local recent=now-context<=0.45
+            local localPart=part and part:IsDescendantOf(LocalPlayer.Character)
+            if recent or localPart then
+                local matched=true
+                if part then
+                    local ok,position=pcall(function()
+                        return part:IsA("Attachment") and part.WorldPosition or part.Position
+                    end)
+                    if not ok or not position then matched=false
+                    elseif not localPart then
+                        local distance=(position-state.handle.Position).Magnitude
+                        if distance>6 then matched=false
+                        else
+                            -- A nearby opponent's spatial gunshot must retain its own sound.
+                            for _,owner in ipairs(Players:GetPlayers()) do
+                                if owner~=LocalPlayer and owner.Character then
+                                    if part:IsDescendantOf(owner.Character) then matched=false;break end
+                                    local peer=owner.Character:FindFirstChild("Gun")
+                                    local handle=peer and peer:IsA("Tool") and peer:FindFirstChild("Handle",true)
+                                    if handle and handle:IsA("BasePart")
+                                        and (position-handle.Position).Magnitude<=distance+1 then matched=false;break end
+                                end
+                            end
+                        end
+                    end
+                end
+                if matched then
+                    return state,recent and context==state.inputAt
+                end
+            end
+        end
+    end
+end
+local function releaseExternalShot(watch,record)
+    if watch.record~=record then return end
+    watch.writing=true
+    watch.record=nil
+    if nativeSounds[record.sound]==record then nativeSounds[record.sound]=nil end
+    if record.state.sounds[record.sound]==record then record.state.sounds[record.sound]=nil end
+    restoreNativeAudio(record)
+    watch.writing=false
+end
+observeExternalShot=function(sound,controller,playing,localPlayback)
+    local watch=externalWatches[sound]
+    if watch and watch.writing then return nil end
+    if watch and watch.record and watch.record.writing then return watch.record end
+    local state,activation=externalShotState(sound,controller,localPlayback)
+    if not state then
+        if watch and watch.record then releaseExternalShot(watch,watch.record) end
+        return nil
+    end
+    if not watch then watchExternalSound(sound);watch=externalWatches[sound] end
+    if not watch then return nil end
+    externalSources[sound]=true
+    local record=watch.record
+    if record and record.state~=state then releaseExternalShot(watch,record);record=nil end
+    if not record then
+        record={sound=sound,state=state,kind="Shot",saved={},applied={},nativeId=assetId(sound.SoundId),external=true}
+        watch.record=record;state.sounds[sound]=record;nativeSounds[sound]=record
+        state.externalShotSources=(state.externalShotSources or 0)+1
+        if activation then state.activationShotMatches=(state.activationShotMatches or 0)+1 end
+        state.lastExternalShot={name=sound.Name,asset=sound.SoundId,parent=sound.Parent and sound.Parent.Name,
+            caller=controller and controller.Name}
+    end
+    routeNativeAudio(record)
+    local token={};record.expiry=token
+    task.delay(0.5,function()
+        if record.expiry==token then releaseExternalShot(watch,record) end
+    end)
+    if playing then
+        state.externalShotEvents=(state.externalShotEvents or 0)+1
+        local settings=state.behavior.shoot
+        local id=assetId(sound.SoundId)
+        if replacementReady(state,"Shot") and settings and (state.customShoot
+            or record.externalShot~=id and id and (id==vanillaAssets.Shot or nativeAssets.Shot[id]
+                or id==assetId(settings.SoundId))) then
+            pcall(function() sound:Stop() end)
+            confirmed(state,"Shot",false)
+        else confirmed(state,"Shot",sound) end
+    end
+    return record
+end
+watchExternalSound=function(sound)
+    if not sound:IsA("Sound") or owned(sound,nil) or externalWatches[sound] then return end
+    local watch={connections={}}
+    externalWatches[sound]=watch
+    local function dispose()
+        if watch.record then releaseExternalShot(watch,watch.record) end
+        externalWatches[sound]=nil
+        externalSources[sound]=nil
+        for _,connection in ipairs(watch.connections) do connection:Disconnect() end
+        table.clear(watch.connections)
+    end
+    watch.connections[#watch.connections+1]=sound.Played:Connect(function()
+        if not alive or not runtimeAlive then return end
+        local record=nativeSounds[sound]
+        if record and not record.external then return end
+        observeExternalShot(sound,nil,true)
+    end)
+    watch.connections[#watch.connections+1]=sound:GetPropertyChangedSignal("SoundId"):Connect(function()
+        if not alive or not runtimeAlive then return end
+        local record=nativeSounds[sound]
+        if record and not record.external then return end
+        observeExternalShot(sound)
+    end)
+    watch.connections[#watch.connections+1]=sound:GetPropertyChangedSignal("Parent"):Connect(function()
+        if not sound.Parent then task.defer(function() if not sound.Parent then dispose() end end) end
+    end)
+    if sound.Destroying then watch.connections[#watch.connections+1]=sound.Destroying:Connect(dispose) end
+end
 local function installAudioTransport()
     local bridge=env.VisualsV2GunAudioBridge
     if type(bridge)~="table" or bridge.version~=3 then
@@ -11705,9 +12019,11 @@ local function installAudioTransport()
         end
         local sound=method=="PlayLocalSound" and object==soundService and first or method=="Play" and object
         local record=sound and nativeSounds[sound]
-        if not record and sound and type(callingScript)=="function" then
+        local controller
+        if sound and typeof(sound)=="Instance" and sound:IsA("Sound") and type(callingScript)=="function" then
             local ok,script=pcall(callingScript)
-            if ok and script then
+            if ok then controller=script end
+            if not record and ok and script then
                 local current=script
                 local state
                 while current do
@@ -11722,13 +12038,19 @@ local function installAudioTransport()
                 end
             end
         end
+        if sound and (not record or record.external) then
+            record=observeExternalShot(sound,controller,false,method=="PlayLocalSound" and object==soundService)
+        end
         if not record or not audible(record.state,record.kind) then return end
         captureHostAudio(record)
         local state,kind=record.state,record.kind
         local settings=kind=="Shot" and state.behavior.shoot or state.behavior.reload
         state.nativeCalls[kind]=state.nativeCalls[kind]+1
+        if record.external then state.externalShotCalls=(state.externalShotCalls or 0)+1 end
         if not replacementReady(state,kind) then
-            if state.customShoot then applyNativeSettings(record,kind=="Shot" and vanillaShot or vanillaReload) end
+            if state.customShoot and not record.external then
+                applyNativeSettings(record,kind=="Shot" and vanillaShot or vanillaReload)
+            end
             return
         end
         if kind=="Reload" then
@@ -11830,7 +12152,13 @@ local function bindAnimator(state)
             local native=animations and animations:FindFirstChild(pair[1])
             local expected=native and assetId(native.AnimationId)
                 or state.behavior.animations and assetId(state.behavior.animations[pair[1]])
-            if id and id==expected then confirmed(state,pair[2]);return end
+            if id and (id==expected or pair[2]=="Shot" and nativeShotAnimations[id]) then
+                if pair[2]=="Shot" then
+                    state.animationShotAt=os.clock()
+                    state.animationShots=(state.animationShots or 0)+1
+                end
+                confirmed(state,pair[2]);return
+            end
         end
     end)
     state.connections[#state.connections+1]=state.animationConnection
@@ -12021,6 +12349,9 @@ local function bindAudioContainers()
         audioContainerConnections[#audioContainerConnections+1]=container.DescendantAdded:Connect(function(object)
             if object.Name=="Handle" or object:IsA("Animator") then scheduleAudio() end
         end)
+        if container==LocalPlayer.Character then
+            for _,object in ipairs(container:GetDescendants()) do watchExternalSound(object) end
+        end
     end
     scheduleAudio()
 end
@@ -12030,8 +12361,17 @@ connections[#connections+1]=LocalPlayer.ChildAdded:Connect(function(object)
     if object:IsA("Backpack") then bindAudioContainers() end
 end)
 bindAudioContainers()
+for sound in pairs(externalSources) do
+    if sound.Parent then watchExternalSound(sound) else externalSources[sound]=nil end
+end
+for _,object in ipairs(soundService:GetDescendants()) do watchExternalSound(object) end
+local camera=workspace.CurrentCamera
+if camera then for _,object in ipairs(camera:GetDescendants()) do watchExternalSound(object) end end
+connections[#connections+1]=soundService.DescendantAdded:Connect(watchExternalSound)
 connections[#connections+1]=workspace.DescendantAdded:Connect(function(object)
-    if not alive or not runtimeAlive or not object:IsA("Beam") then return end
+    if not alive or not runtimeAlive then return end
+    if object:IsA("Sound") then watchExternalSound(object);return end
+    if not object:IsA("Beam") then return end
     if object.Name=="VisualsV2_ShotBeam" then return end
     local active=false
     for tool,state in pairs(states) do
@@ -12089,6 +12429,11 @@ end,GetDiagnostics=function()
         hostShootObserved=hostAudio.Shot and hostAudio.Shot.SoundId,hostReloadObserved=hostAudio.Reload and hostAudio.Reload.SoundId,
         customBeam=state.behavior.beam~=nil,
         inputs=state.inputs or 0,shotPlays=state.plays.Shot,reloadPlays=state.plays.Reload,tracers=state.tracers or 0,
+        externalShotSources=state.externalShotSources or 0,externalShotCalls=state.externalShotCalls or 0,
+        externalShotEvents=state.externalShotEvents or 0,activationShotMatches=state.activationShotMatches or 0,
+        animationShots=state.animationShots or 0,lastExternalShot=state.lastExternalShot,
+        overlayShotEvents=state.overlayShotEvents or 0,shotLoadAttempts=state.shotLoadAttempts or 0,
+        shotLoadFailures=state.shotLoadFailures or 0,shotPlaybackErrors=state.shotPlaybackErrors or 0,
         remoteShots=state.remoteShots or 0,nativeShotCalls=state.nativeCalls.Shot,nativeReloadCalls=state.nativeCalls.Reload,
         suppressedReloads=state.suppressedReloads or 0,suppressReload=state.suppressReload,
         directAudioMethods=audioTransport and audioTransport.methods,
@@ -12102,6 +12447,11 @@ env.VisualsV2Runtime.RegisterReset(function()
     if not runtimeAlive then
         alive=false
         if audioTransport then audioTransport.handler=nil end
+        for sound,watch in pairs(externalWatches) do
+            if watch.record then releaseExternalShot(watch,watch.record) end
+            for _,connection in ipairs(watch.connections) do connection:Disconnect() end
+            externalWatches[sound]=nil
+        end
         for _,connection in ipairs(connections) do connection:Disconnect() end
         for _,connection in ipairs(audioContainerConnections) do connection:Disconnect() end
     end
@@ -13414,6 +13764,7 @@ local function collect()
         pets=runtime.ClientPets and runtime.ClientPets.GetDiagnostics(),
         gunCosmetics=runtime.GunCosmetics and runtime.GunCosmetics.GetDiagnostics(),
         presentation=runtime.WeaponPresentation and runtime.WeaponPresentation.GetDiagnostics(),
+        animations=runtime.FEAnimations and runtime.FEAnimations.GetDiagnostics(),
         inventoryTools=runtime.InventoryTools and runtime.InventoryTools.GetDiagnostics(),
         tools={},character={},originalDefinitions={},availableTemplates={},storageRoots={}}
     pcall(function() report.executor=identifyexecutor() end)
@@ -17457,7 +17808,9 @@ local removingCharacter=nil
 local recoveryDeadline=0
 local rescanRequested=false
 local toyAttempts={}
-local activeToyRequest=nil
+local toyRecoveryRunning=false
+local toyRecoveryToken=0
+local toyRecoveryDeadline=0
 local toyOrderDirty=true
 local orderingBackpack=false
 local originalSlotOrders=setmetatable({}, {__mode="k"})
@@ -17470,7 +17823,7 @@ local lifecycleConnections={}
 local dropdowns={}
 local refreshingDropdowns=false
 local guiRefreshToken=0
-local requestRecovery,refreshToyDropdowns
+local requestRecovery,requestToyRecovery,refreshToyDropdowns
 
 local function disconnectAll(connections)
     for _,connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
@@ -17756,6 +18109,7 @@ local function cacheReference(reference)
         requestRecovery(false)
     end)
     toyOrderDirty=true
+    if requestRecovery then requestRecovery(false) end
 end
 local function clearReferences()
     for _,connection in pairs(slotReferences) do connection:Disconnect() end
@@ -17811,11 +18165,13 @@ local function orderSelectedTools(char,backpack,token)
     return true
 end
 local function cancelToyRequests()
+    toyRecoveryToken=toyRecoveryToken+1
+    toyRecoveryRunning=false
+    toyRecoveryDeadline=0
     for _,attempt in pairs(toyAttempts) do
         if attempt.thread and type(task.cancel)=="function" then pcall(task.cancel,attempt.thread) end
     end
     table.clear(toyAttempts)
-    activeToyRequest=nil
 end
 
 local function cancelRecovery()
@@ -17834,6 +18190,95 @@ local function isCurrentRecovery(token,char)
         and (inventoryEnabled or autoGetTools)
 end
 
+local function requestSelectedTools(char,token)
+    local now=os.clock()
+    local humanoid=char:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health<=0 then return true,now+0.1 end
+    local backpack=getBackpack()
+    local folder=findToyFolder()
+    local remote=toyRemote()
+    if not backpack or not folder or not remote then return true end
+
+    local selected={}
+    for slot=1,4 do
+        local name=selectedToys[slot]
+        if name and name~="None" then selected[name]=true end
+    end
+    -- Acquired/unselected tools no longer need their outstanding coroutine.
+    -- Identity checks below fence late replies even without task.cancel.
+    for name,attempt in pairs(toyAttempts) do
+        if not selected[name] or hasSelectedTool(name,char,backpack) then
+            toyAttempts[name]=nil
+            if attempt.thread and type(task.cancel)=="function" then pcall(task.cancel,attempt.thread) end
+        end
+    end
+
+    local missing=false
+    local nextWake
+    local seen={}
+    local generation=toyRecoveryToken
+    for slot=1,4 do
+        local name=selectedToys[slot]
+        if name and name~="None" and not seen[name] then
+            seen[name]=true
+            if not hasSelectedTool(name,char,backpack) then
+                missing=true
+                local attempt=toyAttempts[name]
+                if not attempt then
+                    attempt={count=0,nextAt=0,inFlight=false}
+                    toyAttempts[name]=attempt
+                end
+                if folder:FindFirstChild(name) and not attempt.inFlight and attempt.count<6 then
+                    if now>=attempt.nextAt then
+                        attempt.count=attempt.count+1
+                        attempt.nextAt=now+math.min(3,0.35*2^(attempt.count-1))
+                        attempt.inFlight=true
+                        attempt.thread=task.spawn(function()
+                            if isCurrentRecovery(token,char) and autoGetTools
+                                and generation==toyRecoveryToken and toyAttempts[name]==attempt then
+                                pcall(function() remote:InvokeServer(name) end)
+                            end
+                            if generation~=toyRecoveryToken or toyAttempts[name]~=attempt then return end
+                            attempt.inFlight=false
+                            attempt.thread=nil
+                            -- Allow replication to settle, without adding a full
+                            -- retry delay on top of a slow server response.
+                            attempt.nextAt=math.max(attempt.nextAt,os.clock()+0.15)
+                            if isCurrentRecovery(token,char) and autoGetTools then requestToyRecovery(char,token) end
+                        end)
+                    end
+                    if not attempt.inFlight and attempt.count<6 then
+                        nextWake=math.min(nextWake or math.huge,attempt.nextAt)
+                    end
+                end
+            end
+        end
+    end
+    return missing,nextWake
+end
+
+requestToyRecovery=function(char,token)
+    if not autoGetTools or not isCurrentRecovery(token,char) then return end
+    toyRecoveryDeadline=math.max(toyRecoveryDeadline,os.clock()+20)
+    if toyRecoveryRunning then return end
+    toyRecoveryRunning=true
+    local generation=toyRecoveryToken
+    -- Defer once to coalesce Backpack/Character events during an equip move.
+    -- Acquisition runs independently of yielding capacity/GUI discovery.
+    task.defer(function()
+        while generation==toyRecoveryToken and autoGetTools and isCurrentRecovery(token,char)
+            and os.clock()<toyRecoveryDeadline do
+            local _,nextWake=requestSelectedTools(char,token)
+            if toyOrderDirty and orderSelectedTools(char,getBackpack(),token) then toyOrderDirty=false end
+            -- Replies, replication, and folder changes restart us; no polling
+            -- is needed while all outstanding calls are in flight.
+            if not nextWake then break end
+            task.wait(math.clamp(nextWake-os.clock(),0.05,0.2))
+        end
+        if generation==toyRecoveryToken then toyRecoveryRunning=false end
+    end)
+end
+
 requestRecovery=function(forceScan)
     if not alive or not runtimeAlive or not (inventoryEnabled or autoGetTools) then return end
     local char=player.Character
@@ -17843,6 +18288,8 @@ requestRecovery=function(forceScan)
         recoveryCharacter=char
     end
     if forceScan then rescanRequested=true end
+    requestToyRecovery(char,recoveryToken)
+    if not inventoryEnabled then return end
     recoveryDeadline=math.max(recoveryDeadline,os.clock()+20)
     if recoveryRunning then return end
     recoveryRunning=true
@@ -17852,8 +18299,7 @@ requestRecovery=function(forceScan)
         local scanTimes={0,1,3,6,10,15}
         local scanIndex=1
         local nextInventoryApply=0
-        local nextToyRequest=0
-        while isCurrentRecovery(token,char) and os.clock()<recoveryDeadline do
+        while isCurrentRecovery(token,char) and inventoryEnabled and os.clock()<recoveryDeadline do
             local now=os.clock()
             local humanoid=char:FindFirstChildOfClass("Humanoid")
             if humanoid and humanoid.Health>0 then
@@ -17869,53 +18315,6 @@ requestRecovery=function(forceScan)
                 if inventoryEnabled and (force or (targetsScanned and now>=nextInventoryApply)) then
                     applyInventoryLimit(force)
                     nextInventoryApply=now+1
-                end
-
-                if autoGetTools then
-                    local backpack=getBackpack()
-                    if toyOrderDirty and backpack and orderSelectedTools(char,backpack,token) then
-                        toyOrderDirty=false
-                    end
-                end
-                if autoGetTools and not activeToyRequest and now>=nextToyRequest then
-                    local backpack=getBackpack()
-                    local folder=findToyFolder()
-                    local remote=toyRemote()
-                    if backpack and folder and remote then
-                        local seen={}
-                        for slot=1,4 do
-                            local name=selectedToys[slot]
-                            if name and name~="None" and not seen[name] then
-                                seen[name]=true
-                                if not hasSelectedTool(name,char,backpack) then
-                                    local attempt=toyAttempts[name]
-                                    if not attempt then
-                                        attempt={count=0,nextAt=0,inFlight=false}
-                                        toyAttempts[name]=attempt
-                                    end
-                                    if folder:FindFirstChild(name) and not attempt.inFlight and attempt.count<6 and now>=attempt.nextAt then
-                                        attempt.count=attempt.count+1
-                                        attempt.nextAt=now+math.min(3,0.75+attempt.count*0.5)
-                                        attempt.inFlight=true
-                                        activeToyRequest=attempt
-                                        nextToyRequest=now+0.25
-                                        attempt.thread=task.spawn(function()
-                                            if isCurrentRecovery(token,char) and autoGetTools then
-                                                pcall(function() remote:InvokeServer(name) end)
-                                            end
-                                            attempt.inFlight=false
-                                            attempt.thread=nil
-                                            attempt.nextAt=math.max(attempt.nextAt,os.clock()+math.min(3,0.75+attempt.count*0.5))
-                                            if activeToyRequest==attempt then activeToyRequest=nil end
-                                            if isCurrentRecovery(token,char) and autoGetTools then requestRecovery(false) end
-                                        end)
-                                    end
-
-                                    break
-                                end
-                            end
-                        end
-                    end
                 end
             end
             task.wait(0.2)
@@ -18061,8 +18460,8 @@ local autoToggle=addToggle(section,"Auto Get Tools",autoGetTools,function(state)
     SetCfg("autoGetTools",state)
     if state then
         if not wasEnabled then cancelToyRequests() end
-        if observedGui then task.defer(function() scanSlotReferences(observedGui) end) end
         requestRecovery(false)
+        if observedGui then task.defer(function() scanSlotReferences(observedGui) end) end
     else
         cancelToyRequests()
         clearReferences()
@@ -18103,6 +18502,7 @@ lifecycleConnections[#lifecycleConnections+1]=player.CharacterAdded:Connect(func
     watchCharacter(char)
     watchBackpack(player:FindFirstChildOfClass("Backpack"))
     queueGuiRecovery(true)
+    requestRecovery(false)
 end)
 lifecycleConnections[#lifecycleConnections+1]=player.ChildAdded:Connect(function(child)
     if child:IsA("Backpack") then
