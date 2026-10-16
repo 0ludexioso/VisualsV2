@@ -204,27 +204,22 @@ local function addToggle(section, name, defaultValue, callback)
     local state = false
     local rawToggle
     local constructing=true
-    local applied=false
 
     rawToggle = section:AddToggle(name, function(newState)
         state = not not newState
-        if not constructing and (runtimeAlive or not state) then applied=true;callback(state) end
+        if not constructing and (runtimeAlive or not state) then callback(state) end
     end)
     constructing=false
 
     local controller = {}
     function controller:Set(newState)
         newState = not not newState
-        if newState == state then
-            if not applied and runtimeAlive then applied=true;callback(newState) end
-            return
-        end
+        if newState == state then return end
 
         silentControl(rawToggle)
         if state ~= newState then silentControl(rawToggle) end
         if state ~= newState then
             state = newState
-            applied=true
             callback(newState)
         end
     end
@@ -318,22 +313,7 @@ end
 
 loadConfig()
 
-env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-16-native-capacity-8"}
--- Bound continuous particle work on local clones when several cosmetics are on.
-env.VisualsV2Runtime.LimitCosmeticParticles=function(emitters,rateBudget,liveBudget)
-    local rate,live=0,0
-    for _,emitter in ipairs(emitters) do
-        if emitter.Enabled then
-            rate=rate+emitter.Rate
-            live=live+emitter.Rate*math.max(0,emitter.Lifetime.Max)
-        end
-    end
-    local scale=math.min(1,rate>0 and rateBudget/rate or 1,live>0 and liveBudget/live or 1)
-    if scale<1 then
-        for _,emitter in ipairs(emitters) do if emitter.Enabled then emitter.Rate=emitter.Rate*scale end end
-    end
-    return scale
-end
+env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-16-skins-2"}
 env.VisualsV2Runtime.RegisterReset = function(callback)
     if type(callback) == "function" then table.insert(env.VisualsV2Runtime.Resetters, callback) end
 end
@@ -3290,9 +3270,6 @@ local graceUntil=0
 local session=0
 local boundChar,boundHumanoid,boundAnimator=nil,nil,nil
 local resolveBindings
-local collisionParts={}
-local collisionOwners={}
-local collisionWrites=0
 
 local function dprint(...)
     if DEBUG then print("[VisualsV2 emote]",...) end
@@ -3401,12 +3378,6 @@ local function judgeTrack(track,char)
     local id=numericId(animation.AnimationId)
     if id and EXCLUDED_ANIMATION_IDS[id] then return false,"excluded id" end
     if id and locomotionIds[id] then return false,"locomotion id" end
-    if animation:FindFirstAncestorOfClass("Tool") or animation:GetAttribute("VisualsV2_ClientWeaponSkin") then
-        return false,"weapon animation"
-    end
-    local name=(tostring(track.Name).." "..animation.Name):lower():gsub("[^%w]","")
-    if name:find("scopehold",1,true) or name:find("customhold",1,true) or name:find("toolnone",1,true)
-        or name:find("toolhold",1,true) then return false,"tool hold" end
 
     local group=animateGroupName(animation,char)
     if group then
@@ -3414,16 +3385,8 @@ local function judgeTrack(track,char)
         return false,"Animate group '"..group.."'"
     end
 
-    if id and emoteIds[id] then return true,"known avatar emote id" end
-    local parent=animation.Parent
-    while parent and parent~=game do
-        local name=parent.Name:lower()
-        if parent:IsA("Folder") and (name=="emotes" or name=="ownedemotes" or name=="emoteanimations") then
-            return true,"owned emote catalog"
-        end
-        parent=parent.Parent
-    end
     if isGameOwned(animation,char) then return false,"game-owned animation" end
+    if id and emoteIds[id] then return true,"known avatar emote id" end
     if not TREAT_UNKNOWN_AS_EMOTE then return false,"unknown animation" end
 
     if not track.Looped then
@@ -3484,49 +3447,20 @@ local function emoteActive()
     return os.clock()<graceUntil
 end
 
-local function suppressCollision(part)
-    if not stepConn or not part.Parent or not part.CanCollide then return end
-    changed[part]=true;part.CanCollide=false;collisionWrites=collisionWrites+1
-end
-local function removeCollisionPart(part)
-    local connection=collisionParts[part]
-    if connection then connection:Disconnect();collisionParts[part]=nil end
-    if changed[part] then changed[part]=nil;if part.Parent then pcall(function() part.CanCollide=true end) end end
-end
-local function cacheCollisionPart(part)
-    if not part:IsA("BasePart") or collisionParts[part] then return end
-    collisionParts[part]=part:GetPropertyChangedSignal("CanCollide"):Connect(function() suppressCollision(part) end)
-    suppressCollision(part)
-end
-local function clearCollisionOwners()
-    for _,record in pairs(collisionOwners) do disconnectAll(record.connections);disconnectAll(record.characterConnections) end
-    table.clear(collisionOwners)
-    for part in pairs(collisionParts) do removeCollisionPart(part) end
-end
-local function watchCollisionOwner(owner)
-    if owner==player or collisionOwners[owner] then return end
-    local record={connections={},characterConnections={}};collisionOwners[owner]=record
-    local function bind(character)
-        disconnectAll(record.characterConnections)
-        if record.character then
-            for part in pairs(collisionParts) do if part:IsDescendantOf(record.character) then removeCollisionPart(part) end end
-        end
-        record.character=character
-        if not character then return end
-        for _,part in ipairs(character:GetDescendants()) do cacheCollisionPart(part) end
-        record.characterConnections[1]=character.DescendantAdded:Connect(cacheCollisionPart)
-        record.characterConnections[2]=character.DescendantRemoving:Connect(function(part)
-            if collisionParts[part] then removeCollisionPart(part) end
-        end)
-    end
-    record.connections[1]=owner.CharacterAdded:Connect(bind)
-    record.connections[2]=owner.CharacterRemoving:Connect(function() bind(nil) end)
-    bind(owner.Character)
-end
 local function applyStep()
-    -- Character parts are cached once and maintained by events, so opening an
-    -- emote menu never starts a per-frame character-tree scan.
-    for part in pairs(collisionParts) do suppressCollision(part) end
+    for _,other in ipairs(Players:GetPlayers()) do
+        if other~=player then
+            local character=other.Character
+            if character then
+                for _,part in ipairs(character:GetDescendants()) do
+                    if part:IsA("BasePart") and part.CanCollide then
+                        changed[part]=true
+                        part.CanCollide=false
+                    end
+                end
+            end
+        end
+    end
 end
 
 local function setCollidable(part)
@@ -3566,11 +3500,7 @@ end
 
 local function ensureProtection()
     if not noInterruptionEmote or stepConn then return end
-    local elapsed=0
-    stepConn=RunService.Heartbeat:Connect(function(dt)
-        elapsed=elapsed+dt
-        if elapsed>=0.1 then elapsed=0;onStepped() end
-    end)
+    stepConn=RunService.Stepped:Connect(onStepped)
     dprint("anti-fling ON")
     applyStep()
 end
@@ -3669,7 +3599,6 @@ local function teardown()
     clearEmotes()
     boundChar,boundHumanoid,boundAnimator=nil,nil,nil
     stopProtection()
-    clearCollisionOwners()
 end
 
 setupAutomaticEmoteProtection=function(char)
@@ -3678,17 +3607,6 @@ setupAutomaticEmoteProtection=function(char)
 
     local mySession=session
     boundChar=char
-    for _,owner in ipairs(Players:GetPlayers()) do watchCollisionOwner(owner) end
-    charConns[#charConns+1]=Players.PlayerAdded:Connect(watchCollisionOwner)
-    charConns[#charConns+1]=Players.PlayerRemoving:Connect(function(owner)
-        local record=collisionOwners[owner]
-        if not record then return end
-        disconnectAll(record.connections);disconnectAll(record.characterConnections)
-        if record.character then
-            for part in pairs(collisionParts) do if part:IsDescendantOf(record.character) then removeCollisionPart(part) end end
-        end
-        collisionOwners[owner]=nil
-    end)
 
     local function alive()
         return noInterruptionEmote
@@ -3737,11 +3655,6 @@ setupAutomaticEmoteProtection=function(char)
         end
     end)
 end
-
-env.VisualsV2Runtime.EmoteProtection={IsActive=emoteActive,GetDiagnostics=function()
-    local count=0;for _ in pairs(collisionParts) do count=count+1 end
-    return {enabled=noInterruptionEmote,active=emoteActive(),cachedParts=count,collisionWrites=collisionWrites}
-end}
 
 local noInterruptionToggle=addToggle(
     characterSection,
@@ -4691,14 +4604,8 @@ local buttonPos=loadStoredPosition("shootMurdButtonPosition",DEFAULT_POS)
 
 local resetShootMurdererPosition
 local ourClickCallbacks=setmetatable({}, {__mode="k"})
-local identifiedButtons=setmetatable({}, {__mode="k"})
-local discoveryConnections={}
-local cachedIdentity,cachedScreen,cachedShootButton
-local nextRootScan,nextButtonScan=0,0
-local lastInput
-local lookupStats={rootScans=0,buttonScans=0,dispatches=0}
 
-local function normalize(value) return tostring(value or ""):gsub("<[^>]->",""):lower():gsub("[^%w]","") end
+local function normalize(value) return tostring(value or ""):lower():gsub("%s+","") end
 local function roots()
     local result,seen={},{}
     local function add(root)
@@ -4706,98 +4613,32 @@ local function roots()
     end
     pcall(function() add(game:GetService("CoreGui")) end)
     if type(gethui)=="function" then local ok,r=pcall(gethui); if ok then add(r) end end
+    pcall(function() add(player:FindFirstChildOfClass("PlayerGui")) end)
     return result
 end
-local function identityScreen(identity)
-    if not identity or identity.Name~="Identity" or not identity:IsA("CanvasGroup") then return end
-    local imageLabel=identity.Parent
-    local canvasGroup=imageLabel and imageLabel.Parent
-    local screenGui=canvasGroup and canvasGroup.Parent
-    if imageLabel and imageLabel:IsA("ImageLabel") and canvasGroup and canvasGroup:IsA("CanvasGroup")
-        and screenGui and screenGui:IsA("ScreenGui") and screenGui.Parent then return screenGui end
+local function isTarget(item)
+    if not item or not item:IsA("TextButton") then return false end
+    if normalize(item.Text):find("shootmurderer",1,true) then return true end
+    local label=item:FindFirstChildWhichIsA("TextLabel",true)
+    if label and normalize(label.Text):find("shootmurderer",1,true) then return true end
+    return item:GetAttribute("ShootMurderButton")==true
 end
-local function getofhui()
-    local screen=identityScreen(cachedIdentity)
-    if screen and screen==cachedScreen then return screen end
-    cachedIdentity=nil;cachedScreen=nil;cachedShootButton=nil
-    if os.clock()<nextRootScan then return end
-    nextRootScan=os.clock()+1
-    lookupStats.rootScans=lookupStats.rootScans+1
+local function findButton()
     for _,root in ipairs(roots()) do
         local ok,desc=pcall(function() return root:GetDescendants() end)
         if ok then
             for _,item in ipairs(desc) do
-                screen=identityScreen(item)
-                if screen then
-                    cachedIdentity=item;cachedScreen=screen;nextButtonScan=0
-                    return screen
-                end
+                if isTarget(item) then item:SetAttribute("ShootMurderButton",true); return item end
             end
         end
     end
-end
-local function exactShootText(value)
-    local text=normalize(value)
-    return text=="shootmurderer" or text=="shootmurdurer"
-end
-local function isTarget(item)
-    if not item or not item:IsA("GuiButton") then return false end
-    if identifiedButtons[item] then return true end
-    if item:IsA("TextButton") and exactShootText(item.Text) then return true end
-    local pending={{item,0}}
-    local index=1
-    while pending[index] and index<=32 do
-        local object,depth=pending[index][1],pending[index][2];index=index+1
-        if depth>0 and object:IsA("TextLabel") and exactShootText(object.Text) then return true end
-        if depth<3 then
-            for _,child in ipairs(object:GetChildren()) do
-                if #pending>=32 then break end
-                pending[#pending+1]={child,depth+1}
-            end
-        end
-    end
-    -- Only trust a button identified in this run; an old marker may have been
-    -- placed on an add-on setting by the former substring search.
-    return identifiedButtons[item]==true
-end
-local function shown(item,screen)
-    local current=item
-    while current and current~=screen do
-        if current:IsA("GuiObject") and not current.Visible then return false end
-        current=current.Parent
-    end
-    return current==screen and screen.Enabled
-end
-local function findButton()
-    local screen=getofhui()
-    if not screen then return nil,"ODH's interface has not been found yet",true end
-    local target=cachedShootButton
-    if target and target.Parent and target:IsDescendantOf(screen) and isTarget(target) and shown(target,screen) then
-        return target
-    end
-    cachedShootButton=nil;target=nil
-    if os.clock()<nextButtonScan then return nil,"Enable ODH's Shoot Murderer button first",true end
-    nextButtonScan=os.clock()+0.35
-    lookupStats.buttonScans=lookupStats.buttonScans+1
-    for _,item in ipairs(screen:GetDescendants()) do
-        if isTarget(item) and shown(item,screen) then
-            if target and target~=item then return nil,"More than one ODH Shoot Murderer button matches",false end
-            target=item
-        end
-    end
-    if target then
-        identifiedButtons[target]=true;cachedShootButton=target
-        target:SetAttribute("ShootMurderButton",true)
-        return target
-    end
-    return nil,"Enable ODH's Shoot Murderer button first",true
 end
 local function getTextTarget(btn)
     if not btn then return nil,nil end
-    if btn:IsA("TextButton") and tostring(btn.Text or "")~="" then return btn,btn.Text end
+    if tostring(btn.Text or "")~="" then return btn,btn.Text end
     local label=btn:FindFirstChildWhichIsA("TextLabel",true)
     if label then return label,label.Text end
-    return nil,"Shoot Murderer"
+    return btn,"Shoot Murderer"
 end
 local function stopKeeper()
     if gunConn then gunConn:Disconnect(); gunConn=nil end
@@ -4934,57 +4775,35 @@ resetShootMurdererPosition=function()
 end
 env.VisualsV2ResetShootMurdererPosition=resetShootMurdererPosition
 env.VisualsV2Runtime.ODHShootMurderer=function()
-    if not runtimeAlive then return false,"The add-on is no longer active",false end
-    local target,reason,retry=findButton()
-    if not target then return false,reason,retry end
-    local fire=firesignal or env.firesignal
-    if type(fire)~="function" then return false,"This executor does not provide firesignal",false end
-    if target~=button then bind(target) end
-    local chosen=target.MouseButton1Click
-    local eventName="MouseButton1Click"
+    local target=button and button.Parent and button or findButton()
+    if not target then return false,"Enable ODH's Shoot Murderer button first" end
     local inspect=getconnections or env.getconnections
     if type(inspect)=="function" then
-        local found=false
-        for _,event in ipairs({{target.MouseButton1Click,"MouseButton1Click"},{target.Activated,"Activated"}}) do
-            local signal=event[1]
+        for _,signal in ipairs({target.MouseButton1Click,target.Activated}) do
             local ok,callbacks=pcall(inspect,signal)
+            local fired=false
             if ok and type(callbacks)=="table" then
                 for _,connection in ipairs(callbacks) do
                     local readable,callback,enabled=pcall(function() return connection.Function,connection.Enabled end)
-                    if readable and enabled~=false and not ourClickCallbacks[callback] then
-                        chosen=signal;eventName=event[2];found=true;break
+                    if readable and type(callback)=="function" and not ourClickCallbacks[callback]
+                        and enabled~=false then
+                        task.spawn(callback)
+                        fired=true
                     end
                 end
             end
-            if found then break end
+            if fired then return true end
         end
-        -- Some executors cannot enumerate another script's connections. An
-        -- empty list must not block the firesignal route requested here.
-        lookupStats.callbackObserved=found
+        return false,"ODH's Shoot Murderer callback is not available yet"
     end
-    -- Dispatch one native event, never both click and activation. ODH owns the
-    -- target, prediction and shot checks; dispatch success is not a confirmed hit.
-    local ok,err
-    if eventName=="Activated" then ok,err=pcall(fire,chosen,lastInput,1)
-    else ok,err=pcall(fire,chosen) end
-    if not ok then lookupStats.error=tostring(err);return false,"ODH button click failed: "..tostring(err),false end
-    lookupStats.dispatches=lookupStats.dispatches+1;lookupStats.event=eventName;lookupStats.error=nil
-    return true
+    local fire=firesignal or env.firesignal
+    if type(fire)=="function" then return pcall(fire,target.MouseButton1Click) end
+    return false,"This executor cannot activate ODH's Shoot Murderer button"
 end
-env.VisualsV2Runtime.ODHShootBridge={GetDiagnostics=function()
-    local report=table.clone(lookupStats)
-    report.interfaceCached=identityScreen(cachedIdentity)==cachedScreen and cachedScreen~=nil
-    report.buttonCached=cachedShootButton~=nil and cachedShootButton.Parent~=nil
-    if report.buttonCached then report.buttonPath=cachedShootButton:GetFullName() end
-    return report
-end}
 
 local customToggle=addToggle(section,"Enable Button Customization",customEnabled,function(v)
     customEnabled=v; SetCfg("shootCustomizationEnabled",v)
-    if v then
-        local found=findButton();if found then bind(found) end
-        update()
-    else restoreOriginal(); dragging=false; dragInput=nil; stopKeeper() end
+    if v then update() else restoreOriginal(); dragging=false; dragInput=nil; stopKeeper() end
 end)
 section:AddSlider("Button Width",40,300,buttonWidth,function(v) buttonWidth=v; SetCfg("shootButtonWidth",v); update() end)
 section:AddSlider("Button Height",20,150,buttonHeight,function(v) buttonHeight=v; SetCfg("shootButtonHeight",v); update() end)
@@ -4997,27 +4816,12 @@ local textToggle=addToggle(section,"Hide Button Text",hideText,function(v)
 end)
 section:AddButton("Reset Shoot Murderer Button Position",resetShootMurdererPosition)
 
-discoveryConnections[#discoveryConnections+1]=UserInputService.InputBegan:Connect(function(input) lastInput=input end)
-local discoveryQueued=false
-local function discoverLater()
-    if discoveryQueued or not runtimeAlive or not customEnabled then return end
-    discoveryQueued=true
-    task.delay(0.15,function()
-        discoveryQueued=false
-        if not runtimeAlive or not customEnabled then return end
-        local found=findButton();if found then bind(found) end
-    end)
-end
 task.defer(function()
     task.wait(0.5)
-    if not runtimeAlive then return end
-    if customEnabled then local found=findButton(); if found then bind(found) end end
+    local found=findButton(); if found then bind(found) end
     for _,root in ipairs(roots()) do
         pcall(function()
-            discoveryConnections[#discoveryConnections+1]=root.DescendantAdded:Connect(function(item)
-                if not runtimeAlive or not customEnabled then return end
-                if item.Name=="Identity" or (item:IsA("TextButton") or item:IsA("TextLabel")) and exactShootText(item.Text) then discoverLater() end
-            end)
+            root.DescendantAdded:Connect(function(item) if isTarget(item) then task.defer(function() bind(item) end) end end)
         end)
     end
 end)
@@ -5027,12 +4831,6 @@ env.VisualsV2Runtime.RegisterReset(function()
     customEnabled=false; keepGun=false; allowDrag=false; hideText=false
     buttonWidth=100; buttonHeight=40; buttonPos=UDim2.new(0.5,0,0.5,0)
     stopKeeper(); restoreOriginal()
-    if not runtimeAlive then
-        clearConnections()
-        for _,connection in ipairs(discoveryConnections) do pcall(function() connection:Disconnect() end) end
-        table.clear(discoveryConnections)
-        cachedIdentity=nil;cachedScreen=nil;cachedShootButton=nil;lastInput=nil
-    end
 end)
 end)()
 
@@ -5774,8 +5572,8 @@ if not scopeOnly then data.weapons.Gun["RedIceblaster"]=function() return {["nod
 if not scopeOnly then data.weapons.Gun["RedLuger"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Tool",["name"]="Gun",["properties"]={["Enabled"]=true,["CanBeDropped"]=false,["RequiresHandle"]=true,["TextureId"]="http://www.roblox.com/Thumbs/Asset.ashx?format=png&width=250&height=250&assetId=332044583",["Grip"]={["v"]={0,-0.206,0.5,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}},["attributes"]={["ItemName"]="Red Luger",["ItemType"]="Gun",["Event"]="Christmas",["IsWeapon"]=true,["Image"]="http://www.roblox.com/Thumbs/Asset.ashx?format=png&width=250&height=250&assetId=332044583",["ItemID"]="RedLuger",["Year"]="2015",["Rarity"]="Godly",["IsGun"]=true}},{["nodeId"]=1,["parentId"]=0,["class"]="Part",["name"]="Handle",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0,0.56078434,0.61176473},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.Plastic",["Size"]={["v"]={0.51000047,1.18000245,1.34999704},["type"]="Vector3"}}},{["nodeId"]=5,["parentId"]=0,["class"]="Folder",["name"]="Sounds",["properties"]={}},{["nodeId"]=6,["parentId"]=0,["class"]="Folder",["name"]="Animations",["properties"]={}},{["nodeId"]=7,["parentId"]=1,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,0.2,0.30000001},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={1.79999995,1.79999995,1.79999995},["type"]="Vector3"},["MeshId"]="http://www.roblox.com/asset/?id=95356090",["TextureId"]="http://www.roblox.com/asset/?id=126534866"}},{["nodeId"]=8,["parentId"]=1,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["v"]={0.15,0.03835,0.33321,1,0,0,0,0,1,0,-1,0},["type"]="CFrame"}}},{["nodeId"]=9,["parentId"]=1,["class"]="Sound",["name"]="Gunshot",["properties"]={["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1,["RollOffMaxDistance"]=10000,["Volume"]=0.69999999,["SoundId"]="http://www.roblox.com/asset/?id=10209803",["RollOffMinDistance"]=10}},{["nodeId"]=10,["parentId"]=1,["class"]="Sound",["name"]="Reload",["properties"]={["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1,["RollOffMaxDistance"]=10000,["Volume"]=1,["SoundId"]="rbxassetid://4753414199",["RollOffMinDistance"]=10}},{["nodeId"]=13,["parentId"]=6,["class"]="Animation",["name"]="Shoot",["properties"]={["AnimationId"]="rbxassetid://124281955370937"}},{["nodeId"]=14,["parentId"]=6,["class"]="Animation",["name"]="Reload",["properties"]={["AnimationId"]="rbxassetid://127786188145385"}}},["anchor"]=1} end end
 if not scopeOnly then data.weapons.Gun["Ripper_G_2020"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.SmoothPlastic",["Size"]={["v"]={0.2,1.83000016,1.02999997},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,1,1},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={1.5,1.5,1.5},["type"]="Vector3"},["MeshId"]="http://www.roblox.com/asset/?id=79401392",["TextureId"]="http://www.roblox.com/asset/?id=5866373797"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
 if not scopeOnly then data.weapons.Gun["Ritual_G_2024"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.SmoothPlastic",["Size"]={["v"]={0.2,1.83000016,1.02999997},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,1,1},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={1.5,1.5,1.5},["type"]="Vector3"},["MeshId"]="http://www.roblox.com/asset/?id=79401392",["TextureId"]="rbxassetid://122499606241450"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
-if not scopeOnly then data.weapons.Gun["Sands"]=function() return {["nodes"]={{["nodeId"]=0,["name"]="GunDisplay",["class"]="MeshPart",["attributes"]={},["properties"]={["MaterialVariant"]="",["LocalTransparencyModifier"]=0,["CanCollide"]=false,["TextureID"]="",["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Massless"]=true,["Reflectance"]=0,["MeshId"]="rbxassetid://104658283027428",["Transparency"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["MeshSize"]={["v"]={10.73921585,35.7940979,50},["type"]="Vector3"},["DoubleSided"]=false,["Material"]="Enum.Material.Plastic",["Anchored"]=false,["Size"]={["v"]={0.40993273,1.36631525,1.90858018},["type"]="Vector3"}}},{["nodeId"]=1,["name"]="SurfaceAppearance",["attributes"]={},["properties"]={["MetalnessMap"]="",["NormalMap"]="",["AlphaMode"]="Enum.AlphaMode.Overlay",["RoughnessMap"]="",["ColorMap"]="rbxassetid://138720590976364"},["parentId"]=0,["class"]="SurfaceAppearance"},{["nodeId"]=2,["name"]="CustomAttachment",["attributes"]={},["properties"]={["CFrame"]={["v"]={0,0,0.0899086,1,0,0,0,0.64276332,0.76606494,0,-0.76606494,0.64276332},["type"]="CFrame"}},["parentId"]=0,["class"]="Attachment"}},["anchor"]=0} end end
-if not scopeOnly then data.weapons.Gun["SandsChroma"]=function() return {["nodes"]={{["nodeId"]=0,["name"]="GunDisplay",["class"]="MeshPart",["attributes"]={},["properties"]={["MaterialVariant"]="",["LocalTransparencyModifier"]=0,["CanCollide"]=false,["TextureID"]="",["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Massless"]=true,["Reflectance"]=0,["MeshId"]="rbxassetid://104658283027428",["Transparency"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["MeshSize"]={["v"]={10.73921585,35.7940979,50},["type"]="Vector3"},["DoubleSided"]=false,["Material"]="Enum.Material.Plastic",["Anchored"]=false,["Size"]={["v"]={0.40993273,1.36631525,1.90858018},["type"]="Vector3"}}},{["nodeId"]=1,["name"]="SurfaceAppearance",["attributes"]={},["properties"]={["MetalnessMap"]="",["NormalMap"]="",["AlphaMode"]="Enum.AlphaMode.Overlay",["RoughnessMap"]="",["ColorMap"]="rbxassetid://138720590976364"},["parentId"]=0,["class"]="SurfaceAppearance"},{["nodeId"]=2,["name"]="CustomAttachment",["attributes"]={},["properties"]={["CFrame"]={["v"]={0,0,0.0899086,1,0,0,0,0.64276332,0.76606494,0,-0.76606494,0.64276332},["type"]="CFrame"}},["parentId"]=0,["class"]="Attachment"}},["anchor"]=0} end end
+if not scopeOnly then data.weapons.Gun["Sands"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="MeshPart",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["TextureID"]="",["Transparency"]=0,["MeshId"]="rbxassetid://104658283027428",["MeshSize"]={["v"]={10.73921585,35.7940979,50},["type"]="Vector3"},["Material"]="Enum.Material.Plastic",["Size"]={["v"]={0.40993273,1.36631525,1.90858018},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SurfaceAppearance",["name"]="SurfaceAppearance",["properties"]={["MetalnessMap"]="",["NormalMap"]="",["AlphaMode"]="Enum.AlphaMode.Overlay",["RoughnessMap"]="",["ColorMap"]="rbxassetid://138720590976364"}},{["nodeId"]=2,["parentId"]=0,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["v"]={0,0,0.08991,1,0,0,0,0.64276,0.76606,0,-0.76606,0.64276},["type"]="CFrame"}}}},["anchor"]=0} end end
+if not scopeOnly then data.weapons.Gun["SandsChroma"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.Plastic",["Size"]={["v"]={0.38987333,1.10729837,1.67906415},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,1,1},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={0.03792585,0.03792585,0.03792587},["type"]="Vector3"},["MeshId"]="rbxassetid://104658283027428",["TextureId"]="rbxassetid://138720590976364"}},{["nodeId"]=2,["parentId"]=0,["class"]="Decal",["name"]="Chroma",["properties"]={["Transparency"]=0,["Color3"]={["v"]={0,0.8161214,1},["type"]="Color3"},["Face"]="Enum.NormalId.Left",["ZIndex"]=1,["Texture"]="rbxassetid://92831262223446"},["attributes"]={["StaticLayer"]="rbxassetid://18363568406",["ChromaLayer"]="rbxassetid://18335602807"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["v"]={0,-0.19216,0.08638,1,0,0,0,0.64276,0.76606,0,-0.76606,0.64276},["type"]="CFrame"}}}},["anchor"]=0} end end
 if not scopeOnly then data.weapons.Gun["Sandy_G_2024"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.SmoothPlastic",["Size"]={["v"]={0.2,1.83000016,1.02999997},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,1,1},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={1.5,1.5,1.5},["type"]="Vector3"},["MeshId"]="http://www.roblox.com/asset/?id=79401392",["TextureId"]="rbxassetid://18323743340"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
 if not scopeOnly then data.weapons.Gun["SantaGun"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.SmoothPlastic",["Size"]={["v"]={0.2,1.83000016,1.02999997},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,1,1},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={1.5,1.5,1.5},["type"]="Vector3"},["MeshId"]="http://www.roblox.com/asset/?id=79401392 ",["TextureId"]="http://www.roblox.com/asset/?id=332358305"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
 if not scopeOnly then data.weapons.Gun["Santa_G_2018"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.SmoothPlastic",["Size"]={["v"]={0.2,1.83000016,1.02999997},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,1,1},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={1.5,1.5,1.5},["type"]="Vector3"},["MeshId"]="http://www.roblox.com/asset/?id=79401392 ",["TextureId"]="rbxassetid://2669621718"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
@@ -5925,8 +5723,8 @@ if not scopeOnly then data.weapons.Knife["BaubleKnifeChroma"]=function() return 
 if not scopeOnly then data.weapons.Knife["Beach_K_2023"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="KnifeDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.Plastic",["Size"]={["v"]={0.40000001,3,0.69999999},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,1,1},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={1,1,1},["type"]="Vector3"},["MeshId"]="rbxassetid://6600901997",["TextureId"]="rbxassetid://13894391232"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
 end)()
 ;(function()
-if not scopeOnly then data.weapons.Knife["Beachy"]=function() return {["nodes"]={{["nodeId"]=0,["name"]="KnifeDisplay",["class"]="MeshPart",["attributes"]={},["properties"]={["MaterialVariant"]="",["LocalTransparencyModifier"]=0,["CanCollide"]=false,["TextureID"]="",["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Massless"]=true,["Reflectance"]=0,["MeshId"]="rbxassetid://88652423673547",["Transparency"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["MeshSize"]={["v"]={5.26934242,49.99999619,17.96671677},["type"]="Vector3"},["DoubleSided"]=false,["Material"]="Enum.Material.Plastic",["Anchored"]=false,["Size"]={["v"]={0.36935592,3.50476432,1.25938189},["type"]="Vector3"}}},{["nodeId"]=1,["name"]="SurfaceAppearance",["attributes"]={},["properties"]={["MetalnessMap"]="",["NormalMap"]="",["AlphaMode"]="Enum.AlphaMode.Overlay",["RoughnessMap"]="",["ColorMap"]="rbxassetid://128146857850145"},["parentId"]=0,["class"]="SurfaceAppearance"},{["nodeId"]=3,["name"]="Attachment",["attributes"]={},["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}},["parentId"]=0,["class"]="Attachment"}},["anchor"]=0} end end
-if not scopeOnly then data.weapons.Knife["BeachyChroma"]=function() return {["nodes"]={{["nodeId"]=0,["name"]="KnifeDisplay",["class"]="MeshPart",["attributes"]={},["properties"]={["MaterialVariant"]="",["LocalTransparencyModifier"]=0,["CanCollide"]=false,["TextureID"]="",["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Massless"]=true,["Reflectance"]=0,["MeshId"]="rbxassetid://88652423673547",["Transparency"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["MeshSize"]={["v"]={5.26934242,49.99999619,17.96671677},["type"]="Vector3"},["DoubleSided"]=false,["Material"]="Enum.Material.Plastic",["Anchored"]=false,["Size"]={["v"]={0.36935592,3.50476432,1.25938189},["type"]="Vector3"}}},{["nodeId"]=1,["name"]="SurfaceAppearance",["attributes"]={},["properties"]={["MetalnessMap"]="",["NormalMap"]="",["AlphaMode"]="Enum.AlphaMode.Overlay",["RoughnessMap"]="",["ColorMap"]="rbxassetid://128146857850145"},["parentId"]=0,["class"]="SurfaceAppearance"},{["nodeId"]=3,["name"]="Attachment",["attributes"]={},["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}},["parentId"]=0,["class"]="Attachment"}},["anchor"]=0} end end
+if not scopeOnly then data.weapons.Knife["Beachy"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="MeshPart",["name"]="KnifeDisplay",["properties"]={["Reflectance"]=0,["TextureID"]="",["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["MeshId"]="rbxassetid://88652423673547",["Transparency"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["MeshSize"]={["v"]={5.26934242,49.99999619,17.96671677},["type"]="Vector3"},["Material"]="Enum.Material.Plastic",["Size"]={["v"]={0.36935592,3.50476432,1.25938189},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SurfaceAppearance",["name"]="SurfaceAppearance",["properties"]={["MetalnessMap"]="",["NormalMap"]="",["AlphaMode"]="Enum.AlphaMode.Overlay",["RoughnessMap"]="",["ColorMap"]="rbxassetid://128146857850145"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
+if not scopeOnly then data.weapons.Knife["BeachyChroma"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="KnifeDisplay",["properties"]={["Reflectance"]=0,["Color"]={["type"]="Color3",["v"]={0.63921571,0.63529414,0.64705884}},["CFrame"]={["type"]="CFrame",["v"]={0,0,0,1,0,0,0,1,0,0,0,1}},["Transparency"]=0,["Size"]={["type"]="Vector3",["v"]={0.71875978,2.04138517,3.09547687}},["Material"]="Enum.Material.Plastic"}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["type"]="Vector3",["v"]={0,0,0}},["VertexColor"]={["type"]="Vector3",["v"]={1,1,1}},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["type"]="Vector3",["v"]={0.06991907,0.06991906,0.06991909}},["MeshId"]="rbxassetid://88652423673547",["TextureId"]="rbxassetid://128146857850145"}},{["nodeId"]=2,["parentId"]=0,["class"]="Decal",["name"]="Chroma",["properties"]={["Transparency"]=0,["Color3"]={["type"]="Color3",["v"]={0.91695935,1,0}},["Face"]="Enum.NormalId.Left",["ZIndex"]=1,["Texture"]="rbxassetid://73559105239250"},["attributes"]={["StaticLayer"]="rbxassetid://18363568406",["ChromaLayer"]="rbxassetid://18335602807"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["type"]="CFrame",["v"]={0,-0.35428,0.15926,1,0,0,0,0.998,-0.06324,0,0.06324,0.998}}}}},["anchor"]=0} end end
 if not scopeOnly then data.weapons.Knife["Bells_K_2023"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="KnifeDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.Plastic",["Size"]={["v"]={0.40000001,3,0.69999999},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,1,1},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={1,1,1},["type"]="Vector3"},["MeshId"]="rbxassetid://6600901997",["TextureId"]="rbxassetid://15382279697"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
 if not scopeOnly then data.weapons.Knife["Bio_K_2023"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="KnifeDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.Plastic",["Size"]={["v"]={0.40000001,3,0.69999999},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,1,1},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={1,1,1},["type"]="Vector3"},["MeshId"]="rbxassetid://6600901997",["TextureId"]="rbxassetid://12926766355"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
 if not scopeOnly then data.weapons.Knife["Bioblade"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="MeshPart",["name"]="KnifeDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.06666667,0.06666667,0.06666667},["type"]="Color3"},["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["TextureID"]="http://www.roblox.com/asset/?id=4751538400",["Transparency"]=0,["MeshId"]="rbxassetid://4662600017",["MeshSize"]={["v"]={4.97859287,50,16.48271179},["type"]="Vector3"},["Material"]="Enum.Material.Brick",["Size"]={["v"]={0.31063882,3.42103457,1.08775854},["type"]="Vector3"}}},{["nodeId"]=2,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
@@ -8283,48 +8081,25 @@ if not scopeOnly then
     end
 end
 
-
--- Native MM2 Raygun audio and reload behavior from the new 2026-10-16 capture.
-if not scopeOnly then
-    local mm2RaygunShot={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=1,["SoundId"]="rbxassetid://127697544541654",["equalizer"]={["Enabled"]=true,["LowGain"]=-5,["HighGain"]=0,["MidGain"]=0,["Priority"]=0}}
-    local defaultReload={SoundId="rbxassetid://4753414199",Volume=1,PlaybackSpeed=1,
-        RollOffMinDistance=10,RollOffMaxDistance=10000,StartTime=1.579}
-    for id,behavior in pairs(data.gunBehavior) do
-        if id:find("Raygun",1,true) then behavior.shoot=mm2RaygunShot end
-        if id:find("Snowcannon",1,true) or id:find("Raygun",1,true) or id:find("Icepiercer",1,true)
-            or id:find("Harvester",1,true) or id:lower():find("gingerscope",1,true) then
-            behavior.reload=table.clone(defaultReload);behavior.forceDefaultReload=true;behavior.reloadDelay=0.5
-        end
-    end
-end
-
 local gripSources={Gun={
-    SandsChroma="Sands",
     BlueHarvester="Harvester",BronzeHarvester="Harvester",SilverHarvester="Harvester",GoldHarvester="Harvester",
     ElderwoodGunBlue="ElderwoodGun",ElderwoodGunBronze="ElderwoodGun",ElderwoodGunSilver="ElderwoodGun",ElderwoodGunGold="ElderwoodGun",
     IcepiercerBronze="Icepiercer",IcepiercerSilver="Icepiercer",IcepiercerGold="Icepiercer",IcepiercerRed="Icepiercer",
     RaygunBronze="Raygun",RaygunSilver="Raygun",RaygunGold="Raygun",RaygunRed="Raygun",RaygunChroma="Raygun",
     Snowcannon="SnowcannonChroma",SnowcannonBronze="SnowcannonChroma",SnowcannonSilver="SnowcannonChroma",
     SnowcannonGold="SnowcannonChroma",SnowcannonRed="SnowcannonChroma",
-},Knife={BeachyChroma="Beachy",BlueCandy="Candy",BronzeCandy="Candy",SilverCandy="Candy",GoldCandy="Candy"}}
+},Knife={BlueCandy="Candy",BronzeCandy="Candy",SilverCandy="Candy",GoldCandy="Candy"}}
 local inheritedGrips={}
 local function weaponGrip(category,id,record)
     -- Every Harvester trophy uses the native held Harvester grip from the scan.
     if category=="Gun" and id:find("Harvester",1,true) then
         return {type="CFrame",v={0,-0.5109372138977051,0.34054040908813477,1,0,0,0,1,0,0,0,1}}
     end
-    if category=="Knife" and (id=="Beachy" or id=="BeachyChroma") then
-        return {type="CFrame",v={0,-1.05,-0.1,1,0,0,0,1,0,0,0,1}}
-    end
     if record.grip then return record.grip end
     for _,node in ipairs(record.nodes) do
         if node.class=="Tool" and node.properties.Grip then return node.properties.Grip end
     end
     local source=gripSources[category] and gripSources[category][id]
-    if not source then
-        local base=id:gsub("Chroma","")
-        if base~=id and data.weapons[category] and data.weapons[category][base] then source=base end
-    end
     if not source then return nil end
     local key=category..":"..source
     if not inheritedGrips[key] then
@@ -8370,15 +8145,7 @@ local function create(record,id,category)
                 mesh.Name="VisualsV2_CapturedMesh"
                 mesh.MeshType=Enum.MeshType.FileMesh
                 mesh.MeshId=node.properties.MeshId or ""
-                local texture=node.properties.TextureID or ""
-                if texture=="" then
-                    for _,surface in ipairs(record.nodes) do
-                        if surface.parentId==node.nodeId and surface.class=="SurfaceAppearance" then
-                            texture=surface.properties.ColorMap or texture;break
-                        end
-                    end
-                end
-                mesh.TextureId=texture
+                mesh.TextureId=node.properties.TextureID or ""
                 local size=node.properties.Size and decode(node.properties.Size) or Vector3.new(1,1,1)
                 local bounds=node.properties.MeshSize and decode(node.properties.MeshSize) or size
                 mesh.Scale=Vector3.new(size.X/math.max(bounds.X,0.000001),size.Y/math.max(bounds.Y,0.000001),size.Z/math.max(bounds.Z,0.000001))
@@ -9774,26 +9541,6 @@ local function buildTemplate(entry)
     local capturedGrip=clone:GetAttribute("VisualsV2_CapturedGrip")
     local grip=typeof(capturedGrip)=="CFrame" and capturedGrip or typeof(data.grip)=="CFrame" and data.grip or nil
     local useToolGrip=typeof(capturedGrip)=="CFrame"
-    if not useToolGrip then
-        -- Prefer a real tool with the same native item/mesh whenever it is loaded.
-        local mesh=root:FindFirstChildWhichIsA("SpecialMesh")
-        local meshId=root:IsA("MeshPart") and assetId(root.MeshId) or mesh and assetId(mesh.MeshId)
-        for _,owner in ipairs(Players:GetPlayers()) do
-            local character=owner.Character
-            local backpack=owner:FindFirstChildOfClass("Backpack")
-            local native=character and character:FindFirstChild(entry.kind) or backpack and backpack:FindFirstChild(entry.kind)
-            if native and native:IsA("Tool") then
-                local handle=visualRoot(native)
-                local nativeMesh=handle and handle:FindFirstChildWhichIsA("SpecialMesh")
-                local nativeId=handle and (handle:IsA("MeshPart") and assetId(handle.MeshId) or nativeMesh and assetId(nativeMesh.MeshId))
-                if meshId and meshId==nativeId then grip=native.Grip;useToolGrip=true;break end
-            end
-        end
-        if not useToolGrip and entry.kind=="Gun" then
-            grip=CFrame.new(0,-root.Size.Y*0.25,root.Size.Z*0.25)
-            useToolGrip=true
-        end
-    end
     local behavior=originals and originals.GetGunBehavior(entry.id)
     local scopeHold=isScope(entry) and (behavior and assetId(behavior.hold) or originalHold(clone)) or nil
     if clone:IsA("Tool") then grip=clone.Grip;useToolGrip=true end
@@ -9827,14 +9574,16 @@ local function buildTemplate(entry)
     end
     if not root:IsDescendantOf(model) then model:Destroy(); return nil,"The weapon Handle is unavailable" end
     model.PrimaryPart=root
+    local totalRate=0
     local emitters={}
     for _,object in ipairs(model:GetDescendants()) do
         if object:IsA("ParticleEmitter") and object.Enabled then
-            emitters[#emitters+1]=object
+            emitters[#emitters+1]=object;totalRate=totalRate+object.Rate
         end
     end
-    env.VisualsV2Runtime.LimitCosmeticParticles(emitters,UserInputService.TouchEnabled and 50 or 80,
-        UserInputService.TouchEnabled and 120 or 220)
+    if totalRate>80 then
+        for _,emitter in ipairs(emitters) do emitter.Rate=emitter.Rate*(80/totalRate) end
+    end
     -- A grip attachment is not a muzzle. Use a named muzzle when captured;
     -- otherwise project the recorded tool's forward axis to its visible barrel edge.
     if entry.kind=="Gun" then
@@ -10151,13 +9900,6 @@ local function updateScopeHold(tool,state,entry)
         return
     end
     local existing=state.hold
-    local emotes=env.VisualsV2Runtime.EmoteProtection
-    if existing and existing.track then
-        local paused=emotes and emotes.IsActive()
-        if paused and not existing.emotePaused then existing.track:AdjustWeight(0,0.1);existing.emotePaused=true end
-        if not paused and existing.emotePaused then existing.track:AdjustWeight(1,0.1);existing.emotePaused=false end
-        if paused then return end
-    end
     if existing and not existing.pose and existing.animator==animator and existing.skinSignature==state.applied
         and existing.track and existing.track.IsPlaying then return end
     local rig=tostring(humanoid.RigType)
@@ -10825,7 +10567,7 @@ env.VisualsV2Runtime.ClientWeaponSkins={
     end,
     GetNativeHolster=function(kind) return nativeHolster(player.Character,kind) end,
     GetDiagnostics=function()
-        local report={build="2026-10-16-ui-integration-6",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
+        local report={build="2026-10-16-skins-2",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
         for kind,settings in pairs(kinds) do
             local entry=catalog[kind][settings.selected]
             local key=entry and cacheKey(entry)
@@ -11098,7 +10840,6 @@ local function clear(tool)
     local state=states[tool]
     if not state then return end
     states[tool]=nil
-    for _,connection in ipairs(state.nativeConnections or {}) do connection:Disconnect() end
     for _,object in ipairs(state.outputs) do pcall(function() object:Destroy() end) end
     local skins=env.VisualsV2Runtime.ClientWeaponSkins
     for object,value in pairs(state.textures or {}) do
@@ -11214,12 +10955,9 @@ local function cloneVisuals(source,handle)
     end
     local mounted=pcall(mount,clone,CFrame.new())
     count=0
-    local emitters={}
     for _,object in ipairs(outputs) do
-        if object:IsA("ParticleEmitter") then emitters[#emitters+1]=object end
         if visuals[object.ClassName] then count=count+1 end
         for _,child in ipairs(object:GetDescendants()) do
-            if child:IsA("ParticleEmitter") then emitters[#emitters+1]=child end
             if visuals[child.ClassName] then count=count+1 end
         end
     end
@@ -11228,16 +10966,13 @@ local function cloneVisuals(source,handle)
         pcall(function() clone:Destroy() end)
         return nil
     end
-    env.VisualsV2Runtime.LimitCosmeticParticles(emitters,UserInputService.TouchEnabled and 30 or 60,
-        UserInputService.TouchEnabled and 75 or 150)
     return outputs
 end
 
 local function hideNative(tool,state)
-    if state.nativeDirty then
-        state.nativeDirty=false
-        for _,object in ipairs(tool:GetDescendants()) do
-            if visuals[object.ClassName] and not own(object,tool) and state.originals[object]==nil then
+    for _,object in ipairs(tool:GetDescendants()) do
+        if visuals[object.ClassName] and not own(object,tool) then
+            if state.originals[object]==nil then
                 local original=object.Enabled
                 local skins=env.VisualsV2Runtime.ClientWeaponSkins
                 if skins and skins.GetOriginalEnabled then
@@ -11246,11 +10981,8 @@ local function hideNative(tool,state)
                 end
                 state.originals[object]=original
             end
+            object.Enabled=false
         end
-    end
-    for object in pairs(state.originals) do
-        if not object.Parent then state.originals[object]=nil
-        elseif object.Enabled then object.Enabled=false end
     end
 end
 
@@ -11299,12 +11031,7 @@ local function update()
                     local info=originals and originals.GetEffectInfo(selected)
                     if not outputs and info and info.texture then outputs={} end
                     if outputs then
-                        state={id=selected,handle=handle,outputs=outputs,originals={},textures={},nativeDirty=true,nativeConnections={}}
-                        local function changed(object)
-                            if not own(object,tool) then state.nativeDirty=true end
-                        end
-                        state.nativeConnections[1]=tool.DescendantAdded:Connect(changed)
-                        state.nativeConnections[2]=tool.DescendantRemoving:Connect(changed)
+                        state={id=selected,handle=handle,outputs=outputs,originals={},textures={}}
                         if info and info.texture then
                             local target=handle.Parent and handle.Parent:GetAttribute(SKIN_MARKER) and handle.Parent or handle
                             local objects={target}
@@ -11578,15 +11305,9 @@ local lastError=nil
 local motionMode="none"
 local nativeAnchor=nil
 local petHalfHeight=.5
-local hiddenPet,hiddenPetConnection
-local nextSpawnAttempt=0
-local raycastParams,groundY
-local groundAt=-math.huge
 for id,data in pairs(originals.Metadata.Pets) do catalog[id]={id=id,name=data.name or id,data=data} end
 if not catalog[selected] then selected="None" end
 local function restoreNative()
-    if hiddenPetConnection then hiddenPetConnection:Disconnect();hiddenPetConnection=nil end
-    hiddenPet=nil
     for object,record in pairs(hidden) do pcall(function() object[record.property]=record.value end) end
     table.clear(hidden)
 end
@@ -11597,38 +11318,23 @@ local function nativePet()
 end
 local function hideNative(pet)
     if not pet then return end
-    local function cache(object)
-        local property=object:IsA("BasePart") and "LocalTransparencyModifier"
-            or (object:IsA("BillboardGui") or object:IsA("ParticleEmitter") or object:IsA("Trail")
-                or object:IsA("Beam") or object:IsA("Light")) and "Enabled"
+    local objects={pet}
+    for _,object in ipairs(pet:GetDescendants()) do objects[#objects+1]=object end
+    for _,object in ipairs(objects) do
+        local property=object:IsA("BasePart") and "LocalTransparencyModifier" or object:IsA("BillboardGui") and "Enabled"
         if property then
             if not hidden[object] then hidden[object]={property=property,value=object[property]} end
-        end
-    end
-    if hiddenPet~=pet then
-        restoreNative();hiddenPet=pet
-        cache(pet)
-        for _,object in ipairs(pet:GetDescendants()) do cache(object) end
-        hiddenPetConnection=pet.DescendantAdded:Connect(cache)
-    end
-    for object,record in pairs(hidden) do
-        if not object.Parent then hidden[object]=nil
-        else
-            local desired=1
-            if record.property=="Enabled" then desired=false end
-            if object[record.property]~=desired then object[record.property]=desired end
+            if property=="Enabled" then object[property]=false else object[property]=1 end
         end
     end
 end
 local function clear()
     if model then model:Destroy() end
     model=nil;root=nil;parts=nil;follow=nil;nativeAnchor=nil
-    velocity=Vector3.new();motionMode="none";raycastParams=nil;groundY=nil;groundAt=-math.huge
+    velocity=Vector3.new();motionMode="none"
     restoreNative()
 end
 local function spawnModel()
-    if os.clock()<nextSpawnAttempt then return false end
-    nextSpawnAttempt=os.clock()+3
     local source=originals.GetPet(selected)
     if not source then lastError="Original pet template unavailable";return false end
     model=source:Clone();model.Name="VisualsV2_ClientPet"
@@ -11638,19 +11344,15 @@ local function spawnModel()
     local origin=root.CFrame
     local bottom=0
     parts={}
-    local emitters={}
     for _,part in ipairs(model:GetDescendants()) do
-        if part:IsA("ParticleEmitter") then emitters[#emitters+1]=part end
         if part:IsA("BasePart") then
             part.Anchored=true;part.CanCollide=false;part.CanTouch=false;part.CanQuery=false
-            part.Massless=true;part.LocalTransparencyModifier=0;part.CastShadow=false
+            part.Massless=true;part.LocalTransparencyModifier=0
             local relative=origin:ToObjectSpace(part.CFrame)
             parts[#parts+1]={part=part,relative=relative}
             bottom=math.min(bottom,relative.Position.Y-part.Size.Y*.5)
         end
     end
-    env.VisualsV2Runtime.LimitCosmeticParticles(emitters,UserInputService.TouchEnabled and 30 or 60,
-        UserInputService.TouchEnabled and 75 or 150)
     petHalfHeight=math.max(.15,-bottom);lastError=nil
     return true
 end
@@ -11675,18 +11377,14 @@ local function springGoal(body,floating,dt)
     local position=body.Position or body.CFrame.Position
     local target=position+offset+Vector3.new(0,floating and 1.1+math.sin(os.clock()*2.5)*.25 or -2,0)
     if not floating then
-        if os.clock()-groundAt>=0.1 then
-            groundAt=os.clock();groundY=nil
-            pcall(function()
-                if not raycastParams then
-                    raycastParams=RaycastParams.new();raycastParams.FilterType=Enum.RaycastFilterType.Exclude
-                    raycastParams.FilterDescendantsInstances={character,model}
-                end
-                local hit=workspace:Raycast(target+Vector3.new(0,8,0),Vector3.new(0,-30,0),raycastParams)
-                if hit then groundY=hit.Position.Y+petHalfHeight end
-            end)
-        end
-        if groundY then target=Vector3.new(target.X,groundY,target.Z) end
+        pcall(function()
+            local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
+            local filters={character,model}
+            local pet=nativePet();if pet then filters[#filters+1]=pet end
+            params.FilterDescendantsInstances=filters
+            local hit=workspace:Raycast(target+Vector3.new(0,8,0),Vector3.new(0,-30,0),params)
+            if hit then target=Vector3.new(target.X,hit.Position.Y+petHalfHeight,target.Z) end
+        end)
     end
     local current=follow and follow.Position or target
     local distance=(target-current).Magnitude
@@ -11735,7 +11433,7 @@ local function update(dt)
 end
 local function refresh()
     if heartbeat then heartbeat:Disconnect();heartbeat=nil end
-    clear();character=LocalPlayer.Character;nextSpawnAttempt=0
+    clear();character=LocalPlayer.Character
     if not alive or not runtimeAlive or not enabled or selected=="None" then return end
     update(0)
     heartbeat=RunService.Heartbeat:Connect(function(dt) if alive and runtimeAlive then update(dt) end end)
@@ -11830,7 +11528,7 @@ local defaultAudio={
 local function routeNativeAudio(record)
     if record.writing then return end
     local sound,state=record.sound,record.state
-    local muted=(record.kind=="Shot" and state.audioEnabled) or (record.kind=="Reload" and state.suppressReload)
+    local muted=state.audioEnabled and (record.kind=="Shot" or state.suppressReload)
     if muted then
         record.writing=true
         if record.saved.Volume==nil then record.saved.Volume=sound.Volume end
@@ -11892,7 +11590,7 @@ local function clear(tool,preserveAudio)
     if audioTransport and not next(states) then audioTransport.handler=nil end
 end
 local function makeSound(state,kind,settings)
-    if not settings or (not state.audioEnabled and not (kind=="Reload" and state.forceDefaultReload)) then return end
+    if not state.audioEnabled or not settings then return end
     local sound=Instance.new("Sound")
     sound.Name="VisualsV2_"..kind.."Overlay"
     sound:SetAttribute("VisualsV2_GunCosmetic",true)
@@ -11934,7 +11632,7 @@ local function confirmed(state,kind,source,authorized)
         end
         state.shotAt=now
     end
-    if not state.audioEnabled and not (kind=="Reload" and state.forceDefaultReload) then return end
+    if not state.audioEnabled then return end
     local settings=kind=="Shot" and state.behavior.shoot or state.behavior.reload
     if not settings or now-(state.lastPlay[kind] or -math.huge)<SHOT_GAP then return end
     if kind=="Reload" and state.reloadCycle==(state.shotCycle or 0)
@@ -11943,8 +11641,7 @@ local function confirmed(state,kind,source,authorized)
     local token={}
     state.pending[kind]=token
     local function dispatch()
-        if states[state.tool]~=state or (not state.audioEnabled and not (kind=="Reload" and state.forceDefaultReload))
-            or state.pending[kind]~=token then return end
+        if states[state.tool]~=state or not state.audioEnabled or state.pending[kind]~=token then return end
         state.pending[kind]=nil
         local at=os.clock()
         if at-(state.lastPlay[kind] or -math.huge)<SHOT_GAP then return end
@@ -11954,7 +11651,7 @@ local function confirmed(state,kind,source,authorized)
         end
         local sound=state.overlays[kind]
         if sound and sound.Parent then
-            local ok,err=pcall(function() sound.TimePosition=tonumber(settings.StartTime) or 0;sound:Play() end)
+            local ok,err=pcall(function() sound.TimePosition=0;sound:Play() end)
             if ok then state.plays[kind]=state.plays[kind]+1 else state.soundError=tostring(err) end
         end
     end
@@ -11973,7 +11670,7 @@ local function configureObject(tool,state,object)
             routeNativeAudio(record)
             state.connections[#state.connections+1]=object.Played:Connect(function()
                 if states[tool]~=state or not audible(state,kind) then return end
-                if (kind=="Shot" and state.audioEnabled) or (kind=="Reload" and state.suppressReload) then
+                if state.audioEnabled and (kind=="Shot" or state.suppressReload) then
                     pcall(function() object:Stop() end)
                     confirmed(state,kind,false)
                 end
@@ -12016,12 +11713,6 @@ local function installAudioTransport()
                 if os.clock()-(state.remoteAt or -math.huge)>SHOT_GAP then state.shotCycle=(state.shotCycle or 0)+1 end
                 state.remoteAt=os.clock()
                 confirmed(state,"Shot")
-                if state.forceDefaultReload then
-                    local cycle=state.shotCycle or 0
-                    task.delay(state.behavior.reloadDelay or 0.5,function()
-                        if states[state.tool]==state and state.shotCycle==cycle then confirmed(state,"Reload",false,true) end
-                    end)
-                end
                 if shotVisual then shotVisual(state,object,first,...) end
             end
             return
@@ -12048,7 +11739,7 @@ local function installAudioTransport()
         if not record or not audible(record.state,record.kind) then return end
         local state,kind=record.state,record.kind
         state.nativeCalls[kind]=state.nativeCalls[kind]+1
-        if kind=="Shot" and not state.audioEnabled then return end
+        if not state.audioEnabled then return end
         if kind=="Reload" and not state.suppressReload then return end
         if kind=="Reload" then state.suppressedReloads=(state.suppressedReloads or 0)+1 end
         confirmed(state,kind,false)
@@ -12165,8 +11856,7 @@ local function update()
             if handle and handle:IsA("BasePart") then
                 local scope=id:lower():find("scope",1,true)~=nil
                 state={id=id,tool=tool,handle=handle,behavior=behavior,audioEnabled=weaponSoundsEnabled,
-                    forceDefaultReload=behavior.forceDefaultReload==true,
-                    suppressReload=behavior.forceDefaultReload==true or weaponSoundsEnabled and (scope or behavior.reload~=nil),
+                    suppressReload=weaponSoundsEnabled and (scope or behavior.reload~=nil),
                     saved={},created={},connections={},
                     sounds=setmetatable({}, {__mode="k"}),remotes={},overlays={},pending={},evidence={},lastPlay={},
                     plays={Shot=0,Reload=0},nativeCalls={Shot=0,Reload=0}}
@@ -12428,7 +12118,7 @@ end,GetDiagnostics=function()
         customReload=state.behavior.reload~=nil,weaponSoundsEnabled=state.audioEnabled,customBeam=state.behavior.beam~=nil,
         inputs=state.inputs or 0,shotPlays=state.plays.Shot,reloadPlays=state.plays.Reload,tracers=state.tracers or 0,
         remoteShots=state.remoteShots or 0,nativeShotCalls=state.nativeCalls.Shot,nativeReloadCalls=state.nativeCalls.Reload,
-        suppressedReloads=state.suppressedReloads or 0,suppressReload=state.suppressReload,forceDefaultReload=state.forceDefaultReload,
+        suppressedReloads=state.suppressedReloads or 0,suppressReload=state.suppressReload,
         directAudioMethods=audioTransport and audioTransport.methods,
         visualShots=state.visualShots or 0,audioOutsideTool=state.audioHost and state.audioHost.Parent==soundService or false,
         nativeAudioReady=audioTransport and audioTransport.ready or false,nativeAudioError=audioTransport and audioTransport.error,
@@ -12657,8 +12347,12 @@ local function bindGui()
     table.clear(hudRoots)
     playerGui=LocalPlayer:FindFirstChildOfClass("PlayerGui")
     if playerGui then hudRoots[playerGui]=true end
-    -- Tool.TextureId already feeds Roblox's backpack icons. This observer only
-    -- needs the game's HUD; traversing ODH's menu has no cosmetic purpose.
+    pcall(function() hudRoots[game:GetService("CoreGui")]=true end)
+    local getUI=gethui or env.gethui
+    if type(getUI)=="function" then
+        local ok,root=pcall(getUI)
+        if ok and typeof(root)=="Instance" then hudRoots[root]=true end
+    end
     for root in pairs(hudRoots) do
         local ok,objects=pcall(function() return root:GetDescendants() end)
         if ok then
@@ -12727,7 +12421,7 @@ local effects=env.VisualsV2Runtime.ClientKnifeEffects
 local pets=env.VisualsV2Runtime.ClientPets
 local storage=game:GetService("ReplicatedStorage")
 local mmv=game.GameId==10413186812 or game.PlaceId==93017634738276
-section:AddParagraph("Client-Sided Visuals","Weapons / Knife Effects / Pets\n\nMay be buggy.\n\nOnly enable the visuals you use to improve game performance.\n\nYou can find all visuals in your MM2/MMV inventory.")
+section:AddParagraph("Client-Sided Visuals","Weapons / Knife Effects / Pets\n\nMay be buggy.\n\nOnly enable the visuals you use to improve game performance.\n\nYou can find all visuals in your MM2 inventory.")
 local gunAudio=env.VisualsV2Runtime.GunCosmetics
 addToggle(section,"Use Weapon Shoot Sounds",gunAudio.GetSoundsEnabled(),function(value)
     gunAudio.SetSoundsEnabled(value)
@@ -12752,6 +12446,7 @@ local inventoryModule=nil
 local profile=nil
 local controls={}
 local stats={filterRuns=0,builds=0,cardsCreated=0,cardsRemoved=0,uiPolls=0,discoveries=0,publishYields=0,imagesLoaded=0}
+local loadVisibleImages
 local definitions={
     Gun={label=mmv and "Matrixscope / Voidscope" or "Guns",key=mmv and "clientScopeEnabled" or "clientGunEnabled",entries=skins.Catalog.Gun},
     Knife={label="Knives",key="clientKnifeEnabled",entries=skins.Catalog.Knife},
@@ -12779,66 +12474,16 @@ local function excludedInventory(object)
     return current~=playerGui
 end
 
-local tradeStates={}
 local function tradeRoot(object)
-    if not object:IsA("GuiObject") or object:IsA("GuiButton") then return false end
+    if not (object:IsA("GuiObject") or object:IsA("ScreenGui")) or object:IsA("GuiButton") then return false end
     local name=object.Name:lower():gsub("[^%w]","")
-    if name:find("button",1,true) or name:find("icon",1,true) or name:find("tab",1,true)
-        or name:find("request",1,true) then return false end
-    if name:match("^trade") or name:match("^trading") then return true end
-    local parent=object.Parent
-    if parent and parent:IsA("ScreenGui") and (name=="main" or name=="container" or name=="window") then
-        local screenName=parent.Name:lower():gsub("[^%w]","")
-        return screenName:match("^trade")~=nil or screenName:match("^trading")~=nil
-    end
-    return false
-end
-local function forgetTradeState(root)
-    local state=tradeStates[root]
-    if state then disconnect(state.connections);tradeStates[root]=nil end
-end
-local function activeTrade(root)
-    if not visible(root) then return false end
-    local state=tradeStates[root]
-    if not state then
-        state={localOffers={},remoteOffers={},accept={},decline={},connections={},watched={}}
-        tradeStates[root]=state
-        local pending={{root,0}}
-        local count=0
-        while #pending>0 and count<240 do
-            local entry=table.remove(pending);local object,depth=entry[1],entry[2];count=count+1
-            local name=object.Name:lower():gsub("[^%w]","")
-            if not name:find("request",1,true) and not object:GetAttribute(MARKER) then
-                local list
-                if name=="you" or name=="youritems" or name=="youroffer" or name=="yourinventory" or name=="localoffer" or name=="player1" then list=state.localOffers
-                elseif name=="them" or name=="theiritems" or name=="theiroffer" or name=="theirinventory" or name=="remoteoffer" or name=="player2" then list=state.remoteOffers
-                elseif name=="accept" or name=="acceptbutton" or name=="accepttrade" or name=="confirmtrade" then list=state.accept
-                elseif name=="decline" or name=="declinebutton" or name=="declinetrade" or name=="canceltrade" then list=state.decline end
-                if list and object:IsA("GuiObject") then
-                    list[#list+1]=object
-                    local ancestor=object
-                    for _=1,6 do
-                        if not ancestor or ancestor==root.Parent then break end
-                        if ancestor:IsA("GuiObject") and not state.watched[ancestor] then
-                            state.watched[ancestor]=true
-                            state.connections[#state.connections+1]=ancestor:GetPropertyChangedSignal("Visible"):Connect(function() if schedule then schedule() end end)
-                        end
-                        ancestor=ancestor.Parent
-                    end
-                end
-                if depth<5 then for _,child in ipairs(object:GetChildren()) do pending[#pending+1]={child,depth+1} end end
-            end
-        end
-    end
-    local function any(list) for _,object in ipairs(list) do if visible(object) then return true end end;return false end
-    -- A visible wrapper alone is not a running trade. Inspect the actual offers
-    -- or native accept/decline controls, which are hidden when the trade is closed.
-    return any(state.localOffers) and any(state.remoteOffers) or any(state.accept) and any(state.decline)
+    return name=="trade" or name=="trading" or name=="tradegui" or name=="tradinggui"
+        or name=="tradeframe" or name=="tradewindow" or name=="tradescreen"
 end
 local function inTrade()
     for object in pairs(tradeRoots) do
-        if not object.Parent then forgetTradeState(object);tradeRoots[object]=nil
-        elseif activeTrade(object) then return true end
+        if not object.Parent then tradeRoots[object]=nil
+        elseif visible(object) then return true end
     end
     return false
 end
@@ -12914,7 +12559,6 @@ local function readNativeData()
         local event=inventory and inventory:FindFirstChild(name)
         if event and event:IsA("BindableEvent") then
             connections[#connections+1]=event.Event:Connect(function()
-                if inTrade() then return end
                 for _,record in pairs(records) do record.dirty=true end
                 if schedule then schedule() end
             end)
@@ -12998,149 +12642,31 @@ local function child(object,name)
     return object and object:FindFirstChild(name)
 end
 
-local routeCategories=setmetatable({}, {__mode="k"})
-local routeTargets=setmetatable({}, {__mode="k"})
-local function categoryNames(kind)
-    if kind=="Effects" then return {"Effects","WeaponEffects","KnifeEffects","Effect"} end
-    if kind=="Pets" then return {"Pets","Pet"} end
-    return kind=="Gun" and {"Weapons","Weapon","Guns","Gun"} or {"Weapons","Weapon","Knives","Knife"}
-end
 local function categoryFor(main,kind)
-    if not main then return nil end
-    local cached=routeCategories[main]
-    local existing=cached and cached[kind]
-    if existing and existing.Parent and existing:IsDescendantOf(main) then return existing end
-    for _,name in ipairs(categoryNames(kind)) do
+    local names=kind=="Effects" and {"Effects","WeaponEffects","KnifeEffects","Effect"} or kind=="Pets" and {"Pets","Pet"} or {"Weapons"}
+    for _,name in ipairs(names) do
         local object=child(main,name)
-        if object and (object:IsA("GuiObject") or object:IsA("Folder")) then
-            cached=cached or {};routeCategories[main]=cached;cached[kind]=object;return object
-        end
+        if object then return object end
     end
     local gui=inventoryModule and inventoryModule.GUI
     local object=type(gui)=="table" and gui[(kind=="Effects" or kind=="Pets") and kind or "Weapons"]
-    if type(object)=="table" then object=object.Frame or object.Root or object.Instance end
     if typeof(object)=="Instance" and object:IsDescendantOf(main) then return object end
 end
+
 local function itemsFor(main,kind)
     local category=categoryFor(main,kind)
-    return child(category,"Items") or child(category,"ItemList")
-        or child(child(category,"Container"),"Items") or category
-end
-local function cardButton(frame)
-    local action=child(child(frame,"Container"),"ActionButton") or frame:FindFirstChild("ActionButton",true)
-    if action and action:IsA("GuiButton") then return action end
-    if frame:IsA("GuiButton") then return frame end
-    for _,name in ipairs({"EquipButton","SelectButton","Button"}) do
-        local button=frame:FindFirstChild(name,true)
-        if button and button:IsA("GuiButton") then return button end
-    end
-end
-local function cardIcon(frame)
-    local icon=child(child(frame,"Container"),"Icon") or frame:FindFirstChild("Icon",true)
-        or frame:FindFirstChild("ItemImage",true)
-    if icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton")) then return icon end
-end
-local function isNativeCard(frame)
-    if not frame:IsA("GuiObject") or frame:IsA("ScrollingFrame") then return false end
-    local container=child(frame,"Container") or frame
-    local icon=child(container,"Icon") or child(container,"ItemImage")
-    local action=child(container,"ActionButton") or child(container,"EquipButton") or child(container,"SelectButton")
-        or frame:IsA("GuiButton") and frame
-    return icon~=nil and action and action:IsA("GuiButton")
-end
-local function nativeCard(source)
-    if not source then return nil end
-    if isNativeCard(source) then return source end
-    local pending={source}
-    local visited=0
-    while #pending>0 and visited<160 do
-        local object=table.remove(pending);visited=visited+1
-        if object~=source and not own(object) and isNativeCard(object) then return object end
-        if not own(object) then for _,item in ipairs(object:GetChildren()) do pending[#pending+1]=item end end
-    end
-end
-local function fallbackCard()
-    local frame=Instance.new("Frame");frame.Name="ItemFrame";frame.Size=UDim2.fromOffset(100,100)
-    frame.BackgroundTransparency=1;frame.BorderSizePixel=0
-    local aspect=Instance.new("UIAspectRatioConstraint");aspect.AspectRatio=1;aspect.Parent=frame
-    local title=Instance.new("Frame");title.Name="ItemName";title.BackgroundTransparency=0.15;title.BorderSizePixel=0
-    title.Size=UDim2.new(1,0,0.22,0);title.Position=UDim2.new(0,0,.78,0);title.Parent=frame
-    local label=Instance.new("TextLabel");label.Name="Label";label.Size=UDim2.fromScale(1,1)
-    label.BackgroundTransparency=1;label.BorderSizePixel=0;label.Font=Enum.Font.SourceSansBold
-    label.TextColor3=Color3.new(1,1,1);label.TextScaled=true;label.Parent=title
-    local container=Instance.new("Frame");container.Name="Container";container.Size=UDim2.new(1,0,.78,0)
-    container.BackgroundTransparency=.65;container.BorderSizePixel=0;container.Parent=frame
-    local icon=Instance.new("ImageLabel");icon.Name="Icon";icon.Size=UDim2.fromScale(1,1)
-    icon.BackgroundTransparency=1;icon.BorderSizePixel=0;icon.ScaleType=Enum.ScaleType.Fit;icon.Parent=container
-    local action=Instance.new("TextButton");action.Name="ActionButton";action.Text="";action.BackgroundTransparency=1
-    action.BorderSizePixel=0;action.Size=UDim2.fromScale(1,1);action.ZIndex=5;action.Parent=container
-    frame:SetAttribute(MARKER,true)
-    return frame
-end
-local function templateFor(main,kind)
-    local items=itemsFor(main,kind)
-    local native=nativeCard(items)
-    if native then return native end
-    local services=storage:FindFirstChild("ClientServices")
-    local modern=child(child(services,"ItemService"),"ItemFrame")
-    local legacy=child(storage:FindFirstChild("Modules"),"InventoryModule")
-    native=nativeCard(modern) or nativeCard(child(legacy,"NewItem"))
-    if native then return native end
-    -- Empty effect/pet lists can reuse the game's weapon card template.
-    for _,other in ipairs({"Gun","Knife","Effects","Pets"}) do
-        native=nativeCard(itemsFor(main,other));if native then return native end
-    end
-    return nil
-end
-local function targetFor(main,kind,data)
-    local class=data.InventoryClass or "Current"
-    local key=kind..":"..class
-    local cached=routeTargets[main]
-    local saved=cached and cached[key]
-    if saved and saved.Parent and saved:IsDescendantOf(main) then return saved end
-    local items=itemsFor(main,kind)
-    if not items then return nil end
-    local target
-    if items:IsA("ScrollingFrame") then target=items
-    else
-        target=child(items,"ItemList")
-        local container=child(items,"Container") or items
-        if not target and container:IsA("ScrollingFrame") then target=container end
-        if not target then
-            target=child(container,class)
-            if class=="Current" then target=target or child(container,"Season1") or child(container,"Season 1") end
-            if not target then target=child(child(child(container,"Holiday"),"Container"),class) end
-            if target then target=child(target,"Container") or target end
-        end
-        if not target then
-            -- Support list wrappers without depending on their display names.
-            local pending={items}
-            local count=0
-            while #pending>0 and count<120 do
-                local node=table.remove(pending);count=count+1
-                if node:IsA("ScrollingFrame") then target=node;break end
-                if node:IsA("GuiObject") and (node:FindFirstChildOfClass("UIGridLayout") or node:FindFirstChildOfClass("UIListLayout")) then target=node;break end
-                for _,item in ipairs(node:GetChildren()) do
-                    if not own(item) and not isNativeCard(item) then pending[#pending+1]=item end
-                end
-            end
-        end
-    end
-    if target and target:IsA("GuiObject") then
-        cached=cached or {};routeTargets[main]=cached;cached[key]=target
-        return target
-    end
+    return child(category,"Items") or child(category,"ItemList") or category
 end
 
 local function fill(frame,data,lazyImage)
-    local title=child(frame,"ItemName") or frame:FindFirstChild("ItemName",true)
-    local label=title and title:IsA("TextLabel") and title or child(title,"Label")
+    local title=child(frame,"ItemName")
+    local label=child(title,"Label")
     local coloured=child(title,"ColoredName")
     local container=child(frame,"Container")
-    local icon=cardIcon(frame)
+    local icon=child(container,"Icon")
     local amount=child(container,"Amount")
-    if label and (label:IsA("TextLabel") or label:IsA("TextButton")) then label.Text=data.ItemName end
-    if coloured and (coloured:IsA("TextLabel") or coloured:IsA("TextButton")) then coloured.Text=data.ItemName end
+    if label then label.Text=data.ItemName end
+    if coloured then coloured.Text=data.ItemName end
     if title and title:IsA("GuiObject") then
         title.BackgroundColor3=data.ScopeStyle and Color3.fromRGB(45,45,45) or rarityColour(data)
     end
@@ -13152,7 +12678,7 @@ local function fill(frame,data,lazyImage)
         icon.Image=lazyImage and "" or image(data.Image)
         if not lazyImage then preloadImage(icon.Image) end
     end
-    if amount and (amount:IsA("TextLabel") or amount:IsA("TextButton")) then amount.Text="" end
+    if amount then amount.Text="" end
     local tags=child(frame,"Tags")
     if tags then
         for _,tag in ipairs(tags:GetChildren()) do
@@ -13175,15 +12701,45 @@ local function cloneFrame(source)
     if not ok or not clone then return nil end
     clone:SetAttribute(MARKER,true)
     for _,object in ipairs(clone:GetDescendants()) do
-        if object:GetAttribute("VisualsV2_FontGlyph") then
-            local label=object.Parent
-            if object.Name=="VisualsV2_StarbornGlyphs" and label and (label:IsA("TextLabel") or label:IsA("TextButton")) then
-                label.TextTransparency=0
-            end
-            object:Destroy()
-        elseif object:IsA("LuaSourceContainer") then object:Destroy() end
+        if object:IsA("LuaSourceContainer") then object:Destroy() end
     end
     return clone
+end
+
+local function templateFor(main,kind)
+    local services=storage:FindFirstChild("ClientServices")
+    local source=child(child(services,"ItemService"),"ItemFrame")
+    local items=itemsFor(main,kind)
+    if items and (items:IsA("ScrollingFrame") or child(items,"ItemList")) and source then return source end
+    local legacy=child(storage:FindFirstChild("Modules"),"InventoryModule")
+    local old=child(legacy,"NewItem")
+    if old then return old end
+    if source then return source end
+    if items then
+        for _,frame in ipairs(items:GetDescendants()) do
+            if not own(frame) and child(child(frame,"Container"),"ActionButton")
+                and child(child(frame,"ItemName"),"Label") then return frame end
+        end
+    end
+end
+
+local function targetFor(main,kind,data)
+    local items=itemsFor(main,kind)
+    if not items then return nil end
+    if items:IsA("ScrollingFrame") then return items end
+    local modern=child(items,"ItemList")
+    if modern then return modern end
+    local container=child(items,"Container") or items
+    if container:IsA("ScrollingFrame") then return container end
+    local class=data.InventoryClass or "Current"
+    local target=child(container,class)
+    if class=="Current" then target=target or child(container,"Season1") or child(container,"Season 1") end
+    if not target then target=child(child(child(container,"Holiday"),"Container"),class) end
+    if target then return child(target,"Container") or target end
+    if kind=="Effects" or kind=="Pets" then
+        return container:FindFirstChildWhichIsA("ScrollingFrame",true)
+            or (container:FindFirstChildWhichIsA("UIGridLayout") and container)
+    end
 end
 
 local rarityOrder={Unique=1,Ancient=2,Secret=2,Classic=3,Godly=4,Legendary=5,Rare=6,Uncommon=7,Common=8}
@@ -13304,6 +12860,27 @@ local function removePreview(record,kind)
     if preview.original.Parent and preview.original.Visible==false then preview.original.Visible=preview.visible end
 end
 
+local function watchImages(record,target)
+    local viewport=target
+    while viewport and viewport~=record.main and not viewport:IsA("ScrollingFrame") do viewport=viewport.Parent end
+    if not viewport or not viewport:IsA("ScrollingFrame") then return nil end
+    if not record.imageWatches[viewport] then
+        record.imageWatches[viewport]=true
+        local function changed()
+            if record.imageQueued then return end
+            record.imageQueued=true
+            task.delay(0.04,function()
+                record.imageQueued=false
+                if alive and runtimeAlive and records[record.main]==record and loadVisibleImages then loadVisibleImages(record) end
+            end)
+        end
+        for _,property in ipairs({"CanvasPosition","AbsoluteSize"}) do
+            record.imageConnections[#record.imageConnections+1]=viewport:GetPropertyChangedSignal(property):Connect(changed)
+        end
+    end
+    return viewport
+end
+
 local function watchCanvas(record,target)
     if not target:IsA("ScrollingFrame") then return nil end
     local automatic=target.AutomaticCanvasSize
@@ -13355,7 +12932,6 @@ end
 
 local function release(record)
     record.generation=record.generation+1
-    record.publishToken=(record.publishToken or 0)+1
     record.building=false
     restoreNativeOrders(record)
     for kind in pairs(record.previews) do removePreview(record,kind) end
@@ -13435,6 +13011,27 @@ local function categoryOpen(record,kind)
     return visible(categoryFor(record.main,kind))
 end
 
+loadVisibleImages=function(record)
+    if not record.open then return end
+    for _,card in pairs(record.cards) do
+        if not card.imageLoaded and card.frame.Parent==card.target and card.frame.Visible and categoryOpen(record,card.kind) then
+            local viewport=card.viewport
+            local within=true
+            if viewport then
+                local p,size=card.frame.AbsolutePosition,card.frame.AbsoluteSize
+                local origin,bounds=viewport.AbsolutePosition,viewport.AbsoluteSize
+                local margin=math.max(size.Y,64)
+                within=size.Y>0 and p.Y+size.Y>=origin.Y-margin and p.Y<=origin.Y+bounds.Y+margin
+                    and p.X+size.X>=origin.X-margin and p.X<=origin.X+bounds.X+margin
+            end
+            if within and card.icon then
+                card.icon.Image=image(card.data.Image)
+                card.imageLoaded=true;stats.imagesLoaded=stats.imagesLoaded+1
+            end
+        end
+    end
+end
+
 local function updatePreviews(record)
     for kind in pairs(definitions) do
         if categoryOpen(record,kind) then updatePreview(record,kind) else removePreview(record,kind) end
@@ -13446,7 +13043,7 @@ local function cacheFilters(record)
     record.filterConnections={}
     record.filterRefs={}
     local function changed()
-        record.filterDirty=true
+        record.filterDirty=true;record.dirty=true
         if schedule then schedule() end
     end
     for _,name in ipairs({"Weapons","Effects","Pets"}) do
@@ -13467,7 +13064,7 @@ local function cacheFilters(record)
         end
         if category then
             record.filterConnections[#record.filterConnections+1]=category:GetPropertyChangedSignal("Visible"):Connect(function()
-                record.filterDirty=true
+                record.dirty=true
                 if schedule then schedule() end
             end)
         end
@@ -13500,37 +13097,8 @@ local function matchesFilter(record,kind,data)
     return show
 end
 local function applyCardFilter(record,card)
-    local show=record.open and enabled(card.kind) and not record.paused and matchesFilter(record,card.kind,card.data)
+    local show=matchesFilter(record,card.kind,card.data)
     if card.frame.Visible~=show then card.settingVisible=true;card.frame.Visible=show;card.settingVisible=false end
-end
-
-local function publishCards(record)
-    record.publishToken=(record.publishToken or 0)+1
-    local token=record.publishToken
-    -- Hide the whole catalog when it is closed, or when another native tab is
-    -- open. Retain the complete native frames outside the rendered UI tree.
-    if not record.open or record.paused then
-        for _,card in pairs(record.cards) do if card.frame.Visible then card.frame.Visible=false end end
-    end
-    task.spawn(function()
-        local count=0
-        local started=os.clock()
-        for _,card in pairs(record.cards) do
-            if not alive or not runtimeAlive or records[record.main]~=record or token~=record.publishToken then return end
-            local show=record.open and not record.paused and enabled(card.kind)
-                and categoryOpen(record,card.kind) and visible(card.target) and matchesFilter(record,card.kind,card.data)
-            if show then
-                if card.frame.Visible~=true then card.frame.Visible=true end
-                if card.frame.Parent~=card.target then card.frame.Parent=card.target;count=count+1 end
-            else
-                if card.frame.Visible then card.frame.Visible=false end
-                if card.frame.Parent==card.target then card.frame.Parent=record.staging;count=count+1 end
-            end
-            if count>=12 or os.clock()-started>=0.0015 then
-                stats.publishYields=stats.publishYields+1;count=0;task.wait();started=os.clock()
-            end
-        end
-    end)
 end
 
 local function filterCards(record)
@@ -13539,7 +13107,7 @@ local function filterCards(record)
     for _,card in pairs(record.cards) do applyCardFilter(record,card) end
     record.filterDirty=false
     updatePreviews(record)
-    publishCards(record)
+    loadVisibleImages(record)
 end
 
 local function addCard(record,kind,entry)
@@ -13550,7 +13118,7 @@ local function addCard(record,kind,entry)
     if not target then record.waiting[kind]="Inventory list unavailable";return end
     local template=record.templates[kind]
     if not template then
-        template=cloneFrame(templateFor(record.main,kind)) or fallbackCard()
+        template=cloneFrame(templateFor(record.main,kind))
         record.templates[kind]=template
     end
     local frame=cloneFrame(template)
@@ -13560,10 +13128,10 @@ local function addCard(record,kind,entry)
     frame:SetAttribute("VisualKind",kind)
     fill(frame,data,true)
     frame.LayoutOrder=sortRanks[kind..":"..entry.id] or 100000
-    local button=cardButton(frame)
+    local button=child(child(frame,"Container"),"ActionButton")
     if not button or not button:IsA("GuiButton") then frame:Destroy();record.waiting[kind]="Item button unavailable";return end
     local card={kind=kind,id=entry.id,frame=frame,data=data,target=target,connections={},canvas=watchCanvas(record,target),
-        icon=cardIcon(frame)}
+        viewport=watchImages(record,target),icon=child(child(frame,"Container"),"Icon")}
     record.cards[key]=card
     stats.cardsCreated=stats.cardsCreated+1
     card.connections[1]=button.Activated:Connect(function()
@@ -13575,7 +13143,7 @@ local function addCard(record,kind,entry)
     end)
     applyCardFilter(record,card)
     frame.Parent=record.staging
-    if card.icon then card.icon.Image=image(data.Image);stats.imagesLoaded=stats.imagesLoaded+1 end
+
 end
 
 local function observeNativeButtons(record)
@@ -13584,9 +13152,7 @@ local function observeNativeButtons(record)
         if not definitions[kind] or not button or own(button) or nativeButtons[button]
             or not button:IsDescendantOf(record.main) then return end
         local function nativeSelected()
-            if not alive or not runtimeAlive or inTrade() or excludedInventory(button)
-                or not button:IsDescendantOf(record.main) then return end
-            selectItem(kind,"None");task.defer(refresh)
+            if alive and runtimeAlive then selectItem(kind,"None");task.defer(refresh) end
         end
         local list={button.Activated:Connect(nativeSelected)}
         list[#list+1]=button.MouseButton1Click:Connect(nativeSelected)
@@ -13643,44 +13209,39 @@ local function nativeOwns(kind,id)
     return cached[id]==true
 end
 
-local function pauseRecord(record,trading)
-    record.trading=trading==true
-    if record.paused then return end
-    record.paused=true;record.generation=record.generation+1
+local function suspendRecord(record)
+    if record.trading then return end
+    record.trading=true;record.generation=record.generation+1
     record.building=false;record.dirty=true
     for kind in pairs(record.previews) do removePreview(record,kind) end
-    for button,list in pairs(nativeButtons) do
-        if button:IsDescendantOf(record.main) or excludedInventory(button) then disconnect(list);nativeButtons[button]=nil end
-    end
     restoreNativeOrders(record)
-    publishCards(record)
+    for _,card in pairs(record.cards) do
+        if card.frame.Parent==card.target then card.frame.Parent=record.staging end
+    end
 end
-local function suspendRecord(record) pauseRecord(record,true) end
 local function updateRecord(record)
-    if not (enabled("Gun") or enabled("Knife") or enabled("Effects") or enabled("Pets")) then pauseRecord(record,false);return end
     if inTrade() or excludedInventory(record.main) then suspendRecord(record);return end
-    if record.paused then record.paused=false;record.trading=false;record.dirty=true;record.filterDirty=true end
+    if record.trading then record.trading=false;record.dirty=true;record.filterDirty=true end
     local isOpen=visible(record.main)
     if record.open~=isOpen then record.filterDirty=true end
     record.open=isOpen
-    if record.dirty and not record.building then
+    if record.dirty then
         table.clear(ownedCache)
         for key,card in pairs(record.cards) do
-            if not card.frame.Parent or not card.target.Parent or card.frame.Parent~=record.staging and card.frame.Parent~=card.target
-                or nativeOwns(card.kind,card.id) then removeCard(record,key)
-            end
+            if not enabled(card.kind) or not card.frame.Parent or not card.target.Parent
+                or nativeOwns(card.kind,card.id) then removeCard(record,key) end
         end
         observeNativeButtons(record)
     end
     if record.filterDirty then filterCards(record) end
-    if not isOpen then for kind in pairs(record.previews) do removePreview(record,kind) end end
-    if record.building or not record.dirty or (record.buildFailures or 0)>3 then return end
+    if isOpen then loadVisibleImages(record)
+    else for kind in pairs(record.previews) do removePreview(record,kind) end end
+    if record.building or not record.dirty then return end
     prepareSort()
     record.dirty=false;record.building=true;record.waiting={}
     stats.builds=stats.builds+1
     local generation=record.generation
     task.spawn(function()
-        local ok,reason=pcall(function()
         local count=0
         local started=os.clock()
         for _,kind in ipairs({"Gun","Knife","Effects","Pets"}) do
@@ -13695,7 +13256,7 @@ local function updateRecord(record)
                     if not nativeOwns(kind,entry.id) and not record.cards[kind..":"..entry.id] then
                         addCard(record,kind,entry);count=count+1
                     end
-                    if count>=12 or os.clock()-started>=0.0015 then
+                    if count>=48 or os.clock()-started>=0.003 then
                         count=0;task.wait();started=os.clock()
                     end
                 end
@@ -13705,16 +13266,13 @@ local function updateRecord(record)
         if inTrade() then suspendRecord(record);return end
         filterCards(record)
         sortNativeCards(record)
-        -- filterCards publishes only the currently open native inventory tab.
-        end)
-        if generation~=record.generation or not alive or not runtimeAlive then return end
-        record.building=false
-        if not ok then
-            stats.error=tostring(reason);record.buildFailures=(record.buildFailures or 0)+1;record.dirty=true
-            if record.buildFailures<=3 then task.delay(0.5,function() if schedule then schedule() end end) end
-            return
+        -- No yield while publishing: the first rendered list has its final order.
+        for key,card in pairs(record.cards) do
+            if not enabled(card.kind) or not card.target.Parent or nativeOwns(card.kind,card.id) then removeCard(record,key)
+            elseif card.frame.Parent==record.staging then card.frame.Parent=card.target end
         end
-        record.buildFailures=0;stats.error=nil
+        record.building=false
+        loadVisibleImages(record)
         if record.dirty and schedule then schedule() end
     end)
 end
@@ -13725,100 +13283,63 @@ local function forgetRecord(record)
     disconnect(record.filterConnections or {})
     disconnect(record.visibilityConnections or {})
     disconnect(record.contentConnections or {})
+    disconnect(record.imageConnections or {})
     for kind,template in pairs(record.templates) do template:Destroy();record.templates[kind]=nil end
 end
 
 local function discover()
     if not playerGui then return end
     stats.discoveries=stats.discoveries+1
-    local function register(main)
-        if not main or records[main] or not main:IsDescendantOf(playerGui) or excludedInventory(main) or own(main)
-            or not (main:IsA("GuiObject") or main:IsA("ScreenGui")) then return records[main]~=nil end
-        local recognised=false
-        for _,kind in ipairs({"Gun","Knife","Effects","Pets"}) do
-            -- Register the actual category parent, rather than assuming an
-            -- Inventory/Main/Weapons hierarchy or treating its HUD ancestor as open.
-            for _,name in ipairs(categoryNames(kind)) do
-                if child(main,name) and targetFor(main,kind,{InventoryClass="Current"}) then recognised=true;break end
-            end
-            if recognised then break end
-        end
-        if not recognised then return false end
-        local record={main=main,cards={},previews={},canvases={},templates={},waiting={},generation=0,
-            building=false,dirty=true,open=false,filterDirty=true,visibilityConnections={},
-            nativeOrders=setmetatable({}, {__mode="k"}),layouts=setmetatable({}, {__mode="k"}),contentConnections={}}
-        record.staging=Instance.new("Folder");record.staging.Name="VisualsV2_InventoryBuild"
-        records[main]=record
-        record.contentConnections[1]=main.DescendantRemoving:Connect(function(removed)
-            if removed:GetAttribute(MARKER) and removed:GetAttribute("WeaponID") then
-                local key=tostring(removed:GetAttribute("VisualKind"))..":"..tostring(removed:GetAttribute("WeaponID"))
-                local card=record.cards[key]
-                if card and card.frame==removed and not record.paused and not record.building then
-                    task.defer(function()
-                        if records[main]==record and card.frame.Parent~=record.staging and card.frame.Parent~=card.target then
-                            record.dirty=true;schedule()
-                        end
-                    end)
-                end
-            end
-        end)
-        local ancestor=main
-        while ancestor and ancestor~=playerGui do
-            local property=ancestor:IsA("GuiObject") and "Visible" or ancestor:IsA("ScreenGui") and "Enabled"
-            if property then
-                record.visibilityConnections[#record.visibilityConnections+1]=ancestor:GetPropertyChangedSignal(property):Connect(function()
-                    if schedule then schedule() end
-                end)
-            end
-            ancestor=ancestor.Parent
-        end
-        cacheFilters(record)
-        return true
-    end
-    -- Prefer native module references, including versions whose GUI was renamed.
-    local gui=inventoryModule and inventoryModule.GUI
-    if type(gui)=="table" then
-        local pending={{gui,0}}
-        local seen={}
-        local count=0
-        while #pending>0 and count<80 do
-            local entry=table.remove(pending);local object,depth=entry[1],entry[2];count=count+1
-            if typeof(object)=="Instance" then
-                local current=object
-                for _=1,5 do if not current or current==playerGui then break end;register(current);current=current.Parent end
-            elseif type(object)=="table" and not seen[object] and depth<3 then
-                seen[object]=true
-                for _,value in pairs(object) do
-                    if typeof(value)=="Instance" or type(value)=="table" then pending[#pending+1]={value,depth+1} end
-                end
-            end
-        end
-    end
     local pending={playerGui}
-    local count=0
     while #pending>0 do
         local object=table.remove(pending)
         if tradeRoot(object) then tradeRoots[object]=true end
         if not own(object) and not excludedInventory(object) then
-            if not register(object) then
-                for _,item in ipairs(object:GetChildren()) do pending[#pending+1]=item end
+            if object.Name=="Inventory" or object.Name=="Inventory2" then
+                local main=child(object,"Main")
+                if main and child(main,"Weapons") and not records[main] then
+                    local record={main=main,cards={},previews={},canvases={},templates={},waiting={},generation=0,
+                        building=false,dirty=true,open=false,filterDirty=true,visibilityConnections={},imageWatches={},imageConnections={},
+                        nativeOrders=setmetatable({}, {__mode="k"}),layouts=setmetatable({}, {__mode="k"}),contentConnections={}}
+                    record.staging=Instance.new("Folder");record.staging.Name="VisualsV2_InventoryBuild"
+                    records[main]=record
+                    record.contentConnections[1]=main.DescendantRemoving:Connect(function(removed)
+                        if removed:GetAttribute(MARKER) and removed:GetAttribute("WeaponID") then
+                            local key=tostring(removed:GetAttribute("VisualKind"))..":"..tostring(removed:GetAttribute("WeaponID"))
+                            local card=record.cards[key]
+                            if card and card.frame==removed and not record.trading and not record.building then
+                                task.defer(function()
+                                    if records[main]==record and card.frame.Parent~=record.staging
+                                        and card.frame.Parent~=card.target then record.dirty=true;schedule() end
+                                end)
+                            end
+                        end
+                    end)
+                    local ancestor=main
+                    while ancestor and ancestor~=playerGui do
+                        local property=ancestor:IsA("GuiObject") and "Visible" or ancestor:IsA("ScreenGui") and "Enabled"
+                        if property then
+                            record.visibilityConnections[#record.visibilityConnections+1]=ancestor:GetPropertyChangedSignal(property):Connect(function()
+                                if schedule then schedule() end
+                            end)
+                        end
+                        ancestor=ancestor.Parent
+                    end
+                    cacheFilters(record)
+                end
             end
+            for _,child in ipairs(object:GetChildren()) do pending[#pending+1]=child end
         end
-        count=count+1
-        if count%96==0 then task.wait() end
-        if not alive or not runtimeAlive or not playerGui then return end
     end
 end
-
 
 refresh=function()
     if not alive or not runtimeAlive then return end
     local active=enabled("Gun") or enabled("Knife") or enabled("Effects") or enabled("Pets")
-    if active and (discoveryDirty or not next(records)) then discoveryDirty=false;discover() end
+    if active and discoveryDirty then discoveryDirty=false;discover() end
     for main,record in pairs(records) do
-        if not playerGui or not main:IsDescendantOf(playerGui) then
+        if not playerGui or not main:IsDescendantOf(playerGui) or not active then
             forgetRecord(record);records[main]=nil
-        elseif not active then pauseRecord(record,false)
         else updateRecord(record) end
     end
 end
@@ -13831,7 +13352,6 @@ end
 
 local function bindGui()
     discoveryDirty=true
-    for root in pairs(tradeStates) do forgetTradeState(root) end
     table.clear(tradeRoots)
     disconnect(guiConnections)
     playerGui=LocalPlayer:FindFirstChildOfClass("PlayerGui")
@@ -13841,14 +13361,14 @@ local function bindGui()
             tradeRoots[object]=true
             local property=object:IsA("ScreenGui") and "Enabled" or "Visible"
             guiConnections[#guiConnections+1]=object:GetPropertyChangedSignal(property):Connect(function()
-                if activeTrade(object) then for _,record in pairs(records) do suspendRecord(record) end end
+                if visible(object) then for _,record in pairs(records) do suspendRecord(record) end end
                 schedule()
             end)
         end
         for _,object in ipairs(playerGui:GetDescendants()) do watchTrade(object) end
         guiConnections[#guiConnections+1]=playerGui.DescendantAdded:Connect(function(object)
             watchTrade(object)
-            if tradeRoot(object) and activeTrade(object) then
+            if tradeRoot(object) and visible(object) then
                 for _,record in pairs(records) do suspendRecord(record) end
                 schedule()
             end
@@ -13858,26 +13378,12 @@ local function bindGui()
                 end
                 return
             end
-            if excludedInventory(object) then
-                for root in pairs(tradeRoots) do
-                    if object:IsDescendantOf(root) then forgetTradeState(root);schedule();break end
-                end
-                return
-            end
-            local missing=not next(records)
-            if not missing then
-                for main in pairs(records) do if not main:IsDescendantOf(playerGui) then missing=true;break end end
-            end
-            if missing and (object:IsA("GuiObject") or object:IsA("ScreenGui")) then discoveryDirty=true;schedule() end
+            if excludedInventory(object) then return end
             if object.Name=="Inventory" or object.Name=="Inventory2" or object.Name=="Main"
                 or object.Name=="Weapons" or object.Name=="Effects" or object.Name=="Pets" or object.Name=="Items"
-                or object.Name=="ItemList" or object.Name=="WeaponEffects" or object.Name=="ActionButton"
-                or object.Name=="Guns" or object.Name=="Knives" or object.Name=="Pet" or object.Name=="Weapon" then
+                or object.Name=="ItemList" or object.Name=="WeaponEffects" or object.Name=="ActionButton" then
                 if not next(records) or object.Name=="Inventory" or object.Name=="Inventory2" or object.Name=="Main" then discoveryDirty=true end
-                for _,record in pairs(records) do
-                    record.dirty=true
-                    routeCategories[record.main]=nil;routeTargets[record.main]=nil
-                end
+                for _,record in pairs(records) do record.dirty=true end
                 schedule()
             end
         end)
@@ -13890,8 +13396,7 @@ for _,kind in ipairs({"Gun","Knife","Effects","Pets"}) do
     if not mmv or kind=="Gun" then
     controls[kind]=addToggle(section,definition.label,C(definition.key,false),function(value)
         if kind=="Effects" then effects.SetEnabled(value) elseif kind=="Pets" then pets.SetEnabled(value) else skins.SetEnabled(kind,value) end
-        if value then discoveryDirty=true end
-        for _,record in pairs(records) do record.dirty=true;record.filterDirty=true;record.buildFailures=0 end
+        for _,record in pairs(records) do record.dirty=true end
         refresh()
     end)
     end
@@ -13915,9 +13420,7 @@ connections[#connections+1]=RunService.Heartbeat:Connect(function(dt)
     stats.uiPolls=stats.uiPolls+1
     for main,record in pairs(records) do
         if playerGui and main:IsDescendantOf(playerGui) then
-            if not record.paused or record.trading then
-                if record.dirty or record.filterDirty or record.trading or record.open~=visible(main) or inTrade() then updateRecord(record) end
-            end
+            if record.dirty or record.filterDirty or record.trading or record.open~=visible(main) or inTrade() then updateRecord(record) end
         else schedule() end
     end
     for button,list in pairs(nativeButtons) do
@@ -13925,14 +13428,13 @@ connections[#connections+1]=RunService.Heartbeat:Connect(function(dt)
     end
 end)
 env.VisualsV2Runtime.VisualWeaponInventory={
-    IsTrading=inTrade,
     GetDiagnostics=function()
         local report={stats=table.clone(stats),inventories={}}
         for _,record in pairs(records) do
-            local count,attached=0,0
-            for _,card in pairs(record.cards) do count=count+1;if card.frame.Parent==card.target then attached=attached+1 end end
+            local count=0
+            for _ in pairs(record.cards) do count=count+1 end
             report.inventories[#report.inventories+1]={name=record.main.Parent and record.main.Parent.Name,
-                open=record.open,cards=count,attached=attached,loader="native cards",paused=record.paused==true,building=record.building,trading=record.trading==true,waiting=table.clone(record.waiting)}
+                open=record.open,cards=count,building=record.building,trading=record.trading==true,waiting=table.clone(record.waiting)}
         end
         return report
     end,
@@ -13941,10 +13443,7 @@ env.VisualsV2Runtime.RegisterReset(function()
     for _,control in pairs(controls) do control:Set(false) end
     for main,record in pairs(records) do forgetRecord(record);records[main]=nil end
     for button,list in pairs(nativeButtons) do disconnect(list);nativeButtons[button]=nil end
-    if not runtimeAlive then
-        alive=false;disconnect(connections);disconnect(guiConnections)
-        for root in pairs(tradeStates) do forgetTradeState(root) end
-    end
+    if not runtimeAlive then alive=false;disconnect(connections);disconnect(guiConnections) end
 end)
 readNativeData()
 bindGui()
@@ -14071,9 +13570,6 @@ local function collect()
         presentation=runtime.WeaponPresentation and runtime.WeaponPresentation.GetDiagnostics(),
         inventoryTools=runtime.InventoryTools and runtime.InventoryTools.GetDiagnostics(),
         jumpGun=runtime.JumpGunFollowup and runtime.JumpGunFollowup.GetDiagnostics(),
-        odhShoot=runtime.ODHShootBridge and runtime.ODHShootBridge.GetDiagnostics(),
-        textFonts=runtime.TextFonts and runtime.TextFonts.GetDiagnostics(),
-        emotes=runtime.EmoteProtection and runtime.EmoteProtection.GetDiagnostics(),
         tools={},character={},originalDefinitions={},availableTemplates={},storageRoots={}}
     pcall(function() report.executor=identifyexecutor() end)
     local selected={}
@@ -15419,37 +14915,25 @@ local fonts={
     ["Code"]=Enum.Font.Code,
     ["Legacy"]=Enum.Font.Legacy,
     ["Starborn"]=true,
-    ["Fredoka One"]=Enum.Font.FredokaOne,
-    ["Nunito"]=Enum.Font.Nunito,
-    ["Luckiest Guy"]=Enum.Font.LuckiestGuy,
-    ["Bangers"]=Enum.Font.Bangers,
-    ["Indie Flower"]=Enum.Font.IndieFlower,
-    ["Permanent Marker"]=Enum.Font.PermanentMarker,
-    ["Patrick Hand"]=Enum.Font.PatrickHand,
-    ["Kalam"]=Enum.Font.Kalam,
-    ["Sci-Fi"]=Enum.Font.SciFi,
-    ["Roboto Mono"]=Enum.Font.RobotoMono,
 }
-local fontNames={"SourceSansBold (Original)","Gotham","Arcade","Arial","ArialBold","Cartoon","Fantasy","Highway","Code","Legacy","Starborn","Fredoka One","Nunito","Luckiest Guy","Bangers","Indie Flower","Permanent Marker","Patrick Hand","Kalam","Sci-Fi","Roboto Mono"}
--- Starborn by Darrell Flood / Hawtpixel, rendered from the original personal-use font.
--- Glyph images also work on executors whose local font-family loader is unsupported.
--- Source / licensing: https://www.dafont.com/starborn.font
-local STARBORN_PIXELS=48
-local STARBORN_LINE_HEIGHT=54
-local STARBORN_MAX_SPRITES=UserInputService.TouchEnabled and 600 or 1000
-local STARBORN_GLYPHS={["32"]={4,4,23,0,0,47,23.4219},["33"]={84,4,20,45,0,2,20.0},["34"]={164,4,25,42,0,5,25.3125},["35"]={244,4,46,42,0,6,45.8281},["36"]={324,4,41,53,0,1,41.375},["37"]={404,4,36,36,0,13,35.7031},["38"]={484,4,41,45,0,4,40.625},["39"]={564,4,13,43,0,4,13.2969},["40"]={644,4,20,44,0,4,20.3906},["41"]={724,4,20,43,0,4,20.1094},["42"]={804,4,33,38,0,9,32.9844},["43"]={884,4,30,31,0,16,30.2344},["44"]={4,84,17,21,0,29,16.8281},["45"]={84,84,27,25,0,22,26.9531},["46"]={164,84,17,15,0,32,17.375},["47"]={244,84,28,38,0,9,28.0625},["48"]={324,84,44,37,0,11,44.0156},["49"]={404,84,21,38,0,10,21.2188},["50"]={484,84,38,42,0,6,37.625},["51"]={564,84,40,43,0,7,40.3594},["52"]={644,84,39,40,0,8,38.7188},["53"]={724,84,34,41,0,6,34.0625},["54"]={804,84,33,40,0,7,32.9844},["55"]={884,84,37,41,0,7,36.7969},["56"]={4,164,34,44,0,5,34.3438},["57"]={84,164,32,41,0,7,32.1562},["58"]={164,164,13,28,0,19,13.2969},["59"]={244,164,17,31,0,20,16.5781},["60"]={324,164,29,33,0,14,28.875},["61"]={404,164,26,36,0,11,25.8594},["62"]={484,164,27,35,0,12,26.6719},["63"]={564,164,35,48,0,-1,35.4375},["64"]={644,164,42,42,0,5,42.0},["65"]={724,164,41,39,0,11,41.1875},["66"]={804,164,45,44,0,8,45.0469},["67"]={884,164,37,39,0,9,36.7969},["68"]={4,244,39,40,0,11,39.2656},["69"]={84,244,39,41,0,10,39.2656},["70"]={164,244,31,40,0,10,30.7812},["71"]={244,244,42,39,0,10,42.2656},["72"]={324,244,42,39,0,9,41.75},["73"]={404,244,14,36,0,11,13.8281},["74"]={484,244,34,36,0,12,33.8438},["75"]={564,244,36,41,0,9,35.9844},["76"]={644,244,28,40,0,8,27.7812},["77"]={724,244,51,40,0,9,51.1406},["78"]={804,244,39,40,0,8,39.1719},["79"]={884,244,44,37,0,11,44.0156},["80"]={4,324,40,44,0,7,40.2969},["81"]={84,324,44,39,0,12,44.1562},["82"]={164,324,42,42,0,8,42.0781},["83"]={244,324,41,42,0,7,41.375},["84"]={324,324,31,39,0,8,30.5156},["85"]={404,324,42,38,0,9,41.7188},["86"]={484,324,41,37,0,10,40.9062},["87"]={564,324,48,37,0,10,48.2812},["88"]={644,324,35,41,0,9,35.4375},["89"]={724,324,38,45,0,6,37.625},["90"]={804,324,40,40,0,7,40.0781},["91"]={884,324,23,42,0,6,23.3906},["92"]={4,404,25,40,0,7,25.3125},["93"]={84,404,23,42,0,6,22.8594},["94"]={164,404,33,41,0,6,32.9844},["95"]={244,404,39,13,0,36,38.9844},["97"]={324,404,47,44,0,4,46.6875},["98"]={404,404,45,44,0,8,45.0469},["99"]={484,404,37,39,0,9,36.7969},["100"]={564,404,39,40,0,11,39.2656},["101"]={644,404,39,41,0,10,39.2656},["102"]={724,404,31,40,0,10,30.7812},["103"]={804,404,42,39,0,10,42.2656},["104"]={884,404,42,39,0,9,41.75},["105"]={4,484,18,47,0,4,17.6562},["106"]={84,484,34,36,0,12,33.8438},["107"]={164,484,36,41,0,9,35.9844},["108"]={244,484,28,40,0,8,27.7812},["109"]={324,484,51,40,0,9,51.1406},["110"]={404,484,39,40,0,8,39.1719},["111"]={484,484,44,38,0,10,44.0156},["112"]={564,484,40,44,0,7,40.2969},["113"]={644,484,44,39,0,12,44.1562},["114"]={724,484,42,42,0,8,42.0781},["115"]={804,484,41,42,0,7,41.375},["116"]={884,484,31,39,0,8,30.5156},["117"]={4,564,42,38,0,9,41.7188},["118"]={84,564,41,37,0,10,40.9062},["119"]={164,564,48,37,0,10,48.2812},["120"]={244,564,35,41,0,9,35.4375},["121"]={324,564,38,45,0,6,37.625},["122"]={404,564,40,40,0,7,40.0781},["124"]={484,564,15,40,0,7,14.9375},["126"]={564,564,37,30,0,17,36.5156},["162"]={644,564,28,37,0,11,28.0625},["163"]={724,564,38,42,0,7,37.9062},["8216"]={804,564,17,42,0,5,16.8281},["8217"]={884,564,17,42,0,5,16.8281},["8220"]={4,644,37,42,0,5,37.1094},["8221"]={84,644,37,42,0,5,37.1094},["8230"]={164,644,43,14,0,33,43.2031},["8364"]={244,644,42,40,0,9,42.0},["8482"]={324,644,17,26,0,21,16.8281}}
-local starbornSpriteCount=0
-local starbornAsset=nil
+local fontNames={"SourceSansBold (Original)","Gotham","Arcade","Arial","ArialBold","Cartoon","Fantasy","Highway","Code","Legacy","Starborn"}
+-- Starborn by Darrell Flood / Hawtpixel, original TTF, personal-use edition.
+-- Source and licensing: https://www.dafont.com/starborn.font
+local starbornFace=nil
 local starbornAttempted=false
 local function loadStarborn()
-    if starbornAttempted then return starbornAsset end
+    if starbornAttempted then return starbornFace end
     starbornAttempted=true
     local asset=getcustomasset or getsynasset or env.getcustomasset or env.getsynasset
-    if type(asset)~="function" or type(write)~="function" then return nil end
+    if type(asset)~="function" or type(write)~="function" then
+        pcall(shared.Notify,"Starborn needs custom-font support in your executor",4)
+        return nil
+    end
     local ok,result=pcall(function()
-        local encoded="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"
+        local encoded="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A4IF/QbtAA0AGwAAATMWHQEUAwYHJjU0EzQlMxYdARQDBgcmNTQTNAGzF9LGQ3jpmARKF9LGQ3jpmAbtK5s6yP67TREvuy0BSOIqK5s6yP67TREvuy0BSOIAAAAAAwAyAIUHAQJbABMAJwA7AAABFxYVFA8BBiMiLwEmNTQ/ATYzMgUXFhUUDwEGIyIvASY1ND8BNjMyBRcWFRQPAQYjIi8BJjU0PwE2MzIBfx9qHRJbXzIzHmodElxeMgKvHmodEltfMjMeah4RXF8xAq8eax4RXF8xMx9pHRJbXzECPhJbXzIzHmodEltfMjIfah0SW18yMx5qHRJbXzIyH2odEltfMjMeah0SW18xMx9qAAAAAQAy/8YGzgZWACgAAAEzMhcVBisBIicEFRYVFAciFRY7ATI3MjcyFxQFByADNCcmNTQ3EiU2BHuA21Q5mSMdb/7FmK+AWb86rb0dQLsj/ee7/e/ldF71kAFO3wZW0l66Iz5aWJGXRxeAowz18ZAMAd5rIVtsn1UBWLVeAAEAMgINApwEVAAOAAABMhMUBwYrASIvATU2NzQBef4luhQnLuJZDD7DBFT+xqVcDK9GXdYUCwAAAAABAAAlvgABBkgYAAAKDbAABAAL/5gABAAO/5gABAAP/3gABAAQ/5gABAAT/5gABAAX/3gABAAZ/5gABAAe/3gABAAf/5gABAAj/5gABAAk/5gABAAl/3gABAAm/5gABAAn/3gABAAq/5gABAAr/5gABAAy/5gABAA0/5gABAA4/5gABABB/5gABABC/3gABABF/5gABABH/5gABABI/5gABABJ/5gABABP/5gABABQ/5gABQAE/3IABQAO/3IABQAPAJYABQAQ/7EABQARAJYABQAS/rUABQAW/7EABQAX/1IABQAe/3IABQAk/rUABQAl/5EABQAr/5EABQAt/pUABQAw/1IABQA9/7EABQBCAJYABQBH/5EABQBI/7EABQBOAJYABQBP/3IABgAE/5gABgAM/3kABgAP/1kABgAR/5gABgAS/5gABgAW/5gABgAX/5gABgAa/5gABgAe/5gABgAi/zoABgAk/3kABgAl/5gABgAt/5gABgAw/5gABgA9/5gABgBA/3kABgBC/3kABgBO/5gABwAH/3oABwAV/5kABwAi/5kABwA2/3oABwBB/3oABwBD/5kABwBL/5kABwBN/5kACAAM/68ACAAO/1AACAAP/68ACAAQ/48ACAAe/68ACAAl/68ACAAr/68ACABH/48ACABI/68ACABJ/68ACABP/1AACABQ/68ACQAF/vwACQAH/zsACQAK/vwACQAN/vwACQAO/zsACQAQ/vwACQAT/5oACQAU/xwACQAV/5oACQAX/5oACQAa/vwACQAc/t0ACQAf/t0ACQAg/5oACQAh/1sACQAi/vwACQAj/3oACQAm/5oACQAq/3oACQAr/5oACQAy/5oACQAz/vwACQA0/5oACQA1/vwACQA2/zsACQA3/vwACQA5/vwACQA6/vwACQA8/vwACQA//vwACQBB/l8ACQBD/3oACQBF/5oACQBH/zsACQBI/3oACQBJ/3oACQBK/vwACQBL/t0ACQBM/vwACQBN/t0ACQBP/xwACQBQ/xwACgAE/3sACgAPAJYACgARAJYACgAS/t0ACgAX/3sACgAe/5oACgAk/t0ACgAl/5oACgAr/5oACgAt/p4ACgAw/3sACgBCAJYACgBOAJYACgBP/5oACwAE/6YACwAG/6YACwAH/2cACwAL/4cACwAO/wkACwAQ/wkACwAR/6YACwAT/0gACwAV/4cACwAX/ygACwAZ/4cACwAc/2cACwAf/wkACwAg/6YACwAj/ygACwAm/0gACwAp/6YACwAq/ygACwAr/0gACwAt/6YACwAy/0gACwA0/0gACwA2/2cACwA4/6YACwBB/ygACwBD/2cACwBF/0gACwBH/wkACwBI/wkACwBJ/ygACwBL/6YACwBN/6YACwBP/wkACwBQ/wkADAAE/7IADAAM/5MADAAP/1QADAAR/7IADAAS/7IADAAW/7IADAAe/7IADAAi/7IADAAk/3MADAAl/7IADAAw/7IADABA/7IADABC/1QADABO/7IADQAE/4UADQAM/6UADQAP/wcADQAR/koADQAS/ycADQAe/0YADQAk/wcADQAl/6UADQAt/ycADQAw/2YADQBC/BMADQBO/sgADgAE/3wADgAF/10ADgAI/10ADgAM/z0ADgAP/10ADgAR/t8ADgAS/5wADgAU/v4ADgAV/3wADgAW/t8ADgAa/oAADgAe/5wADgAi/r8ADgAk/10ADgAl/5wADgAt/5wADgAz/t8ADgA1/v4ADgA3/t8ADgA5/10ADgA6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/34ARAAf/50ARAAj/50ARAAk/34ARAAl/34ARAAm/50ARAAn/50ARAAo/34ARAAq/50ARAAr/50ARAAt/14ARAAw/34ARAAy/50ARAA0/50ARAA9/50ARABB/50ARABC/34ARABF/50ARABH/50ARABI/50ARABJ/50ARABO/14ARABP/50ARABQ/50ARQAM/6YARQAP/4cARQAU/6YARQAa/wkARQAe/6YARQAi/soARQAk/6YARQAl/6YARQAz/2cARQA1/4cARQA3/4cARQA5/4cARQA6/6YARQA7/4cARQA8/2cARQA//4cARQBA/6YARQBC/4cARwAE/4wARwAM/w4ARwAP/y0ARwAR/s8ARwAS/2wARwAW/y0ARwAa/s8ARwAe/6sARwAi/s8ARwAk/y0ARwAl/6sARwAt/2wARwAw/6sARwAz/6sARwA3/6sARwA8/6sARwA9/2wARwA//6sARwBA/q8ARwBC+/oARwBO/y0ASAAa/5oASAAe/5oASAAi/xwASQAO/tMASQAQ/tMASQAT/68ASQAX/5AASQAf/vIASQAj/5AASQAm/68ASQAq/5AASQAr/68ASQAy/68ASQA0/68ASQBB/5AASQBF/68ASQBH/tMASQBI/3AASQBJ/5AASQBP/zEASQBQ/tMASgAE/0IASgAG/6EASgAH/6EASgAL/4EASgAO/uQASgAPAJYASgAQ/yMASgARAJYASgAS/icASgAT/0IASgAW/6EASgAX/sQASgAZ/0IASgAc/6EASgAd/2IASgAe/uQASgAf/0IASgAj/2IASgAk/icASgAl/0IASgAm/2IASgAn/2IASgAo/0IASgAp/4EASgAq/0IASgAr/0IASgAt/mYASgAw/uQASgAx/6EASgAy/0IASgA0/0IASgA2/6EASgA9/6EASgBB/4EASgBCAJYASgBF/0IASgBH/wMASgBI/yMASgBJ/0IASgBL/6EASgBN/6EASgBOAJYASgBP/uQASgBQ/0IASwAE/2IASwAO/uQASwAPAJYASwAQ/yMASwARAJYASwAS/icASwAT/2IASwAX/sQASwAZ/2IASwAd/2IASwAe/uQASwAf/0IASwAj/4EASwAk/icASwAl/2IASwAm/4EASwAn/6EASwAo/2IASwAq/0IASwAr/2IASwAt/oUASwAw/wMASwAy/2IASwA0/2IASwBB/6EASwBCAJYASwBF/2IASwBH/wMASwBI/yMASwBJ/0IASwBOAJYASwBP/uQASwBQ/0IATAAE/1MATAAG/5IATAAH/5IATAAI/7IATAAL/3MATAAO/tUATAAPAJYATAAQ/xQATAARAJYATAAS/hgATAAT/1MATAAV/7IATAAW/7IATAAX/rYATAAZ/zQATAAc/5IATAAd/3MATAAe/vUATAAf/1MATAAj/3MATAAk/hgATAAl/1MATAAm/1MATAAn/1MATAAo/zQATAAp/5IATAAq/1MATAAr/zQATAAs/7IATAAt/lcATAAw/tUATAAx/5IATAAy/1MATAA0/1MATAA2/5IATAA4/7IATAA9/5IATABB/3MATABCAJYATABD/7IATABF/1MATABH/vUATABI/zQATABJ/zQATABL/7IATABN/7IATABOAJYATABP/tUATABQ/zQATQAE/3MATQAL/7IATQAO/tUATQAPAJYATQAQ/xQATQARAJYATQAS/hgATQAT/1MATQAX/rYATQAZ/1MATQAc/7IATQAd/3MATQAe/vUATQAf/1MATQAj/5IATQAk/jgATQAl/3MATQAm/3MATQAn/5IATQAo/1MATQAp/7IATQAq/1MATQAr/3MATQAt/pYATQAw/xQATQAx/7IATQAy/1MATQA0/1MATQA9/7IATQBB/5IATQBCAJYATQBF/1MATQBH/vUATQBI/zQATQBJ/zQATQBOAJYATQBP/tUATQBQ/zQATgAFAJYATgAH/ywATgAKAJYATgAN/hAATgAO/4oATgAQ/ywATgAU/ywATgAV/4oATgAa/o4ATgAc/0sATgAf/wwATgAh/6oATgAi/u0ATgAz/s0ATgA1/wwATgA2/ywATgA3/q4ATgA5/jAATgA6/ywATgA8/s0ATgA//q4ATgBBAJYATgBD/4oATgBH/4oATgBJ/2sATgBKAJYATgBLAJYATgBMAJYATgBNAJYATgBP/4oATgBQ/2sATwAF/34ATwAH/z8ATwAK/34ATwAN/34ATwAO/34ATwAQ/wAATwAU/34ATwAV/54ATwAa/34ATwAc/z8ATwAf/wAATwAh/54ATwAi/34ATwAz/34ATwA1/34ATwA2/18ATwA3/34ATwA5/34ATwA6/34ATwA8/34ATwA//34ATwBB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"
         local alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-        local values={};for i=1,#alphabet do values[alphabet:sub(i,i)]=i-1 end
+        local values={}
+        for i=1,#alphabet do values[alphabet:sub(i,i)]=i-1 end
         local bytes={}
         for i=1,#encoded,4 do
             local a,b,c,d=encoded:sub(i,i),encoded:sub(i+1,i+1),encoded:sub(i+2,i+2),encoded:sub(i+3,i+3)
@@ -15458,11 +14942,15 @@ local function loadStarborn()
             if c~="=" then bytes[#bytes+1]=string.char(math.floor(n/256)%256) end
             if d~="=" then bytes[#bytes+1]=string.char(n%256) end
         end
-        write("VisualsV2_Starborn.png",table.concat(bytes))
-        return asset("VisualsV2_Starborn.png")
+        write("VisualsV2_Starborn.ttf",table.concat(bytes))
+        local fontAsset=asset("VisualsV2_Starborn.ttf")
+        write("VisualsV2_Starborn.json",HttpService:JSONEncode({name="Starborn",faces={
+            {name="Regular",weight=400,style="normal",assetId=fontAsset}}}))
+        return Font.new(asset("VisualsV2_Starborn.json"),Enum.FontWeight.Regular,Enum.FontStyle.Normal)
     end)
-    if ok and type(result)=="string" and result~="" then starbornAsset=result end
-    return starbornAsset
+    if ok then starbornFace=result
+    else pcall(shared.Notify,"Starborn could not load on this executor; keeping the original font",4) end
+    return starbornFace
 end
 
 local selectedFont=C("vv2TextFont","SourceSansBold (Original)")
@@ -15497,19 +14985,7 @@ local function writeProperty(object,record,property,value)
     return ok
 end
 
-local function clearStarborn(object,record)
-    if record.starbornFrame then
-        starbornSpriteCount=math.max(0,starbornSpriteCount-(record.starbornGlyphCount or 0))
-        record.starbornFrame:Destroy();record.starbornFrame=nil;record.starbornGlyphCount=nil;record.starbornImages=nil
-    end
-    if record.starbornAlpha~=nil and object.TextTransparency==record.starbornAppliedAlpha then
-        writeProperty(object,record,"TextTransparency",record.starbornAlpha)
-    end
-    record.starbornAlpha=nil;record.starbornAppliedAlpha=nil;record.starbornSignature=nil
-end
-
 local function restoreFont(object,record)
-    clearStarborn(object,record)
     if not record.font then return end
     record.writing=record.writing+1
     local restored=false
@@ -15580,155 +15056,39 @@ local function isIconFont(object,font)
     return false
 end
 
-local function starbornVisible(object)
-    if not object.Parent or object.AbsoluteSize.X<=1 or object.AbsoluteSize.Y<=1 then return false end
-    local p,size=object.AbsolutePosition,object.AbsoluteSize
-    local current=object
-    while current do
-        if current:IsA("GuiObject") then
-            if not current.Visible then return false end
-            if current:IsA("CanvasGroup") and current.GroupTransparency>=1 then return false end
-            if current~=object and current.ClipsDescendants then
-                local q,bounds=current.AbsolutePosition,current.AbsoluteSize
-                if p.X+size.X<q.X or p.X>q.X+bounds.X or p.Y+size.Y<q.Y or p.Y>q.Y+bounds.Y then return false end
-            end
-        elseif current:IsA("ScreenGui") and not current.Enabled then return false end
-        current=current.Parent
-    end
-    return true
-end
-local function starbornLines(text,size,width,wrapped)
-    local scale=size/STARBORN_PIXELS
-    local lines={{glyphs={},width=0}}
-    local glyphCount=0
-    for _,code in utf8.codes(text) do
-        local line=lines[#lines]
-        if code==10 then lines[#lines+1]={glyphs={},width=0}
-        else
-            local glyph=STARBORN_GLYPHS[tostring(code)]
-            if not glyph then return nil end
-            local advance=glyph[7]*scale
-            if wrapped and line.width>0 and line.width+advance>width then
-                line={glyphs={},width=0};lines[#lines+1]=line
-            end
-            if glyph[3]>0 and glyph[4]>0 then
-                glyphCount=glyphCount+1
-                if glyphCount>192 then return nil end
-                line.glyphs[#line.glyphs+1]={glyph=glyph,x=line.width}
-            end
-            line.width=line.width+advance
-        end
-    end
-    return lines,glyphCount,scale
-end
-local function drawStarborn(object,record)
-    if object:IsA("TextBox") or not starbornVisible(object) then clearStarborn(object,record);return end
-    local atlas=loadStarborn()
-    if not atlas then clearStarborn(object,record);return end
-    local text=object.ContentText or object.Text
-    if text=="" or #text>768 then clearStarborn(object,record);return end
-    local bounds=object.AbsoluteSize
-    local size=math.clamp((record.font and record.font.size or object.TextSize)*0.84,9,36)
-    if object.TextScaled then size=math.clamp(bounds.Y*0.72,10,32) end
-    local lines,count,scale=starbornLines(text,size,bounds.X,object.TextWrapped)
-    if not lines then clearStarborn(object,record);return end
-    if object.TextScaled then
-        local maxWidth=0;for _,line in ipairs(lines) do maxWidth=math.max(maxWidth,line.width) end
-        local height=#lines*STARBORN_LINE_HEIGHT*scale
-        local fit=math.min(1,bounds.X/math.max(maxWidth,1),bounds.Y/math.max(height,1))
-        if fit<1 then size=math.max(8,size*fit);lines,count,scale=starbornLines(text,size,bounds.X,object.TextWrapped) end
-    end
-    if not lines then clearStarborn(object,record);return end
-    local signature=text.."|"..tostring(bounds).."|"..tostring(object.TextColor3).."|"..tostring(size)
-        .."|"..tostring(object.TextXAlignment).."|"..tostring(object.TextYAlignment).."|"..tostring(record.starbornAlpha)
-    if record.starbornFrame and record.starbornSignature==signature then return end
-    local alpha=record.starbornAlpha or object.TextTransparency
-    local allocated=record.starbornGlyphCount or 0
-    if starbornSpriteCount+math.max(0,count-allocated)>STARBORN_MAX_SPRITES then clearStarborn(object,record);return end
-    record.starbornAlpha=alpha
-    local frame=record.starbornFrame
-    if not frame then
-        frame=Instance.new("Frame")
-        frame.Name="VisualsV2_StarbornGlyphs";frame:SetAttribute("VisualsV2_FontGlyph",true)
-        frame.Size=UDim2.fromScale(1,1);frame.BackgroundTransparency=1;frame.ClipsDescendants=true
-        frame.ZIndex=object.ZIndex;frame.Active=false
-        record.starbornFrame=frame;record.starbornImages={}
-    end
-    record.starbornSignature=signature
-    starbornSpriteCount=starbornSpriteCount+math.max(0,count-allocated)
-    record.starbornGlyphCount=math.max(allocated,count)
-    local glyphIndex=0
-    local lineHeight=STARBORN_LINE_HEIGHT*scale
-    local y=object.TextYAlignment==Enum.TextYAlignment.Bottom and bounds.Y-#lines*lineHeight
-        or object.TextYAlignment==Enum.TextYAlignment.Center and (bounds.Y-#lines*lineHeight)/2 or 0
-    for _,line in ipairs(lines) do
-        local x=object.TextXAlignment==Enum.TextXAlignment.Right and bounds.X-line.width
-            or object.TextXAlignment==Enum.TextXAlignment.Center and (bounds.X-line.width)/2 or 0
-        for _,item in ipairs(line.glyphs) do
-            local g=item.glyph
-            glyphIndex=glyphIndex+1
-            local image=record.starbornImages[glyphIndex]
-            if not image then
-                image=Instance.new("ImageLabel")
-                image.Name="Glyph";image:SetAttribute("VisualsV2_FontGlyph",true);image.BackgroundTransparency=1
-                record.starbornImages[glyphIndex]=image;image.Parent=frame
-            end
-            image.Visible=true;image.Image=atlas;image.ImageRectOffset=Vector2.new(g[1],g[2]);image.ImageRectSize=Vector2.new(g[3],g[4])
-            image.Size=UDim2.fromOffset(g[3]*scale,g[4]*scale)
-            image.Position=UDim2.fromOffset(x+item.x+g[5]*scale,y+g[6]*scale)
-            image.ImageColor3=object.TextColor3;image.ImageTransparency=alpha;image.ZIndex=object.ZIndex
-            image.Parent=frame
-        end
-        y=y+lineHeight
-    end
-    for index=glyphIndex+1,#record.starbornImages do record.starbornImages[index].Visible=false end
-    if frame.Parent~=object then frame.Parent=object end
-    record.starbornAppliedAlpha=1
-    writeProperty(object,record,"TextTransparency",1)
-end
-
-local fontRenderPending={}
-local fontRenderQueue={}
-local fontRenderRunning=false
-local function renderStarborn(object,record)
-    if not fontsEnabled or selectedFont~="Starborn" then return end
-    if not starbornVisible(object) then clearStarborn(object,record);return end
-    if fontRenderPending[object] then return end
-    fontRenderPending[object]=record;fontRenderQueue[#fontRenderQueue+1]=object
-    if fontRenderRunning then return end
-    fontRenderRunning=true
-    task.defer(function()
-        local index=1
-        while alive and runtimeAlive and index<=#fontRenderQueue do
-            local started=os.clock()
-            local count=0
-            repeat
-                local item=fontRenderQueue[index];index=index+1
-                local saved=fontRenderPending[item];fontRenderPending[item]=nil
-                if saved and records[item]==saved and item.Parent and fontsEnabled and selectedFont=="Starborn" then
-                    pcall(drawStarborn,item,saved)
-                end
-                count=count+1
-            until index>#fontRenderQueue or count>=4 or os.clock()-started>=0.0015
-            if index<=#fontRenderQueue then task.wait() end
-        end
-        table.clear(fontRenderQueue);table.clear(fontRenderPending);fontRenderRunning=false
-    end)
-end
-
 local function applyFont(object,record)
     local original=record.font or readFont(object)
     if fontsEnabled and not isIconFont(object,original) then
         if not record.font then record.font=original end
         if selectedFont=="Starborn" then
-            writeProperty(object,record,"Font",Enum.Font.FredokaOne)
-            renderStarborn(object,record)
+            local face=loadStarborn()
+            if not face then restoreFont(object,record);return end
+            writeProperty(object,record,"FontFace",face)
+            local size=math.clamp(math.floor((record.font.size or 14)*0.85+0.5),9,48)
+            writeProperty(object,record,"TextSize",size)
+            record.appliedSize=size
+            if object.TextScaled then
+                local constraint=record.sizeConstraint or object:FindFirstChildOfClass("UITextSizeConstraint")
+                if not constraint then
+                    constraint=Instance.new("UITextSizeConstraint")
+                    constraint.Name="VisualsV2_FontSize";constraint.MinTextSize=8
+                    constraint.Parent=object;record.ownsConstraint=true
+                elseif not record.sizeConstraint then record.constraintMax=constraint.MaxTextSize end
+                record.sizeConstraint=constraint
+                local maximum=math.clamp(math.floor(math.max(size,object.AbsoluteSize.Y*0.65)),11,36)
+                constraint.MaxTextSize=math.max(constraint.MinTextSize,math.min(record.constraintMax or maximum,maximum))
+            end
         else
-            clearStarborn(object,record)
+            if record.appliedSize or record.sizeConstraint then
+                local native=record.font
+                restoreFont(object,record);record.font=native
+            end
             writeProperty(object,record,"Font",fonts[selectedFont])
         end
         record.appliedFont=readFont(object)
-    else restoreFont(object,record) end
+    else
+        restoreFont(object,record)
+    end
 end
 
 local function applyText(object,record)
@@ -15767,7 +15127,7 @@ local function connectProperty(object,record,property,callback)
 end
 
 local function process(object)
-    if not alive or not runtimeAlive or resetting or object:GetAttribute("VisualsV2_FontGlyph") then return end
+    if not alive or not runtimeAlive or resetting then return end
     local text=object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")
     local nameLabel=text and not object:IsA("TextBox")
     local image=object:IsA("ImageLabel") or object:IsA("ImageButton")
@@ -15791,19 +15151,11 @@ local function process(object)
             connectProperty(object,record,"Font",fontChanged)
             connectProperty(object,record,"FontFace",fontChanged)
             connectProperty(object,record,"TextSize",function()
-                if record.font then record.font.size=object.TextSize end
-                if selectedFont=="Starborn" then renderStarborn(object,record) end
+                if record.font and object.TextSize~=record.appliedSize then
+                    record.font.size=object.TextSize
+                    if selectedFont=="Starborn" then applyFont(object,record) end
+                end
             end)
-            connectProperty(object,record,"TextTransparency",function()
-                if selectedFont~="Starborn" or object.TextTransparency==record.starbornAppliedAlpha then return end
-                if record.starbornFrame then record.starbornAlpha=object.TextTransparency;record.starbornSignature=nil end
-                renderStarborn(object,record)
-            end)
-            for _,property in ipairs({"AbsoluteSize","TextColor3","TextXAlignment","TextYAlignment"}) do
-                connectProperty(object,record,property,function()
-                    if fontsEnabled and selectedFont=="Starborn" then renderStarborn(object,record) end
-                end)
-            end
         end
         if nameLabel then
             connectProperty(object,record,"Text",function()
@@ -15830,48 +15182,14 @@ local function refreshObject(object)
     if inRoots(object) then pcall(process,object) else release(object) end
 end
 
-local textWorkQueue={}
-local textWorkPending=setmetatable({}, {__mode="k"})
-local textWorkRunning=false
-local textScanEpoch=0
-local function queueTextObject(object)
-    if not alive or not runtimeAlive or resetting or textWorkPending[object]
-        or object:GetAttribute("VisualsV2_FontGlyph") then return end
-    if not records[object] and not (object:IsA("TextLabel") or object:IsA("TextButton")
-        or object:IsA("TextBox") or object:IsA("ImageLabel") or object:IsA("ImageButton")) then return end
-    textWorkPending[object]=true;textWorkQueue[#textWorkQueue+1]=object
-    if textWorkRunning then return end
-    textWorkRunning=true
-    task.defer(function()
-        local index=1
-        while alive and runtimeAlive and not resetting and index<=#textWorkQueue do
-            local count=0
-            local started=os.clock()
-            repeat
-                local object=textWorkQueue[index];index=index+1;textWorkPending[object]=nil
-                refreshObject(object)
-                count=count+1
-            until index>#textWorkQueue or count>=24 or os.clock()-started>=0.0015
-            if index<=#textWorkQueue then task.wait() end
-        end
-        table.clear(textWorkQueue);table.clear(textWorkPending);textWorkRunning=false
-    end)
-end
-
 refresh=function()
     if resetting then return end
-    textScanEpoch=textScanEpoch+1
-    local epoch=textScanEpoch
     disconnectAll(rootConnections)
     table.clear(roots)
     if alive and runtimeAlive and (fontsEnabled or hideNames or hideAvatar) then
         local function addRoot(root)
             if typeof(root)~="Instance" then return end
-            for index=#roots,1,-1 do
-                local existing=roots[index]
-                if root==existing or root:IsDescendantOf(existing) then return end
-                if existing:IsDescendantOf(root) then table.remove(roots,index) end
-            end
+            for _,existing in ipairs(roots) do if root==existing then return end end
             roots[#roots+1]=root
         end
         addRoot(LocalPlayer:FindFirstChildOfClass("PlayerGui"))
@@ -15883,43 +15201,19 @@ refresh=function()
         end
         for _,root in ipairs(roots) do
             pcall(function()
-                rootConnections[#rootConnections+1]=root.DescendantAdded:Connect(queueTextObject)
-                rootConnections[#rootConnections+1]=root.DescendantRemoving:Connect(queueTextObject)
+                rootConnections[#rootConnections+1]=root.DescendantAdded:Connect(function(object)
+                    refreshObject(object)
+                    task.defer(function() refreshObject(object) end)
+                end)
+                rootConnections[#rootConnections+1]=root.DescendantRemoving:Connect(function(object)
+                    task.defer(function() if not inRoots(object) then release(object) end end)
+                end)
+                for _,object in ipairs(root:GetDescendants()) do pcall(process,object) end
             end)
         end
-        local rootSnapshot=table.clone(roots)
-        task.defer(function()
-            local pending=rootSnapshot
-            local visited=0
-            local started=os.clock()
-            while #pending>0 and epoch==textScanEpoch and alive and runtimeAlive and not resetting do
-                local object=table.remove(pending)
-                if not object:GetAttribute("VisualsV2_FontGlyph") then
-                    queueTextObject(object)
-                    for _,child in ipairs(object:GetChildren()) do pending[#pending+1]=child end
-                end
-                visited=visited+1
-                if visited>=48 or os.clock()-started>=0.0015 then visited=0;task.wait();started=os.clock() end
-            end
-        end)
     end
-    for object in pairs(records) do queueTextObject(object) end
+    for object in pairs(records) do refreshObject(object) end
 end
-
-task.spawn(function()
-    while alive and runtimeAlive do
-        if fontsEnabled and selectedFont=="Starborn" then
-            local count=0
-            for object,record in pairs(records) do
-                if record.font and object.Parent then pcall(renderStarborn,object,record) end
-                count=count+1
-                if count%96==0 then task.wait() end
-                if not alive or not runtimeAlive or selectedFont~="Starborn" then break end
-            end
-        end
-        task.wait(0.35)
-    end
-end)
 
 local fontToggle=addToggle(fontSection,"Enable Custom Fonts",fontsEnabled,function(value)
     fontsEnabled=value
@@ -15954,10 +15248,6 @@ pcall(function()
     end)
 end)
 
-env.VisualsV2Runtime.TextFonts={GetDiagnostics=function()
-    return {enabled=fontsEnabled,font=selectedFont,starbornAssetReady=starbornAsset~=nil,
-        glyphSprites=starbornSpriteCount,glyphBudget=STARBORN_MAX_SPRITES,queuedLabels=#fontRenderQueue,availableFonts=#fontNames}
-end}
 env.VisualsV2Runtime.RegisterReset(function()
     resetting=true
     fontsEnabled=false
@@ -15981,26 +15271,16 @@ end)()
 ;(function()
 local pending={}
 local runtime=env.VisualsV2Runtime
-local stats={equips=0,dispatches=0,failures=0,route="ODH Shoot Murderer button"}
-local nextNotice=0
-local function failure(reason)
-    stats.error=tostring(reason);stats.failures=stats.failures+1
-    if os.clock()>=nextNotice then
-        nextNotice=os.clock()+5
-        pcall(shared.Notify,"Clutch auto-shoot: "..stats.error,4)
-    end
-end
+local stats={equips=0,shots=0}
 runtime.JumpGunFollowup={Queue=function(key,character,options,delayTime)
-    -- A newer clutch supersedes an older delayed shot, including the other type.
-    table.clear(pending)
     local token={};pending[key]=token
-    task.delay(delayTime or 0.12,function()
+    task.delay(delayTime or 0.06,function()
         local function current()
             return runtimeAlive and pending[key]==token and LocalPlayer.Character==character
         end
         if not current() then return end
         local equip,shoot=options()
-        if not equip and not shoot then pending[key]=nil;return end
+        if not equip and not shoot then return end
         local humanoid=character and character:FindFirstChildOfClass("Humanoid")
         local backpack=LocalPlayer:FindFirstChildOfClass("Backpack")
         if not humanoid or humanoid.Health<=0 then return end
@@ -16011,48 +15291,17 @@ runtime.JumpGunFollowup={Queue=function(key,character,options,delayTime)
             end
             if gun then break end
         end
-        if not gun then
-            if shoot then failure("No gun in your character or backpack") end
-            pending[key]=nil;return
-        end
+        if not gun then stats.error="No gun in your character or backpack";return end
         local ok=pcall(function() humanoid:EquipTool(gun) end)
-        if not ok then
-            if shoot then failure("The gun could not be equipped") end
-            pending[key]=nil;return
-        end
+        if not ok then stats.error="The gun could not be equipped";return end
         stats.equips=stats.equips+1
-        if not shoot then stats.error=nil;pending[key]=nil;return end
-        task.spawn(function()
-            local deadline=os.clock()+1.5
-            local function ready()
-                if not current() or humanoid.Health<=0 or gun.Parent~=character then return false end
-                local _,stillShoot=options()
-                return stillShoot==true
-            end
-            repeat
-                task.wait(0.05)
-                if not ready() then return end
-            until gun.Enabled or os.clock()>=deadline
-            if not gun.Enabled then failure("The gun is still reloading");pending[key]=nil;return end
-            deadline=os.clock()+2
-            local reason="Enable ODH's Shoot Murderer button first"
-            repeat
-                if not ready() then return end
-                if not gun.Enabled then failure("The gun is still reloading");pending[key]=nil;return end
-                local action=runtime.ODHShootMurderer
-                if type(action)~="function" then failure("The ODH button bridge is unavailable");pending[key]=nil;return end
-                local success,dispatched,detail,retry=pcall(action)
-                if not current() then return end
-                if success and dispatched then
-                    stats.dispatches=stats.dispatches+1;stats.error=nil;pending[key]=nil;return
-                end
-                reason=success and (detail or reason) or tostring(dispatched)
-                if not success or retry~=true then break end
-                task.wait(0.15)
-            until os.clock()>=deadline
-            if ready() then
-                failure(reason);pending[key]=nil
-            end
+        if not shoot then stats.error=nil;return end
+        task.delay(0.08,function()
+            if not current() or humanoid.Health<=0 or gun.Parent~=character then return end
+            local _,stillShoot=options()
+            if not stillShoot then return end
+            local fired,reason=runtime.ODHShootMurderer()
+            if fired then stats.shots=stats.shots+1;stats.error=nil else stats.error=reason end
         end)
     end)
 end,GetDiagnostics=function() return table.clone(stats) end}
@@ -16894,7 +16143,7 @@ hiddenGui.IgnoreGuiInset = true
 hiddenGui.Parent = GetSafeGuiRoot()
 RootMaid:GiveTask(hiddenGui)
 
-local section=mainTab:AddSection("Bomb Jump Clutch","Utilities")
+local section=mainTab:AddSection("Bomb Jump+","Utilities")
 local vv2Controls={}
 local function settingKey(label)
     return "vv2BombJump_"..label:gsub("[^%w]","")
@@ -16909,7 +16158,6 @@ function proxy:AddLabel(label)
 end
 function proxy:AddToggle(label,callback)
     local key=settingKey(label)
-    if ConfigData[key]==nil and ConfigData[key.."ODH"]~=nil then SetCfg(key,ConfigData[key.."ODH"]) end
     local controller=addToggle(section,controlLabel(label),C(key,false),function(value)
         SetCfg(key,value)
         callback(value)
@@ -16956,7 +16204,7 @@ local _game = game.GameId==10413186812 and "Murder Mystery Modded"
 
 if _game == "Murder Mystery 2" or _game == "Murder Mystery Modded" then
 
-local section = BombJump:AddSection("Bomb Jump Clutch", "MM2/MMV")
+local section = BombJump:AddSection("Bomb Jump+", "MM2/MMV")
 
 local CONFIG = {
     CooldownTime = 22.0,
@@ -17168,7 +16416,7 @@ local function FastBombJump()
             env.VisualsV2Runtime.JumpGunFollowup.Queue("BombJump",actionCharacter,function()
                 if not alive then return false,false end
                 return equipGunAfterJump,shootAfterJump
-            end,0.55)
+            end)
 
             vv2Spawn(function()
                 task.wait(0.1)
@@ -17239,19 +16487,9 @@ BombJumpMaid:GiveTasks(
     end)
 )
 
-local lastJumpRequest=-math.huge
-BombJumpMaid:GiveTask(Services.UserInputService.JumpRequest:Connect(function()
-    if not bombJumpEnabled or not IsHoldingBomb() then lastJumpRequest=-math.huge;return end
-    local now=os.clock()
-    local gap=now-lastJumpRequest
-    if gap<0.08 then return end
-    if gap<0.8 and IsPlayerInAir() and not onCooldown and not debounce then FastBombJump() end
-    lastJumpRequest=now
-end))
-
-section:AddLabel("Bomb Jump Clutch Options")
+section:AddLabel("Bomb Jump Options")
 section:AddToggle("Equip Gun After Bomb Jump",function(value) equipGunAfterJump=value end)
-section:AddToggle("Shoot Murderer After Bomb Jump",function(value) shootAfterJump=value end)
+section:AddToggle("Shoot Murderer After Bomb Jump (ODH)",function(value) shootAfterJump=value end)
 section:AddToggle("Enable Auto Bomb Jump", function(bool) bombJumpEnabled = bool end)
 
 section:AddToggle("Auto-Get Fake Bomb", function(bool)
@@ -17339,7 +16577,7 @@ local gbjSection = BombJump:AddSection("Gold Bomb Jump+", "MMV")
 local equipGunAfterGoldJump=false
 local shootAfterGoldJump=false
 gbjSection:AddToggle("Equip Gun After Gold Bomb Jump",function(value) equipGunAfterGoldJump=value end)
-gbjSection:AddToggle("Shoot Murderer After Gold Bomb Jump",function(value) shootAfterGoldJump=value end)
+gbjSection:AddToggle("Shoot Murderer After Gold Bomb Jump (ODH)",function(value) shootAfterGoldJump=value end)
 
 local gbjOnCooldown = false
 local goldBombJumpEnabled = false
@@ -17493,7 +16731,7 @@ local function FastGoldBombJump()
             env.VisualsV2Runtime.JumpGunFollowup.Queue("GoldBombJump",actionCharacter,function()
                 if not alive then return false,false end
                 return equipGunAfterGoldJump,shootAfterGoldJump
-            end,0.55)
+            end)
 
             vv2Spawn(function()
                 task.wait(0.1)
@@ -18080,7 +17318,7 @@ end)
 local equipGunToggle=addToggle(section,"Equip Gun After Firefly Clutch",equipGunAfterClutch,function(value)
     equipGunAfterClutch=value;SetCfg("fireflyEquipGun",value)
 end)
-local shootToggle=addToggle(section,"Shoot Murderer After Firefly Clutch",shootAfterClutch,function(value)
+local shootToggle=addToggle(section,"Shoot Murderer After Firefly Clutch (ODH)",shootAfterClutch,function(value)
     shootAfterClutch=value;SetCfg("fireflyShootMurderer",value)
 end)
 local timerToggle=addToggle(section,"Enable Firefly Timer",timerEnabled,function(state)
@@ -18511,7 +17749,7 @@ end)()
 local section=mainTab:AddSection("Increase Inventory","Utilities")
 section:AddParagraph(
     "Increase Inventory",
-    "Expands the original game tool inventory to your selected limit. Uses the game's hotbar and equip controls."
+    "Increases the number of tools you can carry, up to 10."
 )
 
 local inventoryEnabled=C("inventoryUnlimiterEnabled",false)
@@ -18528,7 +17766,22 @@ if tonumber(C("autoToySelectionVersion",0))<1 then
     end
     SetCfg("autoToySelectionVersion",1)
 end
+local getgc=getgc or env.getgc
+local getupvalues=(debug and debug.getupvalues) or getupvalues or env.getupvalues
+local getupvalue=(debug and debug.getupvalue) or getupvalue or env.getupvalue
+local setupvalue=(debug and debug.setupvalue) or setupvalue or env.setupvalue
+local getinfo=(debug and debug.getinfo) or getinfo or env.getinfo
+local getconstants=(debug and debug.getconstants) or getconstants or env.getconstants
+local setconstant=(debug and debug.setconstant) or setconstant or env.setconstant
+local getprotos=(debug and debug.getprotos) or getprotos or env.getprotos
+local getfenv=getfenv or env.getfenv
+local debugInfo=debug and debug.info
+local targetFunctions={}
+local targetDetails=setmetatable({}, {__mode="k"})
 local targetsScanned=false
+local scanningTargets=false
+local targetEpoch=0
+local lastTargetScan=-math.huge
 local slotReferences={}
 local observedGui=nil
 local perf={targetScans=0,guiScans=0,slotVisits=0,scanYields=0,targets=0,patchedLimits=0}
@@ -18560,308 +17813,182 @@ local function disconnectAll(connections)
     table.clear(connections)
 end
 
--- Change the game's own tool controller. No extra GUI or input bindings are created.
--- Native target/3-or-10 upvalue approach adapted from B6O6S / Better-ODH,
--- Main Loader.lua, "MORE INVENTORY SLOT & SLIDER" (2026-10-16).
--- Keep Visuals V2's existing controls, restoration and batched discovery.
-local getgc=getgc or env.getgc
-local getupvalues=(debug and debug.getupvalues) or getupvalues or env.getupvalues
-local getupvalue=(debug and debug.getupvalue) or getupvalue or env.getupvalue
-local setupvalue=(debug and debug.setupvalue) or setupvalue or env.setupvalue
-local getinfo=(debug and debug.getinfo) or getinfo or env.getinfo
-local getconstants=(debug and debug.getconstants) or getconstants or env.getconstants
-local getfenv=getfenv or env.getfenv
-local debugInfo=debug and debug.info
-local capacityTargets={}
-local capacityRecords={}
-local capacityEpoch=0
-local capacityRunning=false
-local capacityAttempts=0
-local lastCapacityScan=-math.huge
-local capacityRequested=false
-local capacityDirty=false
-local requestNativeCapacity
-perf.api={getgc=type(getgc)=="function",getupvalues=type(getupvalues)=="function",
-    getupvalue=type(getupvalue)=="function",setupvalue=type(setupvalue)=="function",
-    getinfo=type(getinfo)=="function",getconstants=type(getconstants)=="function"}
-local targetNames={updateitemframe=true,onitemequipped=true}
-local exportedNames={"OnItemEquipped","UpdateItemFrame"}
-local refreshNames={updateitemframe=true}
-local function normalized(value) return tostring(value or ""):lower():gsub("[^%w]","") end
-local function inspectUpvalues(f)
-    if type(getupvalues)=="function" then
-        local ok,values=pcall(getupvalues,f)
-        if ok and type(values)=="table" then
-            for index in pairs(values) do if type(index)=="number" then return values end end
-            if type(getupvalue)~="function" then return values end
-        end
+local function discoverTargets(force)
+    if scanningTargets or (targetsScanned and not force) or os.clock()-lastTargetScan<2 then return end
+    if type(getgc)~="function" or not ((type(getupvalues)=="function" and type(setupvalue)=="function")
+        or (type(getconstants)=="function" and type(setconstant)=="function")) then
+        perf.error="This executor does not expose inventory inspection";return
     end
-    local values={}
-    if type(getupvalue)=="function" then
-        for index=1,64 do
-            local result=table.pack(pcall(getupvalue,f,index))
-            if not result[1] then break end
-            -- Executor APIs return a value; Lua-style APIs return name, value.
-            local value=result[2]
-            if result.n>=3 and type(value)=="string" then value=result[3] end
-            values[index]=value
-        end
-    end
-    return values
-end
-local function upvalueAt(f,index)
-    if type(getupvalue)=="function" then
-        local result=table.pack(pcall(getupvalue,f,index))
-        if result[1] then
-            if result.n>=3 and type(result[2])=="string" then return result[3],result[2] end
-            return result[2],nil
-        end
-    end
-    return inspectUpvalues(f)[index],nil
-end
-local function functionDetails(f,hint)
-    local name,source,params,vararg="","",nil,nil
-    if type(getinfo)=="function" then
-        local ok,result=pcall(getinfo,f)
-        if ok and type(result)=="table" then
-            name=normalized(result.name);source=tostring(result.source or result.short_src or ""):lower()
-            params=tonumber(result.numparams or result.nparams)
-            vararg=result.is_vararg
-            if vararg==nil then vararg=result.isvararg end
-        end
-    end
-    if name=="" and hint then name=normalized(hint) end
-    if type(debugInfo)=="function" then
-        if name=="" then local ok,value=pcall(debugInfo,f,"n");if ok then name=normalized(value) end end
-        if source=="" then local ok,value=pcall(debugInfo,f,"s");if ok then source=tostring(value or ""):lower() end end
-        if params==nil then
-            local ok,count,isvararg=pcall(debugInfo,f,"a")
-            if ok then params=tonumber(count);vararg=isvararg end
-        end
-    end
-    local scriptObject
-    if type(getfenv)=="function" then
-        local ok,context=pcall(getfenv,f)
-        scriptObject=ok and type(context)=="table" and rawget(context,"script") or nil
-        if typeof(scriptObject)=="Instance" then
-            -- A parentless module may still own live native closures in an executor.
-            local success,path=pcall(function() return scriptObject:GetFullName() end)
-            if success then source=source.." "..path:lower() end
-        else scriptObject=nil end
-    end
-    if source:find("trade",1,true) or source:find("trading",1,true) or source:find("emote",1,true)
-        or source:find("shop",1,true) or source:find("visualsv2",1,true) or source:find("overdrive",1,true) then return nil end
-    local context=source:find("backpack",1,true) or source:find("hotbar",1,true)
-        or source:find("toolinventory",1,true) or source:find("touchbinding",1,true)
-    return {name=name,source=source,context=context~=nil,script=scriptObject,
-        scriptWasParented=scriptObject and scriptObject.Parent~=nil,
-        noArguments=params==0 and (vararg==false or vararg==0),refs={}}
-end
-local function constantsOf(f)
-    if type(getconstants)~="function" then return {} end
-    local ok,values=pcall(getconstants,f)
-    return ok and type(values)=="table" and values or {}
-end
-local function nativeSignature(values)
-    local touch,equip=false,false
-    for _,value in pairs(values) do
-        if value=="TouchBinding" then touch=true elseif value=="EquipButton" then equip=true end
-    end
-    return touch and equip
-end
-local function nativeReferences(detail,values)
-    for _,value in pairs(values) do
-        if typeof(value)=="Instance" and value:IsA("GuiObject") then
-            local name=normalized(value.Name)
-            if name=="hotbar" or name=="touchbinding" or name=="touchbindings" or name=="equipbutton" then
-                detail.context=true
-                if value.Parent then detail.refs[#detail.refs+1]=value end
-            end
-        end
-    end
-end
-local function candidateAlive(candidate)
-    local detail=candidate.detail
-    if detail.scriptWasParented and not detail.script.Parent then return false end
-    for _,reference in ipairs(detail.refs) do if not reference.Parent then return false end end
-    return true
-end
-local function inspectCapacityTargets(epoch)
-    if type(getgc)~="function" then perf.error="This executor does not expose native inventory inspection";return false end
+    scanningTargets=true
+    lastTargetScan=os.clock()
+    local epoch=targetEpoch
     perf.targetScans=perf.targetScans+1
-    local ok,objects=pcall(getgc)
-    if not ok or type(objects)~="table" then perf.error="Native tool-controller discovery failed";return false end
-    local found,seen={},{}
-    local function inspect(f,hint)
-        if type(f)~="function" or seen[f] then return end
-        local detail=functionDetails(f,hint)
-        if not detail then return end
-        -- Better-ODH identifies these two names directly. Native names remain
-        -- valid even when source paths/debug labels are absent or renamed.
-        detail.constants=not targetNames[detail.name] and constantsOf(f) or {}
-        detail.signature=nativeSignature(detail.constants)
-        if not targetNames[detail.name] and not detail.signature then return end
+    local okGc,objects=pcall(getgc)
+    if not okGc or type(objects)~="table" then scanningTargets=false;return end
+    local found={}
+    local seen={}
+    local names={updateitemframe=true,onitemequipped=true,updatehotbar=true,updatetools=true,
+        addtool=true,onbackpackchildadded=true,updatebackpack=true}
+    local function inspect(f,inherited)
+        if seen[f] or type(f)~="function" then return end
         seen[f]=true
-        detail.native=true
-        nativeReferences(detail,inspectUpvalues(f))
-        found[#found+1]={f=f,detail=detail}
-    end
-    local started=os.clock()
-    for index,object in ipairs(objects) do
-        if epoch~=capacityEpoch or not alive or not runtimeAlive or not inventoryEnabled then return false end
-        if type(object)=="function" then inspect(object)
-        elseif type(object)=="table" then
-            for _,name in ipairs(exportedNames) do
-                inspect(rawget(object,name) or rawget(object,name:sub(1,1):lower()..name:sub(2)),name)
+        local name,source="",""
+        if type(getinfo)=="function" then
+            local ok,info=pcall(getinfo,f)
+            if ok and type(info)=="table" then name=tostring(info.name or ""):lower();source=tostring(info.source or info.short_src or ""):lower() end
+        end
+        if name=="" and type(debugInfo)=="function" then
+            local ok,value=pcall(debugInfo,f,"n")
+            if ok then name=tostring(value or ""):lower() end
+        end
+        if source:find("trade",1,true) or source:find("trading",1,true) then return end
+        local contextual=inherited or source:find("backpack",1,true) or source:find("hotbar",1,true)
+        if not contextual and type(getfenv)=="function" then
+            local ok,context=pcall(getfenv,f)
+            local script=ok and type(context)=="table" and rawget(context,"script")
+            if typeof(script)=="Instance" then
+                local path=script:GetFullName():lower()
+                if path:find("trade",1,true) or path:find("trading",1,true) then return end
+                contextual=path:find("backpack",1,true) or path:find("hotbar",1,true)
             end
         end
-        if index%64==0 or os.clock()-started>=0.0015 then
-            perf.scanYields=perf.scanYields+1;task.wait();started=os.clock()
+        local constants
+        if type(getconstants)=="function" and (names[name] or contextual or name=="") then
+            local ok,result=pcall(getconstants,f)
+            if ok and type(result)=="table" then constants=result end
         end
-    end
-    if #found==0 then
-        -- Some executors omit names on exported methods. Only request tables
-        -- as a fallback; the common path stays the same as Better-ODH's scanner.
-        local success,tables=pcall(getgc,true)
-        if success and type(tables)=="table" then
-            for index,object in ipairs(tables) do
-                if epoch~=capacityEpoch or not alive or not runtimeAlive or not inventoryEnabled then return false end
-                if type(object)=="table" then
-                    for _,name in ipairs(exportedNames) do
-                        inspect(rawget(object,name) or rawget(object,name:sub(1,1):lower()..name:sub(2)),name)
-                    end
-                end
-                if index%64==0 or os.clock()-started>=0.0015 then
-                    perf.scanYields=perf.scanYields+1;task.wait();started=os.clock()
-                end
+        local touch,equip=false,false
+        for _,value in pairs(constants or {}) do
+            if value=="TouchBinding" then touch=true elseif value=="EquipButton" then equip=true end
+        end
+        local strong=(name=="updateitemframe" or name=="onitemequipped" or touch and equip)
+        if strong or contextual and names[name] then
+            found[#found+1]=f
+            targetDetails[f]={strong=strong,constants=constants}
+            if type(getprotos)=="function" then
+                local ok,protos=pcall(getprotos,f)
+                if ok and type(protos)=="table" then for _,child in pairs(protos) do inspect(child,true) end end
             end
         end
     end
-    if epoch~=capacityEpoch then return false end
-    capacityTargets=found
-    perf.targets=#found;perf.candidates={};perf.engine="Better-ODH native upvalues"
-    for index=1,math.min(#found,24) do
-        local detail=found[index].detail
-        perf.candidates[index]={name=detail.name,source=detail.source,markers=detail.signature}
+    local slice=os.clock()
+    for index,f in ipairs(objects) do
+        if not alive or not runtimeAlive or targetEpoch~=epoch or not inventoryEnabled then scanningTargets=false;return end
+        if type(f)=="function" then inspect(f,false) end
+        if index%64==0 or os.clock()-slice>=0.002 then
+            perf.scanYields=perf.scanYields+1
+            task.wait()
+            slice=os.clock()
+        end
     end
-    return true
+    targetFunctions=found
+    perf.targets=#found
+    targetsScanned=#targetFunctions>0
+    scanningTargets=false
 end
-local function saveCapacity(identity,key,reader,writer)
-    local ok,value=pcall(reader)
-    if not ok or type(value)~="number" or value<2 or value>10 then return false,false end
-    local records=capacityRecords[identity]
-    if not records then records={};capacityRecords[identity]=records end
-    local record=records[key]
-    if not record then record={original=value,read=reader,write=writer};records[key]=record end
-    if value==inventoryLimit then record.applied=value;return true,false end
-    local changed=pcall(writer,inventoryLimit)
-    local verified,current=pcall(reader)
-    if changed and verified and current==inventoryLimit then record.applied=current;return true,true end
-    return false,false
+
+local limitNames={maxitems=true,maxslots=true,maxtools=true,inventorylimit=true,
+    inventorymaxitems=true,hotbarlimit=true,touchbindinglimit=true,maxitemcount=true,
+    maxinventory=true,maxinventoryitems=true,maxtoolslots=true,hotbarsize=true,
+    inventorysize=true,maxinventoryslots=true,maximumitems=true}
+local originalLimits={}
+local originalConstants=setmetatable({}, {__mode="k"})
+local function isLimitName(name)
+    return type(name)=="string" and limitNames[name:lower():gsub("[^%w]","")]==true
 end
-local function applyInventoryLimit()
-    if not inventoryEnabled then return false end
-    local patched,changed=0,false
-    for _,candidate in ipairs(capacityTargets) do
-        if not candidateAlive(candidate) then continue end
-        local f=candidate.f
-        local values=inspectUpvalues(f)
-        local previous=capacityRecords[f] or {}
-        for index,value in pairs(values) do
-            -- Same 3/10 capacity test as the referenced increaser. Track previous
-            -- writes too, so moving our slider from 4 to 7 continues to work.
-            if type(index)=="number" and type(value)=="number" and type(setupvalue)=="function"
-                and (value==3 or value==10 or previous[index]) then
-                local success,written=saveCapacity(f,index,function() return upvalueAt(f,index) end,
-                    function(limit) setupvalue(f,index,limit) end)
-                if success then patched=patched+1 end
-                changed=changed or written
-            end
-        end
+local function setLimit(identity,key,readValue,writeValue)
+    local ok,value=pcall(readValue)
+    if not ok or type(value)~="number" or value<2 or value>10 then return false end
+    local originals=originalLimits[identity]
+    if not originals then originals={};originalLimits[identity]=originals end
+    local record=originals[key]
+    if not record then record={original=value,read=readValue,write=writeValue};originals[key]=record end
+    if pcall(writeValue,inventoryLimit) then
+        local success,current=pcall(readValue)
+        if success and current==inventoryLimit then record.applied=inventoryLimit;return true end
     end
-    if changed then
-        for _,candidate in ipairs(capacityTargets) do
-            local detail=candidate.detail
-            if refreshNames[detail.name] and detail.noArguments and candidateAlive(candidate) then
-                local ok,reason=pcall(candidate.f)
-                if ok then perf.nativeRefreshes=(perf.nativeRefreshes or 0)+1 else perf.refreshError=tostring(reason) end
-            end
-        end
-    end
-    perf.mode="native";perf.capacity=inventoryLimit;perf.patchedLimits=patched
-    targetsScanned=patched>0
-    perf.error=patched==0 and "Native tool capacity was not found; save weapon diagnostics if it remains at three slots" or nil
-    return patched>0
-end
-local function verifyNativeCapacity()
-    if not alive or not runtimeAlive or not inventoryEnabled or not targetsScanned then return end
-    perf.capacityChecks=(perf.capacityChecks or 0)+1
-    for _,candidate in ipairs(capacityTargets) do
-        if not candidateAlive(candidate) then requestNativeCapacity(true);return end
-    end
-    for _,records in pairs(capacityRecords) do
-        for _,record in pairs(records) do
-            if record.applied then
-                local ok,current=pcall(record.read)
-                if ok and current~=inventoryLimit then
-                    perf.capacityRepairs=(perf.capacityRepairs or 0)+1
-                    applyInventoryLimit();return
-                end
-            end
-        end
-    end
+    return false
 end
 local function restoreInventoryLimits()
-    capacityEpoch=capacityEpoch+1;capacityRequested=false;capacityDirty=false
-    for _,records in pairs(capacityRecords) do
+    for _,records in pairs(originalLimits) do
         for _,record in pairs(records) do
-            local ok,value=pcall(record.read)
-            if ok and value==record.applied then pcall(record.write,record.original) end
+            local ok,current=pcall(record.read)
+            if ok and current==record.applied then pcall(record.write,record.original) end
         end
     end
-    table.clear(capacityRecords);table.clear(capacityTargets)
-    targetsScanned=false;capacityAttempts=0;lastCapacityScan=-math.huge
-    perf.patchedLimits=0
-end
-requestNativeCapacity=function(invalidate)
-    if not alive or not runtimeAlive or not inventoryEnabled then return end
-    if invalidate then capacityAttempts=0;capacityEpoch=capacityEpoch+1;capacityDirty=true;capacityRequested=true end
-    if capacityRunning then return end
-    if targetsScanned and not capacityDirty then applyInventoryLimit();return end
-    capacityRunning=true
-    task.spawn(function()
-        local ok,reason=pcall(function()
-            repeat
-                capacityRequested=false
-                local epoch=capacityEpoch
-                if capacityDirty then table.clear(capacityTargets);targetsScanned=false;capacityDirty=false end
-                local remaining=2-(os.clock()-lastCapacityScan)
-                if remaining>0 then task.wait(remaining) end
-                if epoch==capacityEpoch and alive and runtimeAlive and inventoryEnabled then
-                    capacityAttempts=capacityAttempts+1;lastCapacityScan=os.clock()
-                    inspectCapacityTargets(epoch)
-                    if epoch==capacityEpoch and alive and runtimeAlive and inventoryEnabled then applyInventoryLimit() end
-                end
-            until not capacityRequested or not alive or not runtimeAlive or not inventoryEnabled
-        end)
-        capacityRunning=false
-        if not ok then perf.error=tostring(reason) end
-        if alive and runtimeAlive and inventoryEnabled and not targetsScanned and capacityAttempts<4 then
-            local epoch=capacityEpoch
-            task.delay(2^math.max(capacityAttempts,1),function()
-                if epoch==capacityEpoch then requestNativeCapacity(false) end
-            end)
+    table.clear(originalLimits)
+    for f,records in pairs(originalConstants) do
+        local ok,constants=pcall(getconstants,f)
+        if ok and type(constants)=="table" then
+            for index,record in pairs(records) do
+                if constants[index]==record.applied then pcall(setconstant,f,index,record.original) end
+            end
         end
-    end)
+    end
+    table.clear(originalConstants)
 end
+local function applyInventoryLimit(force)
+    if not inventoryEnabled then return end
+    discoverTargets(force)
+    local patched=0
+    for _,f in ipairs(targetFunctions) do
+        local ok,upvalues=pcall(function() return type(getupvalues)=="function" and getupvalues(f) or {} end)
+        if ok and type(upvalues)=="table" then
+            for index,value in pairs(upvalues) do
+                if type(index)=="number" and type(value)=="number" then
+                    local hasName,name,namedValue=false,nil,nil
+                    if type(getupvalue)=="function" then
+                        local ok,label,current=pcall(getupvalue,f,index)
+                        local anonymous=type(label)=="string" and (label=="" or label=="?" or label=="_"
+                            or label:match("^v_?u?_?%d+$") or label:lower():match("^upvalue_?%d*$"))
+                        hasName=ok and type(label)=="string" and current==value and not anonymous
+                        if hasName then name,namedValue=label,current end
+                    end
+                    local originals=originalLimits[f]
+                    local previous=originals and originals[index]
 
--- Remove only an orphaned replacement bar left by an older execution.
-local function removeLegacyHotbar(gui)
-    if not gui then return end
-    local previous=gui:FindFirstChild("VisualsV2_ExpandedHotbar")
-    if previous and previous:IsA("ScreenGui") then previous:Destroy() end
+                    local legacyLimit=(not hasName or targetDetails[f] and targetDetails[f].strong) and (value==3
+                        or (previous and previous.original==3 and value==previous.applied))
+                    if (hasName and isLimitName(name) and namedValue==value) or legacyLimit then
+                        if type(setupvalue)=="function" and setLimit(f,index,function() return getupvalues(f)[index] end,
+                            function(limit) setupvalue(f,index,limit) end) then patched=patched+1 end
+                    end
+                elseif type(value)=="table" then
+                    for key,capacity in pairs(value) do
+                        if isLimitName(key) and type(capacity)=="number" then
+                            if setLimit(value,key,function() return value[key] end,function(limit) value[key]=limit end) then
+                                patched=patched+1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        -- Some MM2 hotbars compile their capacity as a constant, not an upvalue.
+        local detail=targetDetails[f]
+        if detail and detail.strong and type(getconstants)=="function" and type(setconstant)=="function" then
+            local ok,constants=pcall(getconstants,f)
+            if ok and type(constants)=="table" then
+                local records=originalConstants[f]
+                for index,value in pairs(constants) do
+                    local previous=records and records[index]
+                    if type(index)=="number" and (value==3 or previous and value==previous.applied) then
+                        if not records then records={};originalConstants[f]=records end
+                        local record=previous or {original=value}
+                        local changed=pcall(setconstant,f,index,inventoryLimit)
+                        local verified,current=pcall(getconstants,f)
+                        if changed and verified and current[index]==inventoryLimit then
+                            record.applied=inventoryLimit;records[index]=record;patched=patched+1
+                        end
+                    end
+                end
+            end
+        end
+    end
+    perf.patchedLimits=patched
+    targetsScanned=#targetFunctions>0 and patched>0
+    perf.error=patched==0 and "The native inventory capacity has not been found yet" or nil
 end
-
 local function getBackpack()
     if observedBackpack and observedBackpack.Parent==player then return observedBackpack end
     return player:FindFirstChildOfClass("Backpack")
@@ -18935,9 +18062,7 @@ local function scanSlotReferences(gui)
     local count=0
     while #pending>0 and alive and runtimeAlive and observedGui==gui do
         local object=table.remove(pending)
-        local name=object.Name:lower()
-        local skip=object~=gui and (object.Name:sub(1,10)=="VisualsV2_" or object:GetAttribute("VisualsV2_InventoryVisual")
-            or name:find("trade",1,true) or name:find("trading",1,true))
+        local skip=object~=gui and (object.Name:sub(1,10)=="VisualsV2_" or object:GetAttribute("VisualsV2_InventoryVisual"))
         if not skip and (object.Name=="Inventory" or object.Name=="Inventory2") then
             local main=object:FindFirstChild("Main") or object
             skip=main:FindFirstChild("Weapons") or main:FindFirstChild("Effects") or main:FindFirstChild("Pets")
@@ -19007,56 +18132,85 @@ requestRecovery=function(forceScan)
     if not alive or not runtimeAlive or not (inventoryEnabled or autoGetTools) then return end
     local char=player.Character
     if not char or char==removingCharacter then return end
-    if recoveryCharacter~=char then cancelRecovery();recoveryCharacter=char end
-    recoveryDeadline=math.max(recoveryDeadline,os.clock()+8)
-    if inventoryEnabled and forceScan then requestNativeCapacity(false) end
-    if not autoGetTools then return end
+    if recoveryCharacter~=char then
+        cancelRecovery()
+        recoveryCharacter=char
+    end
+    if forceScan then rescanRequested=true end
+    recoveryDeadline=math.max(recoveryDeadline,os.clock()+20)
     if recoveryRunning then return end
     recoveryRunning=true
     local token=recoveryToken
     task.spawn(function()
+        local startedAt=os.clock()
+        local scanTimes={0,1,3,6,10,15}
+        local scanIndex=1
+        local nextInventoryApply=0
+        local nextToyRequest=0
         while isCurrentRecovery(token,char) and os.clock()<recoveryDeadline do
             local now=os.clock()
             local humanoid=char:FindFirstChildOfClass("Humanoid")
             if humanoid and humanoid.Health>0 then
-                local backpack=getBackpack()
+                local force=rescanRequested
+                if scanTimes[scanIndex] and now-startedAt>=scanTimes[scanIndex] then
+                    force=force or not targetsScanned
+                    repeat scanIndex=scanIndex+1
+                    until not scanTimes[scanIndex] or now-startedAt<scanTimes[scanIndex]
+                end
+                if inventoryEnabled and (force or (targetsScanned and now>=nextInventoryApply)) then
+                    applyInventoryLimit(force)
+                    nextInventoryApply=now+1
+                end
+                rescanRequested=false
+
                 if autoGetTools then
-                    if toyOrderDirty and backpack and orderSelectedTools(char,backpack,token) then toyOrderDirty=false end
+                    local backpack=getBackpack()
+                    if toyOrderDirty and backpack and orderSelectedTools(char,backpack,token) then
+                        toyOrderDirty=false
+                    end
+                end
+                if autoGetTools and not activeToyRequest and now>=nextToyRequest then
+                    local backpack=getBackpack()
                     local folder=findToyFolder()
-                    local remote=not activeToyRequest and toyRemote()
+                    local remote=toyRemote()
                     if backpack and folder and remote then
                         local seen={}
                         for slot=1,4 do
                             local name=selectedToys[slot]
                             if name and name~="None" and not seen[name] then
                                 seen[name]=true
-                                if not hasSelectedTool(name,char,backpack) and folder:FindFirstChild(name) then
-                                    local attempt=toyAttempts[name] or {count=0,nextAt=0,inFlight=false}
-                                    toyAttempts[name]=attempt
-                                    if not attempt.inFlight and now>=attempt.nextAt then
-                                        attempt.count=attempt.count+1;attempt.inFlight=true;activeToyRequest=attempt
-                                        attempt.nextAt=now+math.min(8,0.75+attempt.count*0.75)
-                                        attempt.thread=task.spawn(function()
-                                            if isCurrentRecovery(token,char) and autoGetTools then pcall(function() remote:InvokeServer(name) end) end
-                                            attempt.inFlight=false;attempt.thread=nil
-                                            if activeToyRequest==attempt then activeToyRequest=nil end
-                                            if isCurrentRecovery(token,char) then requestRecovery() end
-                                        end)
-                                        task.delay(8,function()
-                                            if activeToyRequest==attempt and attempt.inFlight then
-                                                if attempt.thread and type(task.cancel)=="function" then pcall(task.cancel,attempt.thread) end
-                                                attempt.thread=nil;attempt.inFlight=false;activeToyRequest=nil;attempt.nextAt=os.clock()+3
-                                            end
-                                        end)
-                                        break
+                                if not hasSelectedTool(name,char,backpack) then
+                                    local attempt=toyAttempts[name]
+                                    if not attempt then
+                                        attempt={count=0,nextAt=0,inFlight=false}
+                                        toyAttempts[name]=attempt
                                     end
+                                    if folder:FindFirstChild(name) and not attempt.inFlight and attempt.count<6 and now>=attempt.nextAt then
+                                        attempt.count=attempt.count+1
+                                        attempt.nextAt=now+math.min(3,0.75+attempt.count*0.5)
+                                        attempt.inFlight=true
+                                        activeToyRequest=attempt
+                                        nextToyRequest=now+0.25
+                                        attempt.thread=task.spawn(function()
+                                            if isCurrentRecovery(token,char) and autoGetTools then
+                                                pcall(function() remote:InvokeServer(name) end)
+                                            end
+                                            attempt.inFlight=false
+                                            attempt.thread=nil
+                                            attempt.nextAt=math.max(attempt.nextAt,os.clock()+math.min(3,0.75+attempt.count*0.5))
+                                            if activeToyRequest==attempt then activeToyRequest=nil end
+                                            if isCurrentRecovery(token,char) and autoGetTools then requestRecovery(false) end
+                                        end)
+                                    end
+
+                                    break
                                 end
                             end
                         end
                     end
                 end
             end
-            task.wait(0.35)
+            task.wait(0.2)
         end
         if token==recoveryToken then recoveryRunning=false end
     end)
@@ -19135,50 +18289,41 @@ local function watchCharacter(char)
 end
 
 local function queueGuiRecovery(invalidate)
+    if invalidate then
+        targetEpoch=targetEpoch+1
+        targetsScanned=false
+        lastTargetScan=-math.huge
+    end
     guiRefreshToken=guiRefreshToken+1
     local token=guiRefreshToken
     task.delay(0.35,function()
-        if not alive or not runtimeAlive or token~=guiRefreshToken then return end
-        if invalidate and inventoryEnabled then
-            requestNativeCapacity(true)
-            -- Native scripts can start after MainGUI is inserted. One bounded
-            -- settling pass catches that replacement without scanning on equips.
-            task.delay(2,function()
-                if alive and runtimeAlive and token==guiRefreshToken then requestNativeCapacity(true) end
-            end)
-        end
-        requestRecovery(false)
+        if alive and token==guiRefreshToken then requestRecovery(false) end
     end)
 end
 
 local function watchPlayerGui(gui)
-    local replaced=observedGui and observedGui~=gui
     disconnectAll(guiConnections)
     clearReferences()
     observedGui=gui
     if not gui then return end
-    removeLegacyHotbar(gui)
-    if replaced then queueGuiRecovery(true) end
     task.defer(function() scanSlotReferences(gui) end)
     guiConnections[#guiConnections+1]=gui.ChildAdded:Connect(function(child)
         if child.Name=="MainGUI" then queueGuiRecovery(true) end
     end)
     guiConnections[#guiConnections+1]=gui.DescendantAdded:Connect(function(child)
         if child:IsA("ObjectValue") then cacheReference(child)
-        elseif (child:IsA("UIListLayout") or child:IsA("UIGridLayout")) and child.Parent then
+        elseif child:IsA("UIListLayout") and child.Parent then
             for _,slot in ipairs(child.Parent:GetChildren()) do
-                for _,reference in ipairs(slot:GetDescendants()) do cacheReference(reference) end
+                for _,reference in ipairs(slot:GetChildren()) do cacheReference(reference) end
             end
-        elseif not targetsScanned and (child.Name=="TouchBinding" or child.Name=="EquipButton") then queueGuiRecovery(true)
-        elseif child:IsA("LocalScript") and (normalized(child.Name):find("backpack",1,true)
-            or normalized(child.Name):find("hotbar",1,true) or normalized(child.Name):find("touchbinding",1,true)) then queueGuiRecovery(true) end
+        elseif child.Name=="EquipButton" or child.Name=="TouchBinding" then queueGuiRecovery(false) end
     end)
 end
 
 local inventoryToggle=addToggle(section,"Increase Inventory",inventoryEnabled,function(state)
     inventoryEnabled=state
     SetCfg("inventoryUnlimiterEnabled",state)
-    if state then requestNativeCapacity(true);requestRecovery(false)
+    if state then requestRecovery(true)
     else
         restoreInventoryLimits()
         if not autoGetTools then cancelRecovery() end
@@ -19188,7 +18333,8 @@ section:AddSlider("Max Items",3,10,inventoryLimit,function(value)
     inventoryLimit=math.clamp(math.floor(tonumber(value) or 10),3,10)
     SetCfg("inventoryMaxItems",inventoryLimit)
     if inventoryEnabled then
-        requestNativeCapacity(false)
+        if targetsScanned then applyInventoryLimit(false) end
+        requestRecovery(not targetsScanned)
     end
 end)
 local autoToggle=addToggle(section,"Auto Get Tools",autoGetTools,function(state)
@@ -19237,11 +18383,6 @@ lifecycleConnections[#lifecycleConnections+1]=player.CharacterAdded:Connect(func
     removingCharacter=nil
     watchCharacter(char)
     watchBackpack(player:FindFirstChildOfClass("Backpack"))
-    if inventoryEnabled then
-        task.delay(1,function()
-            if alive and runtimeAlive and player.Character==char then requestNativeCapacity(true) end
-        end)
-    end
     requestRecovery(false)
 end)
 lifecycleConnections[#lifecycleConnections+1]=player.ChildAdded:Connect(function(child)
@@ -19257,37 +18398,12 @@ local replicatedStorage=game:GetService("ReplicatedStorage")
 lifecycleConnections[#lifecycleConnections+1]=replicatedStorage.DescendantAdded:Connect(function(child)
     if child.Name=="Remotes" or child.Name=="Extras" or child.Name=="ReplicateToy" then requestRecovery(false) end
 end)
-pcall(function()
-    local actions=game:GetService("ContextActionService")
-    for index=1,10 do actions:UnbindAction("VisualsV2_ExpandedTool_"..index) end
-end)
 watchBackpack(player:FindFirstChildOfClass("Backpack"))
 watchCharacter(player.Character)
 watchPlayerGui(player:FindFirstChildOfClass("PlayerGui"))
-if inventoryEnabled then requestNativeCapacity(false) end
-if autoGetTools then task.defer(function() requestRecovery() end) end
-local hotbarElapsed=0
-lifecycleConnections[#lifecycleConnections+1]=RunService.Heartbeat:Connect(function(dt)
-    hotbarElapsed=hotbarElapsed+dt
-    if hotbarElapsed<1 then return end
-    hotbarElapsed=0
-    verifyNativeCapacity()
-    if autoGetTools and not recoveryRunning then
-        local character=player.Character
-        local backpack=getBackpack()
-        for _,name in ipairs(selectedToys) do
-            if name~="None" and not hasSelectedTool(name,character,backpack) then requestRecovery();break end
-        end
-    end
-end)
+if inventoryEnabled or autoGetTools then task.defer(function() requestRecovery(false) end) end
 
-env.VisualsV2Runtime.InventoryTools={GetDiagnostics=function()
-    local report=table.clone(perf)
-    report.mode="native"
-    report.scanning=capacityRunning
-    report.scanAttempts=capacityAttempts
-    return report
-end}
+env.VisualsV2Runtime.InventoryTools={GetDiagnostics=function() return table.clone(perf) end}
 env.VisualsV2Runtime.RegisterReset(function()
     alive=false
     guiRefreshToken=guiRefreshToken+1
