@@ -9,22 +9,71 @@ local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
 local TextChatService = game:GetService("TextChatService")
 
-local mainTab = shared.CreateTab(
-    "Visuals V2",
-    "/0ludexioso/VisualsV2/refs/heads/main/icon"
-)
+local mainTab
 
 local CFG_FILE = "VisualsV2_settings.json"
 local ConfigData = {}
 local PositionData = {}
 local configResetting = false
 local runtimeAlive = true
+local controlsReady=false
+local silentControlDepth=0
+
+-- Saved control values should not play the UI library's click feedback.
+-- Scope muting to UI sounds during programmatic control changes.
+local function silentControl(callback,...)
+    silentControlDepth=silentControlDepth+1
+    local results=table.pack(pcall(callback,...))
+    silentControlDepth=silentControlDepth-1
+    return table.unpack(results,1,results.n)
+end
 
 local env = {}
 if type(getgenv) == "function" then
     local ok, result = pcall(getgenv)
     if ok and type(result) == "table" then env = result end
 end
+
+;(function()
+    local bridge=env.VisualsV2ControlAudioBridge
+    if type(bridge)~="table" then bridge={methods={}};env.VisualsV2ControlAudioBridge=bridge end
+    local soundService=game:GetService("SoundService")
+    bridge.handler=function(sound)
+        if not runtimeAlive or (controlsReady and silentControlDepth==0) then return false end
+        if typeof(sound)~="Instance" or not sound:IsA("Sound") or sound.Looped
+            or sound:GetAttribute("VisualsV2_GunCosmetic") then return false end
+        local parent=sound.Parent
+        if not parent or sound:IsDescendantOf(soundService) then return true end
+        while parent and parent~=game do
+            if parent:IsA("GuiBase2d") or parent:IsA("LayerCollector") then return true end
+            if parent==workspace then return false end
+            parent=parent.Parent
+        end
+        return false
+    end
+    local hook=hookfunction or env.hookfunction
+    local closure=newcclosure or env.newcclosure
+    if type(hook)=="function" then
+        local sample=Instance.new("Sound")
+        for _,method in ipairs({"Play","PlayLocalSound"}) do
+            if not bridge.methods[method] then
+                local previous
+                local wrapper=function(object,...)
+                    local sound=method=="Play" and object or select(1,...)
+                    if bridge.handler and bridge.handler(sound) then return end
+                    return previous(object,...)
+                end
+                if type(closure)=="function" then wrapper=closure(wrapper) end
+                local target=method=="Play" and sample.Play or soundService.PlayLocalSound
+                local ok,result=pcall(hook,target,wrapper)
+                if ok and type(result)=="function" then previous=result;bridge.methods[method]=true end
+            end
+        end
+        sample:Destroy()
+    end
+end)()
+
+mainTab = shared.CreateTab("Visuals V2","/0ludexioso/VisualsV2/refs/heads/main/icon")
 
 local previousThrowableBridge=env.VisualsV2ThrowableAimBridge
 if type(previousThrowableBridge)=="table" then previousThrowableBridge.handler=nil end
@@ -40,13 +89,11 @@ if type(exists)=="function" then
 elseif type(read)=="function" then
     configExistedAtStart=pcall(read,CFG_FILE)
 end
-if not configExistedAtStart and type(env.VisualsV2SessionConfig)=="table" then
-    configExistedAtStart=true
-end
 local freshInstall=not configExistedAtStart
 local defaultOnControls={
     aaIgnoreListEnabled=true,
     fireflyTimerEnabled=true,
+    vv2WeaponSoundsEnabled=true,
     fireflyTimerColors=true,
     vv2FpsPingColors=true,
     vv2FpsPingShowFps=true,
@@ -82,58 +129,39 @@ local function decodeConfigValue(value, default)
     return value
 end
 
-local function copyConfig(value)
-    if type(value)~="table" then return value end
-    local result={}
-    for key,item in pairs(value) do result[key]=copyConfig(item) end
-    return result
-end
-
 local function loadConfig()
-    local decoded
-    if type(env.VisualsV2SessionConfig)=="table" and env.VisualsV2SessionConfigSaved==false then
-        decoded=env.VisualsV2SessionConfig
-    end
-    if not decoded and type(read)=="function" then
-        if type(exists)=="function" then
-            local ok,found=pcall(exists,CFG_FILE)
-            if ok and not found and not (type(env.VisualsV2SessionConfig)=="table"
-                and env.VisualsV2SessionConfigSaved~=true) then
-                env.VisualsV2SessionConfig=nil
-                freshInstall=true
-                return
-            end
-        end
-        local ok,result=pcall(function() return HttpService:JSONDecode(read(CFG_FILE)) end)
-        if ok and type(result)=="table" then decoded=result end
-    end
+    if type(read) ~= "function" then return end
 
-    if not decoded then decoded=env.VisualsV2SessionConfig end
-    if type(decoded)~="table" then return end
+    local found = true
+    if type(exists) == "function" then
+        local ok, result = pcall(exists, CFG_FILE)
+        found = ok and result
+    end
+    if not found then return end
+
+    local ok, decoded = pcall(function()
+        return HttpService:JSONDecode(read(CFG_FILE))
+    end)
+    if not ok or type(decoded) ~= "table" then return end
 
     if type(decoded.settings) == "table" then
-        ConfigData = copyConfig(decoded.settings)
+        ConfigData = decoded.settings
     end
     if type(decoded.positions) == "table" then
-        PositionData = copyConfig(decoded.positions)
+        PositionData = decoded.positions
     end
 end
 
 local function saveConfig()
-    if not runtimeAlive then return false end
+    if not runtimeAlive or type(write) ~= "function" then return false end
     local payload = {
         version = 2,
-        settings = copyConfig(ConfigData),
-        positions = copyConfig(PositionData),
+        settings = ConfigData,
+        positions = PositionData,
     }
-    env.VisualsV2SessionConfig=payload
-    env.VisualsV2SessionConfigSaved=false
-    if type(write)~="function" then return false end
-    local saved=pcall(function()
+    return pcall(function()
         write(CFG_FILE, HttpService:JSONEncode(payload))
     end)
-    env.VisualsV2SessionConfigSaved=saved
-    return saved
 end
 
 local function C(key, default)
@@ -174,35 +202,24 @@ end
 
 local function addToggle(section, name, defaultValue, callback)
     local state = false
-    local appliedState = false
     local rawToggle
     local constructing=true
 
     rawToggle = section:AddToggle(name, function(newState)
         state = not not newState
-        if not constructing and (runtimeAlive or not state) then
-            appliedState=state
-            callback(state)
-        end
+        if not constructing and (runtimeAlive or not state) then callback(state) end
     end)
     constructing=false
 
     local controller = {}
     function controller:Set(newState)
         newState = not not newState
-        if newState == state then
-            if appliedState~=newState and (runtimeAlive or not newState) then
-                appliedState=newState
-                callback(newState)
-            end
-            return
-        end
+        if newState == state then return end
 
-        pcall(rawToggle)
-        if state ~= newState then pcall(rawToggle) end
+        silentControl(rawToggle)
+        if state ~= newState then silentControl(rawToggle) end
         if state ~= newState then
             state = newState
-            appliedState = newState
             callback(newState)
         end
     end
@@ -258,9 +275,9 @@ local function addDropdown(section, name, items, defaultValue, callback, notific
                     revision=revision+1
                     if method=="Select" then selectedValue=valueOf(args[1]) end
                     silent=silent+1
-                    local ok,result=pcall(rawController[method],table.unpack(args,1,args.n))
+                    local ok,result=silentControl(rawController[method],table.unpack(args,1,args.n))
                     if not ok then
-                        ok,result=pcall(rawController[method],rawController,table.unpack(args,1,args.n))
+                        ok,result=silentControl(rawController[method],rawController,table.unpack(args,1,args.n))
                     end
                     silent=silent-1
                     if not ok then error(result,0) end
@@ -296,7 +313,7 @@ end
 
 loadConfig()
 
-env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-15-runtime-fixes-3"}
+env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-16-skins-2"}
 env.VisualsV2Runtime.RegisterReset = function(callback)
     if type(callback) == "function" then table.insert(env.VisualsV2Runtime.Resetters, callback) end
 end
@@ -1031,7 +1048,7 @@ local animPresets = {
                 fall  = "http://www.roblox.com/asset/?id=138967706335414"
             },
             ["WDTL"] = {
-idle1 = "http://www.roblox.com/asset/?id=92849173543269",
+                idle1 = "http://www.roblox.com/asset/?id=92849173543269",
                 idle2 = "http://www.roblox.com/asset/?id=92849173543269",
                 walk  = "http://www.roblox.com/asset/?id=73718308412641",
                 run   = "http://www.roblox.com/asset/?id=135515454877967",
@@ -1361,7 +1378,6 @@ local defaultMoves = {
 }
 
 local session, generation = nil, 0
-local animationDiagnostics = {loadErrors = 0, runtimeErrors = 0}
 local updateMotion, refreshRuntime
 local function valid(s)
     return alive and runtimeAlive and enabled() and session == s and s.token == generation
@@ -1376,19 +1392,16 @@ local function restoreWeights(s)
         pcall(function() track:AdjustWeight(weight, 0.12) end)
     end
 end
-local function dropRecord(s, kind, keepWeights)
+local function dropRecord(s, kind)
     local record = s.tracks[kind]
     if not record then return end
     s.tracks[kind] = nil; record.disposed = true
     if record.loopConnection then record.loopConnection:Disconnect(); record.loopConnection = nil end
-    if s.current == record then
-        s.current = nil
-        if not keepWeights then restoreWeights(s) end
-    end
+    if s.current == record then s.current = nil; restoreWeights(s) end
     if record.track then
+        s.ownTracks[record.track] = nil
         stopTrack(record.track)
         pcall(function() record.track:Destroy() end)
-        s.ownTracks[record.track] = nil
     end
     if record.animation then pcall(function() record.animation:Destroy() end) end
 end
@@ -1397,9 +1410,6 @@ local function closeSession()
     local old = session; session = nil
     if not old then return end
     for _, connection in ipairs(old.connections) do pcall(function() connection:Disconnect() end) end
-    for _, connections in pairs(old.trackConnections or {}) do
-        for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
-    end
     restoreWeights(old)
     for kind in pairs(old.tracks) do dropRecord(old, kind) end
     if old.references then pcall(function() old.references:Destroy() end) end
@@ -1421,44 +1431,19 @@ local function movementGroup(group)
     if group == "animation1" or group == "animation2" then return nil end
     return group and aliases[group]
 end
-local function equippedToolAnimation(s, id)
-    if not id then return false end
-    -- MM2 sometimes loads a detached copy instead of the Animation below the
-    -- equipped Tool. Match its source ID so firing does not yield locomotion.
-    for _, tool in ipairs(s.character:GetChildren()) do
-        if tool:IsA("Tool") then
-            local animations = tool:FindFirstChild("Animations")
-            if animations then
-                for _, animation in ipairs(animations:GetDescendants()) do
-                    if animation:IsA("Animation") and cleanAnimationId(animation.AnimationId) == id then return true end
-                end
-            end
-        end
-    end
-    return false
-end
 local function nativeKind(s, track)
     if s.ownTracks[track] then return nil end
     local animation = track.Animation
     if not animation or animation:FindFirstAncestorOfClass("Tool") then return nil end
     local group = animationGroup(animation, s.character)
-    if group and (toolGroups[group] or emoteGroups[group] or group:find("emote", 1, true)) then return nil end
+    if group and (emoteGroups[group] or group:find("emote", 1, true)) then return nil end
     local id = cleanAnimationId(animation.AnimationId)
     if id and s.emoteIds[id] then return nil end
     local kind = movementGroup(group)
     if kind then return kind end
-    if s.nativeAnimations[animation] then return s.nativeAnimations[animation] end
     if id and s.nativeIds[id] then return s.nativeIds[id] end
-    if id and defaultMoves[id] then return defaultMoves[id] end
-    -- Animate and avatar packages can pass detached/cloned Animation instances to
-    -- the Animator. Their names still identify locomotion even without ancestry.
-    if (not animation.Parent or group) and (track.Priority == Enum.AnimationPriority.Core
-        or track.Priority == Enum.AnimationPriority.Idle or track.Priority == Enum.AnimationPriority.Movement) then
-        local name = tostring(animation.Name or ""):lower():gsub("[%s_]", "")
-        local trackName = tostring(track.Name or ""):lower():gsub("[%s_]", "")
-        local namedKind = aliases[name] or aliases[trackName]
-        if namedKind and not equippedToolAnimation(s, id) then return namedKind end
-    end
+
+    return id and defaultMoves[id]
 end
 local function isToolTrack(s, track)
     local animation = track.Animation
@@ -1468,7 +1453,6 @@ local function isToolTrack(s, track)
     if group and toolGroups[group] then return true end
     local id = cleanAnimationId(animation.AnimationId)
     if id and toolAnimationIds[id] then return true end
-    if equippedToolAnimation(s, id) then return true end
     local name = (tostring(track.Name or "") .. " " .. tostring(animation.Name or "")):lower():gsub("[%s_]", "")
     return name:find("toolnone", 1, true) ~= nil or name:find("toolhold", 1, true) ~= nil
         or name:find("customhold", 1, true) ~= nil or name:find("scopehold", 1, true) ~= nil
@@ -1476,94 +1460,26 @@ local function isToolTrack(s, track)
 end
 local function isEmote(s, track)
     if s.ownTracks[track] or nativeKind(s, track) then return false end
-    local animation = track.Animation
-    if animation then
-        local group = animationGroup(animation, s.character)
-        local id = cleanAnimationId(animation.AnimationId)
-        if group and (emoteGroups[group] or group:find("emote", 1, true)) or id and s.emoteIds[id] then return true end
+    if isToolTrack(s, track) then
+
+        return track.Priority == Enum.AnimationPriority.Core
     end
-    if isToolTrack(s, track) then return false end
+
     return true
 end
-local collectNativeIds
-local function queueNativeRefresh(s)
-    if not valid(s) or s.nativeRefreshQueued then return end
-    s.nativeRefreshQueued = true
-    task.defer(function()
-        s.nativeRefreshQueued = false
-        if not valid(s) then return end
-        collectNativeIds(s)
-        updateMotion(s)
-    end)
-end
-local function rememberNativeAnimation(s, animation)
-    local group = animationGroup(animation, s.character)
-    local kind = movementGroup(group)
-    local id = cleanAnimationId(animation.AnimationId)
-    if group and (toolGroups[group] or emoteGroups[group] or group:find("emote", 1, true)) then
-        s.nativeAnimations[animation] = nil
-        if id and (emoteGroups[group] or group:find("emote", 1, true)) then s.emoteIds[id] = true end
-    elseif kind then
-        s.nativeAnimations[animation] = kind
-        if id then s.nativeIds[id] = kind end
-    end
-end
-collectNativeIds = function(s)
-    for _, animation in ipairs(s.character:GetDescendants()) do
-        if animation:IsA("Animation") and not animation:IsDescendantOf(s.references) then
-            rememberNativeAnimation(s, animation)
-            if not s.sourceWatches[animation] then
-                s.sourceWatches[animation] = true
-                local function changed()
-                    if not valid(s) then return end
-                    rememberNativeAnimation(s, animation)
-                    queueNativeRefresh(s)
+local function collectNativeIds(s)
+    for _, child in ipairs(s.character:GetChildren()) do
+        if child ~= s.references and child:IsA("LuaSourceContainer") then
+            for _, animation in ipairs(child:GetDescendants()) do
+                if animation:IsA("Animation") then
+                    local group = animationGroup(animation, s.character)
+                    local kind = movementGroup(group)
+                    local id = cleanAnimationId(animation.AnimationId)
+                    if id and kind then s.nativeIds[id] = kind end
                 end
-                table.insert(s.connections, animation:GetPropertyChangedSignal("AnimationId"):Connect(changed))
-                table.insert(s.connections, animation:GetPropertyChangedSignal("Name"):Connect(changed))
-                table.insert(s.connections, animation.AncestryChanged:Connect(changed))
-            end
-            local parent = animation.Parent
-            while parent and parent ~= s.character do
-                if not s.sourceWatches[parent] then
-                    s.sourceWatches[parent] = true
-                    table.insert(s.connections, parent:GetPropertyChangedSignal("Name"):Connect(function() queueNativeRefresh(s) end))
-                end
-                parent = parent.Parent
             end
         end
     end
-end
-local function suppressNativeTrack(s, track)
-    if not track.IsPlaying or not nativeKind(s, track) then return false end
-    local weight = tonumber(track.WeightTarget) or 0
-    if s.weights[track] == nil or weight > 0 then s.weights[track] = weight end
-    -- A high-priority native track also wins during a fade to zero. Remove its
-    -- weight immediately; the replacement track supplies the transition fade.
-    if weight > 0 or (tonumber(track.WeightCurrent) or 0) > 0 then track:AdjustWeight(0, 0) end
-    return true
-end
-local function watchTrack(s, track)
-    if s.ownTracks[track] or s.trackConnections[track] then return end
-    local connections = {}
-    s.trackConnections[track] = connections
-    local function changed()
-        if not valid(s) then return end
-        local current = s.current
-        if current and current.track and current.track.IsPlaying and current.track.Length > 0 then
-            suppressNativeTrack(s, track)
-        end
-        if not s.updating then updateMotion(s) end
-    end
-    table.insert(connections, track:GetPropertyChangedSignal("WeightTarget"):Connect(changed))
-    table.insert(connections, track.Stopped:Connect(function()
-        task.defer(function() if valid(s) then updateMotion(s) end end)
-    end))
-    table.insert(connections, track.Destroying:Connect(function()
-        for _, connection in ipairs(connections) do connection:Disconnect() end
-        s.trackConnections[track] = nil
-        s.weights[track] = nil
-    end))
 end
 local function playbackTargets()
     local result = {}
@@ -1622,8 +1538,6 @@ end
 local function reportLoadError(s, record)
     if not valid(s) or record.disposed or record.notified then return end
     record.notified = true
-    animationDiagnostics.loadErrors = animationDiagnostics.loadErrors + 1
-    animationDiagnostics.lastError = "Could not load " .. record.kind .. " animation " .. record.rawId
     shared.Notify("Error: Could not load the " .. record.kind .. " animation (" .. record.rawId .. "). Check its ID and animation access.", 0)
 end
 local function loadRecord(s, kind)
@@ -1639,9 +1553,8 @@ local function loadRecord(s, kind)
         if not stillCurrent() then return false end
         if record.loopConnection then record.loopConnection:Disconnect(); record.loopConnection = nil end
         if record.track then
-            stopTrack(record.track)
+            s.ownTracks[record.track] = nil; stopTrack(record.track)
             pcall(function() record.track:Destroy() end)
-            s.ownTracks[record.track] = nil
             record.track = nil
         end
         if record.animation then record.animation:Destroy() end
@@ -1729,6 +1642,13 @@ local function desiredMotion(s)
     if not s.targets[kind] then kind = kind == "run" and "walk" or "run" end
     return kind, math.clamp(speed / (kind == "walk" and 8 or 16), 0.1, 3)
 end
+local function sameMovement(native, active)
+    if active == "idle2" then return native == "idle" end
+    if active == "swim" or active == "swimidle" then return native == "swim" or native == "swimidle" end
+    if active == "walk" or active == "run" then return native == "walk" or native == "run" end
+    if active == "fall" then return native == "fall" or native == "jump" end
+    return native == active
+end
 local function motionStep(s)
     if not valid(s) or not s.ready then return end
     local playing = s.animator:GetPlayingAnimationTracks()
@@ -1743,12 +1663,13 @@ local function motionStep(s)
         restoreWeights(s); return
     end
     if s.current and s.current.kind ~= kind then
-        stopTrack(s.current.track); s.current = nil
+        stopTrack(s.current.track); s.current = nil; restoreWeights(s)
     end
     local record = loadRecord(s, kind)
-    if not record or not record.track or record.pending or record.failed then restoreWeights(s); return end
+    if not record or not record.track or record.pending or record.failed then return end
     if s.current ~= record then
         if s.current then stopTrack(s.current.track) end
+        restoreWeights(s)
         s.current = record
         record.lastJump = nil
     end
@@ -1767,7 +1688,14 @@ local function motionStep(s)
 
     local suppressed = {}
     for _, native in ipairs(playing) do
-        if suppressNativeTrack(s, native) then suppressed[native] = true end
+        local nativeMotion = nativeKind(s, native)
+        if native.IsPlaying and nativeMotion and sameMovement(nativeMotion, kind) then
+            local weight = native.WeightTarget
+            if s.weights[native] == nil then s.weights[native] = weight end
+            if weight > 0 then s.weights[native] = weight end
+            native:AdjustWeight(0, 0.12)
+            suppressed[native] = true
+        end
     end
     for native, weight in pairs(s.weights) do
         if not suppressed[native] then
@@ -1779,11 +1707,9 @@ end
 updateMotion = function(s)
     if not valid(s) or s.updating then return end
     s.updating = true
-    local ok, err = pcall(motionStep, s)
+    local ok = pcall(motionStep, s)
     s.updating = false
     if not ok then
-        animationDiagnostics.runtimeErrors = animationDiagnostics.runtimeErrors + 1
-        animationDiagnostics.lastError = tostring(err)
         if s.current then stopTrack(s.current.track); s.current = nil end
         restoreWeights(s)
     end
@@ -1795,21 +1721,16 @@ local function refreshTargets(s)
     local oldTargets = s.targets or {}
     if targets.idle ~= oldTargets.idle or targets.idle2 ~= oldTargets.idle2 then s.idleVariant = nil end
     for kind, record in pairs(s.tracks) do
-        if targets[kind] ~= record.rawId then dropRecord(s, kind, true) end
+        if targets[kind] ~= record.rawId then dropRecord(s, kind) end
     end
     s.targets = targets
-    -- Load the selected slots before the first jump/fall transition needs them.
-    -- Each loader checks this session and its target before installing a track.
-    for kind in pairs(targets) do loadRecord(s, kind) end
     updateMotion(s)
 end
 local function bindCharacter(character)
     closeSession()
     if not alive or not runtimeAlive or not enabled() or LocalPlayer.Character ~= character then return end
     local s = {character = character, token = generation, binding = true, connections = {}, tracks = {}, weights = {},
-        ownTracks = setmetatable({}, {__mode = "k"}), nativeIds = {}, emoteIds = {},
-        nativeAnimations = setmetatable({}, {__mode = "k"}), sourceWatches = setmetatable({}, {__mode = "k"}),
-        trackConnections = {}, jumpCount = 0, jumpedAt = -math.huge}
+        ownTracks = setmetatable({}, {__mode = "k"}), nativeIds = {}, emoteIds = {}, jumpCount = 0, jumpedAt = -math.huge}
     session = s
     table.insert(s.connections, character.DescendantAdded:Connect(function(child)
         if not valid(s) then return end
@@ -1842,45 +1763,28 @@ local function bindCharacter(character)
         connect(humanoid.Died, function() if session == s then closeSession() end end)
         connect(animator.AnimationPlayed, function(track)
             if s.ownTracks[track] then return end
-            watchTrack(s, track)
             updateMotion(s)
             task.defer(function() if valid(s) then updateMotion(s) end end)
         end)
         connect(character.DescendantAdded, function(child)
             if child:IsA("Animation") and not child:IsDescendantOf(s.references) then
-                queueNativeRefresh(s)
+                local group = animationGroup(child, character)
+                local id = cleanAnimationId(child.AnimationId)
+                local kind = movementGroup(group)
+                if kind and id then s.nativeIds[id] = kind end
             end
         end)
         local elapsed = 0
         connect(RunService.Heartbeat, function(dt)
-            -- Some engine-driven weight changes do not emit a property event.
-            -- Check only the few tracks we already suppressed between state scans.
-            local current = s.current
-            if current and current.track and current.track.IsPlaying and current.track.Length > 0 then
-                for native in pairs(s.weights) do
-                    if (tonumber(native.WeightTarget) or 0) > 0 or (tonumber(native.WeightCurrent) or 0) > 0 then
-                        suppressNativeTrack(s, native)
-                    end
-                end
-            end
             elapsed = elapsed + dt
             if elapsed < 0.1 then return end
             elapsed = 0
             updateMotion(s)
         end)
-        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do watchTrack(s, track) end
         refreshTargets(s)
-        local function refreshDescription()
-          task.spawn(function()
+        task.spawn(function()
             local ok, description = pcall(function() return humanoid:GetAppliedDescription() end)
             if not ok or not description or not valid(s) then return end
-            local properties = {IdleAnimation = "idle", WalkAnimation = "walk", RunAnimation = "run",
-                JumpAnimation = "jump", ClimbAnimation = "climb", FallAnimation = "fall", SwimAnimation = "swim"}
-            for property, kind in pairs(properties) do
-                local success, value = pcall(function() return description[property] end)
-                local id = success and cleanAnimationId(value)
-                if id and id ~= "" then s.nativeIds[id] = kind end
-            end
             local success, emotes = pcall(function() return description:GetEmotes() end)
             if success and type(emotes) == "table" then
                 for _, ids in pairs(emotes) do
@@ -1889,18 +1793,7 @@ local function bindCharacter(character)
                     end
                 end
             end
-            updateMotion(s)
-          end)
-        end
-        refreshDescription()
-        local ok, applied = pcall(function() return humanoid.ApplyDescriptionFinished end)
-        if ok and applied then connect(applied, refreshDescription) end
-        local hasAppearanceEvent, appearanceEvent = pcall(function() return LocalPlayer.CharacterAppearanceLoaded end)
-        if hasAppearanceEvent and appearanceEvent then
-            connect(appearanceEvent, function(loadedCharacter)
-                if loadedCharacter == character then collectNativeIds(s); refreshDescription() end
-            end)
-        end
+        end)
     end)
 end
 refreshRuntime = function()
@@ -1921,25 +1814,6 @@ RootMaid:GiveTask(LocalPlayer.CharacterRemoving:Connect(function(character)
     if session and session.character == character then closeSession() end
 end))
 RootMaid:GiveTask(closeSession)
-env.VisualsV2Runtime.FEAnimations = {GetDiagnostics = function()
-    local result = {enabled = enabled(), presetsEnabled = presetsEnabled, customEnabled = customEnabled,
-        loadErrors = animationDiagnostics.loadErrors, runtimeErrors = animationDiagnostics.runtimeErrors,
-        lastError = animationDiagnostics.lastError, ready = session and session.ready == true or false,
-        targets = {}, recognizedTracks = 0, toolTracks = 0, emoteTracks = 0, suppressedTracks = 0}
-    local s = session
-    if not s then return result end
-    result.current = s.current and s.current.kind
-    for kind, id in pairs(s.targets or {}) do result.targets[kind] = id end
-    for _ in pairs(s.weights) do result.suppressedTracks = result.suppressedTracks + 1 end
-    if s.animator then
-        for _, track in ipairs(s.animator:GetPlayingAnimationTracks()) do
-            if nativeKind(s, track) then result.recognizedTracks = result.recognizedTracks + 1
-            elseif isToolTrack(s, track) then result.toolTracks = result.toolTracks + 1
-            elseif isEmote(s, track) then result.emoteTracks = result.emoteTracks + 1 end
-        end
-    end
-    return result
-end}
 
 local presetToggle = addToggle(feAnimSection, "Enable Preset Animations", presetsEnabled, function(value)
     if not alive or not runtimeAlive then return end
@@ -2174,7 +2048,7 @@ local function restoreForceFieldPart(part)
         local ok, material = pcall(function()
             return Enum.Material[materialName]
         end)
-if ok and material then part.Material = material end
+        if ok and material then part.Material = material end
     end
     if typeof(oldColor) == "Color3" then part.Color = oldColor end
     part:SetAttribute(FF_MATERIAL_ATTR, nil)
@@ -3174,7 +3048,7 @@ scheduleSide=function(state,side,delayTime)
                         applySideNow(state,side)
                     end
                 end)
-end
+            end
         end)
     end)
 end
@@ -4174,7 +4048,8 @@ local function setupSpeedButtons()
     big.Active=true
     big.Parent=gui
     speedButton=big
-local corner=Instance.new("UICorner")
+
+    local corner=Instance.new("UICorner")
     corner.CornerRadius=UDim.new(0,5)
     corner.Parent=big
     makeBigButtonDraggable(big)
@@ -4728,6 +4603,7 @@ local DEFAULT_POS=UDim2.new(0.5,0,0.5,0)
 local buttonPos=loadStoredPosition("shootMurdButtonPosition",DEFAULT_POS)
 
 local resetShootMurdererPosition
+local ourClickCallbacks=setmetatable({}, {__mode="k"})
 
 local function normalize(value) return tostring(value or ""):lower():gsub("%s+","") end
 local function roots()
@@ -4847,11 +4723,13 @@ local function bind(newButton)
         startPos=button.Position
     end))
 
-    table.insert(conns,button.MouseButton1Click:Connect(function()
+    local customClick=function()
         if not customEnabled or allowDrag then return end
         keepEquipped()
         animate()
-    end))
+    end
+    ourClickCallbacks[customClick]=true
+    table.insert(conns,button.MouseButton1Click:Connect(customClick))
     table.insert(conns,UserInputService.InputChanged:Connect(function(input)
         if not dragging or not customEnabled or not allowDrag or not button then return end
         if input.UserInputType~=Enum.UserInputType.MouseMovement and input.UserInputType~=Enum.UserInputType.Touch then return end
@@ -4896,6 +4774,32 @@ resetShootMurdererPosition=function()
     end
 end
 env.VisualsV2ResetShootMurdererPosition=resetShootMurdererPosition
+env.VisualsV2Runtime.ODHShootMurderer=function()
+    local target=button and button.Parent and button or findButton()
+    if not target then return false,"Enable ODH's Shoot Murderer button first" end
+    local inspect=getconnections or env.getconnections
+    if type(inspect)=="function" then
+        for _,signal in ipairs({target.MouseButton1Click,target.Activated}) do
+            local ok,callbacks=pcall(inspect,signal)
+            local fired=false
+            if ok and type(callbacks)=="table" then
+                for _,connection in ipairs(callbacks) do
+                    local readable,callback,enabled=pcall(function() return connection.Function,connection.Enabled end)
+                    if readable and type(callback)=="function" and not ourClickCallbacks[callback]
+                        and enabled~=false then
+                        task.spawn(callback)
+                        fired=true
+                    end
+                end
+            end
+            if fired then return true end
+        end
+        return false,"ODH's Shoot Murderer callback is not available yet"
+    end
+    local fire=firesignal or env.firesignal
+    if type(fire)=="function" then return pcall(fire,target.MouseButton1Click) end
+    return false,"This executor cannot activate ODH's Shoot Murderer button"
+end
 
 local customToggle=addToggle(section,"Enable Button Customization",customEnabled,function(v)
     customEnabled=v; SetCfg("shootCustomizationEnabled",v)
@@ -5173,7 +5077,7 @@ local function appearance_apply(state,color)
         end
         part.Color=color;part.MaterialVariant=""
         if preset=="ForceField" then
-part.Material=Enum.Material.ForceField
+            part.Material=Enum.Material.ForceField
             if bombMask then
                 part.Reflectance=0
                 if data.texture~=nil then part.TextureID=BOMB_FORCEFIELD_TEXTURE end
@@ -5688,12 +5592,12 @@ if not scopeOnly then data.weapons.Gun["Sketch"]=function() return {["nodes"]={{
 if not scopeOnly then data.weapons.Gun["SlimeG"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.SmoothPlastic",["Size"]={["v"]={0.2,1.83000016,1.02999997},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,1,1},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={1.5,1.5,1.5},["type"]="Vector3"},["MeshId"]="http://www.roblox.com/asset/?id=79401392 ",["TextureId"]="rbxassetid://2513648152"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
 if not scopeOnly then data.weapons.Gun["SnakebiteG"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.SmoothPlastic",["Size"]={["v"]={0.2,1.83000016,1.02999997},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,1,1},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={1.5,1.5,1.5},["type"]="Vector3"},["MeshId"]="http://www.roblox.com/asset/?id=79401392",["TextureId"]="http://www.roblox.com/asset/?id=4210409984"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
 if not scopeOnly then data.weapons.Gun["Snowball_G_2025"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="MeshPart",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["TextureID"]="rbxassetid://81738515769034",["Transparency"]=0,["MeshId"]="rbxassetid://6600918074",["MeshSize"]={["v"]={47.59854126,24.45413589,8.81549644},["type"]="Vector3"},["Material"]="Enum.Material.Slate",["Size"]={["v"]={1.83000004,0.94999999,0.32499999},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["v"]={0,-0.15,-0.05,-1e-05,-0.76607,0.64276,0,0.64276,0.76607,-1,0,-1e-05},["type"]="CFrame"}}}},["anchor"]=0} end end
-if not scopeOnly then data.weapons.Gun["Snowcannon"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="MeshPart",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["TextureID"]="rbxassetid://122392330922281",["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["MeshId"]="rbxassetid://99836890880541",["Transparency"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["MeshSize"]={["v"]={11.17361259,27.10245705,50},["type"]="Vector3"},["Material"]="Enum.Material.SmoothPlastic",["Size"]={["v"]={0.55858392,1.3548882,2.49956727},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="Sound",["name"]="AltSound",["properties"]={["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://138706272607549",["RollOffMinDistance"]=10}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["v"]={0,0,0.08991,1,0,0,0,0.64276,0.76606,0,-0.76606,0.64276},["type"]="CFrame"}}},{["nodeId"]=4,["parentId"]=0,["class"]="Beam",["name"]="CustomBeam",["properties"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["points"]={{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=0},{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=1}},["type"]="ColorSequence"},["Segments"]=10,["Transparency"]={["points"]={{["value"]=0.5,["time"]=0,["envelope"]=0},{["value"]=0.5,["time"]=1,["envelope"]=0}},["type"]="NumberSequence"},["Width0"]=0.5,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize1"]=0,["CurveSize0"]=0,["Texture"]=""}},{["nodeId"]=5,["parentId"]=0,["class"]="MeshPart",["name"]="Glass",["properties"]={["Reflectance"]=0,["TextureID"]="",["CFrame"]={["v"]={0,0.39828,-0.44937,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["MeshId"]="rbxassetid://127037890709284",["Transparency"]=0.80000001,["Color"]={["v"]={0.97254902,0.97254902,0.97254902},["type"]="Color3"},["MeshSize"]={["v"]={9.23009109,9.230093,28.07057381},["type"]="Vector3"},["Material"]="Enum.Material.SmoothPlastic",["Size"]={["v"]={0.46142468,0.46142474,1.40328562},["type"]="Vector3"}}}},["anchor"]=0} end end
-if not scopeOnly then data.weapons.Gun["SnowcannonBronze"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="MeshPart",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["TextureID"]="rbxassetid://73194694571352",["MeshId"]="rbxassetid://99836890880541",["Size"]={["type"]="Vector3",["v"]={0.55858392,1.3548882,2.49956727}},["CFrame"]={["type"]="CFrame",["v"]={0,0,0,1,0,0,0,1,0,0,0,1}},["Transparency"]=0,["Color"]={["type"]="Color3",["v"]={0.63921571,0.63529414,0.64705884}},["MeshSize"]={["type"]="Vector3",["v"]={11.17361259,27.10245705,50}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}},{["nodeId"]=1,["parentId"]=0,["class"]="Sound",["name"]="AltSound",["properties"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://138706272607549"}},{["nodeId"]=2,["parentId"]=0,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["type"]="CFrame",["v"]={0,0,0.08991,1,0,0,0,0.64276,0.76606,0,-0.76606,0.64276}}}},{["nodeId"]=4,["parentId"]=0,["class"]="Beam",["name"]="CustomBeam",["properties"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.9292897,0.4502022,0.00039673}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.9292897,0.4502022,0.00039673}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""}},{["nodeId"]=5,["parentId"]=0,["class"]="MeshPart",["name"]="Glass",["properties"]={["Reflectance"]=0,["TextureID"]="",["MeshId"]="rbxassetid://127037890709284",["Size"]={["type"]="Vector3",["v"]={0.46142468,0.46142474,1.40328562}},["CFrame"]={["type"]="CFrame",["v"]={0,0.39822,-0.44937,1,0,0,0,1,0,0,0,1}},["Transparency"]=0.80000001,["Color"]={["type"]="Color3",["v"]={0.96078432,0.83137256,0.74509805}},["MeshSize"]={["type"]="Vector3",["v"]={9.23009109,9.230093,28.07057381}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}}},["anchor"]=0} end end
-if not scopeOnly then data.weapons.Gun["SnowcannonChroma"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Tool",["name"]="Gun",["properties"]={["Enabled"]=true,["CanBeDropped"]=false,["RequiresHandle"]=true,["Grip"]={["type"]="CFrame",["v"]={0,-0.06318772,0.53308105,1,0,0,0,1,0,0,0,1}},["TextureId"]="rbxassetid://85283931666319"},["attributes"]={["ItemName"]="Snowcannon",["ItemType"]="Gun",["Event"]="Christmas",["IsWeapon"]=true,["Chroma"]=true,["ItemID"]="SnowcannonChroma",["Year"]="2025",["Rarity"]="Godly",["Image"]="rbxassetid://85283931666319",["IsGun"]=true}},{["nodeId"]=1,["parentId"]=0,["class"]="Part",["name"]="Handle",["properties"]={["Reflectance"]=0,["Color"]={["type"]="Color3",["v"]={0.63921571,0.63529414,0.64705884}},["CFrame"]={["type"]="CFrame",["v"]={0,0,0,1,0,0,0,1,0,0,0,1}},["Transparency"]=0,["Size"]={["type"]="Vector3",["v"]={0.55900002,1.35500002,2.5}},["Material"]="Enum.Material.Plastic"}},{["nodeId"]=5,["parentId"]=0,["class"]="Folder",["name"]="Sounds",["properties"]={}},{["nodeId"]=6,["parentId"]=0,["class"]="Folder",["name"]="Animations",["properties"]={}},{["nodeId"]=7,["parentId"]=0,["class"]="BillboardGui",["name"]="CantShoot",["properties"]={["Enabled"]=false,["MaxDistance"]="inf",["StudsOffsetWorldSpace"]={["type"]="Vector3",["v"]={0,0,0}},["Size"]={["y"]={0.60000002,0},["type"]="UDim2",["x"]={0.60000002,0}},["AlwaysOnTop"]=true,["StudsOffset"]={["type"]="Vector3",["v"]={0,0,0}}}},{["nodeId"]=8,["parentId"]=1,["class"]="Sound",["name"]="AltSound",["properties"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://138706272607549"}},{["nodeId"]=9,["parentId"]=1,["class"]="Decal",["name"]="Chroma",["properties"]={["Transparency"]=0,["Color3"]={["type"]="Color3",["v"]={0.74955952,0,1}},["Face"]="Enum.NormalId.Left",["ZIndex"]=1,["Texture"]="rbxassetid://84894022221722"},["attributes"]={["StaticLayer"]="rbxassetid://18363568406"}},{["nodeId"]=10,["parentId"]=1,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["type"]="CFrame",["v"]={0,-0.2515,0.11306,1,0,0,0,0.64276,0.76606,0,-0.76606,0.64276}}}},{["nodeId"]=11,["parentId"]=1,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["type"]="Vector3",["v"]={0,0,0}},["VertexColor"]={["type"]="Vector3",["v"]={1,1,1}},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["type"]="Vector3",["v"]={0.04963818,0.04963819,0.0496382}},["MeshId"]="rbxassetid://99836890880541",["TextureId"]="rbxassetid://122392330922281"}},{["nodeId"]=12,["parentId"]=1,["class"]="Beam",["name"]="CustomBeam",["properties"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={1,0,0.01568628}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.66666669,0,0.61176473}},["time"]=0.183391},{["value"]={["type"]="Color3",["v"]={0,0,0.77254903}},["time"]=0.39100346},{["value"]={["type"]="Color3",["v"]={0,1,0.96862745}},["time"]=0.6193772},{["value"]={["type"]="Color3",["v"]={0,0.65098041,0.04313726}},["time"]=0.80449831},{["value"]={["type"]="Color3",["v"]={1,0.93333334,0}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.5,["time"]=0,["envelope"]=0},{["value"]=0.5,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""}},{["nodeId"]=13,["parentId"]=1,["class"]="MeshPart",["name"]="Barrel",["properties"]={["Reflectance"]=0,["TextureID"]="",["MeshId"]="rbxassetid://127037890709284",["Size"]={["type"]="Vector3",["v"]={0.45528251,0.4552826,1.38460612}},["CFrame"]={["type"]="CFrame",["v"]={0,0.39295,-0.44714,1,0,0,0,1,0,0,0,1}},["Transparency"]=0.80000001,["Color"]={["type"]="Color3",["v"]={0.97254902,0.97254902,0.97254902}},["MeshSize"]={["type"]="Vector3",["v"]={9.23009109,9.230093,28.07057381}},["Material"]="Enum.Material.SmoothPlastic"}},{["nodeId"]=15,["parentId"]=5,["class"]="Sound",["name"]="Gunshot",["properties"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1,["RollOffMaxDistance"]=10000,["Volume"]=0.69999999,["SoundId"]="http://www.roblox.com/asset/?id=10209803"}},{["nodeId"]=16,["parentId"]=5,["class"]="Sound",["name"]="Reload",["properties"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1,["RollOffMaxDistance"]=10000,["Volume"]=1,["SoundId"]="rbxassetid://4753414199"}},{["nodeId"]=17,["parentId"]=6,["class"]="Animation",["name"]="Shoot",["properties"]={["AnimationId"]="rbxassetid://124281955370937"}},{["nodeId"]=18,["parentId"]=6,["class"]="Animation",["name"]="Reload",["properties"]={["AnimationId"]="rbxassetid://127786188145385"}}},["anchor"]=1} end end
-if not scopeOnly then data.weapons.Gun["SnowcannonGold"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="MeshPart",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["TextureID"]="rbxassetid://140506373376890",["MeshId"]="rbxassetid://99836890880541",["Size"]={["type"]="Vector3",["v"]={0.55858392,1.3548882,2.49956727}},["CFrame"]={["type"]="CFrame",["v"]={0,0,0,1,0,0,0,1,0,0,0,1}},["Transparency"]=0,["Color"]={["type"]="Color3",["v"]={0.63921571,0.63529414,0.64705884}},["MeshSize"]={["type"]="Vector3",["v"]={11.17361259,27.10245705,50}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}},{["nodeId"]=1,["parentId"]=0,["class"]="Sound",["name"]="AltSound",["properties"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://138706272607549"}},{["nodeId"]=2,["parentId"]=0,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["type"]="CFrame",["v"]={0,0,0.08991,1,0,0,0,0.64276,0.76606,0,-0.76606,0.64276}}}},{["nodeId"]=4,["parentId"]=0,["class"]="Beam",["name"]="CustomBeam",["properties"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.9889372,0.85192645,0}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.9889372,0.85192645,0}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""}},{["nodeId"]=5,["parentId"]=0,["class"]="MeshPart",["name"]="Glass",["properties"]={["Reflectance"]=0,["TextureID"]="",["MeshId"]="rbxassetid://127037890709284",["Size"]={["type"]="Vector3",["v"]={0.46142468,0.46142474,1.40328562}},["CFrame"]={["type"]="CFrame",["v"]={0,0.39825,-0.44936,1,0,0,0,1,0,0,0,1}},["Transparency"]=0.80000001,["Color"]={["type"]="Color3",["v"]={0.97254902,0.90196079,0.82352942}},["MeshSize"]={["type"]="Vector3",["v"]={9.23009109,9.230093,28.07057381}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}}},["anchor"]=0} end end
-if not scopeOnly then data.weapons.Gun["SnowcannonRed"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="MeshPart",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["TextureID"]="rbxassetid://72438203217422",["MeshId"]="rbxassetid://99836890880541",["Size"]={["type"]="Vector3",["v"]={0.55858392,1.3548882,2.49956727}},["CFrame"]={["type"]="CFrame",["v"]={0,0,0,1,0,0,0,1,0,0,0,1}},["Transparency"]=0,["Color"]={["type"]="Color3",["v"]={0.63921571,0.63529414,0.64705884}},["MeshSize"]={["type"]="Vector3",["v"]={11.17361259,27.10245705,50}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}},{["nodeId"]=1,["parentId"]=0,["class"]="Sound",["name"]="AltSound",["properties"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://138706272607549"}},{["nodeId"]=2,["parentId"]=0,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["type"]="CFrame",["v"]={0,0,0.08991,1,0,0,0,0.64276,0.76606,0,-0.76606,0.64276}}}},{["nodeId"]=4,["parentId"]=0,["class"]="Beam",["name"]="CustomBeam",["properties"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={1,0,0}},["time"]=0},{["value"]={["type"]="Color3",["v"]={1,0,0}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""}},{["nodeId"]=5,["parentId"]=0,["class"]="MeshPart",["name"]="Glass",["properties"]={["Reflectance"]=0,["TextureID"]="",["MeshId"]="rbxassetid://127037890709284",["Size"]={["type"]="Vector3",["v"]={0.46142468,0.46142474,1.40328562}},["CFrame"]={["type"]="CFrame",["v"]={0,0.39828,-0.44937,1,0,0,0,1,0,0,0,1}},["Transparency"]=0.80000001,["Color"]={["type"]="Color3",["v"]={0.97254902,0.82745099,0.82745099}},["MeshSize"]={["type"]="Vector3",["v"]={9.23009109,9.230093,28.07057381}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}}},["anchor"]=0} end end
-if not scopeOnly then data.weapons.Gun["SnowcannonSilver"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="MeshPart",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["TextureID"]="rbxassetid://136486734226800",["MeshId"]="rbxassetid://99836890880541",["Size"]={["type"]="Vector3",["v"]={0.55858392,1.3548882,2.49956727}},["CFrame"]={["type"]="CFrame",["v"]={0,0,0,1,0,0,0,1,0,0,0,1}},["Transparency"]=0,["Color"]={["type"]="Color3",["v"]={0.63921571,0.63529414,0.64705884}},["MeshSize"]={["type"]="Vector3",["v"]={11.17361259,27.10245705,50}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}},{["nodeId"]=1,["parentId"]=0,["class"]="Sound",["name"]="AltSound",["properties"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://138706272607549"}},{["nodeId"]=2,["parentId"]=0,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["type"]="CFrame",["v"]={0,0,0.08991,1,0,0,0,0.64276,0.76606,0,-0.76606,0.64276}}}},{["nodeId"]=4,["parentId"]=0,["class"]="Beam",["name"]="CustomBeam",["properties"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.88505381,0.92541391,0.99165332}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.88505381,0.92541391,0.99165332}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""}},{["nodeId"]=5,["parentId"]=0,["class"]="MeshPart",["name"]="Glass",["properties"]={["Reflectance"]=0,["TextureID"]="",["MeshId"]="rbxassetid://127037890709284",["Size"]={["type"]="Vector3",["v"]={0.46142468,0.46142474,1.40328562}},["CFrame"]={["type"]="CFrame",["v"]={0,0.39825,-0.44936,1,0,0,0,1,0,0,0,1}},["Transparency"]=0.80000001,["Color"]={["type"]="Color3",["v"]={0.86274511,0.93725491,0.97254902}},["MeshSize"]={["type"]="Vector3",["v"]={9.23009109,9.230093,28.07057381}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}}},["anchor"]=0} end end
+if not scopeOnly then data.weapons.Gun["Snowcannon"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="MeshPart",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["TextureID"]="rbxassetid://122392330922281",["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["MeshId"]="rbxassetid://99836890880541",["Transparency"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["MeshSize"]={["v"]={11.17361259,27.10245705,50},["type"]="Vector3"},["Material"]="Enum.Material.SmoothPlastic",["Size"]={["v"]={0.55858392,1.3548882,2.49956727},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="Sound",["name"]="AltSound",["properties"]={["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381",["RollOffMinDistance"]=10}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["v"]={0,0,0.08991,1,0,0,0,0.64276,0.76606,0,-0.76606,0.64276},["type"]="CFrame"}}},{["nodeId"]=4,["parentId"]=0,["class"]="Beam",["name"]="CustomBeam",["properties"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["points"]={{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=0},{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=1}},["type"]="ColorSequence"},["Segments"]=10,["Transparency"]={["points"]={{["value"]=0.5,["time"]=0,["envelope"]=0},{["value"]=0.5,["time"]=1,["envelope"]=0}},["type"]="NumberSequence"},["Width0"]=0.5,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize1"]=0,["CurveSize0"]=0,["Texture"]=""}},{["nodeId"]=5,["parentId"]=0,["class"]="MeshPart",["name"]="Glass",["properties"]={["Reflectance"]=0,["TextureID"]="",["CFrame"]={["v"]={0,0.39828,-0.44937,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["MeshId"]="rbxassetid://127037890709284",["Transparency"]=0.80000001,["Color"]={["v"]={0.97254902,0.97254902,0.97254902},["type"]="Color3"},["MeshSize"]={["v"]={9.23009109,9.230093,28.07057381},["type"]="Vector3"},["Material"]="Enum.Material.SmoothPlastic",["Size"]={["v"]={0.46142468,0.46142474,1.40328562},["type"]="Vector3"}}}},["anchor"]=0} end end
+if not scopeOnly then data.weapons.Gun["SnowcannonBronze"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="MeshPart",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["TextureID"]="rbxassetid://73194694571352",["MeshId"]="rbxassetid://99836890880541",["Size"]={["type"]="Vector3",["v"]={0.55858392,1.3548882,2.49956727}},["CFrame"]={["type"]="CFrame",["v"]={0,0,0,1,0,0,0,1,0,0,0,1}},["Transparency"]=0,["Color"]={["type"]="Color3",["v"]={0.63921571,0.63529414,0.64705884}},["MeshSize"]={["type"]="Vector3",["v"]={11.17361259,27.10245705,50}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}},{["nodeId"]=1,["parentId"]=0,["class"]="Sound",["name"]="AltSound",["properties"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381"}},{["nodeId"]=2,["parentId"]=0,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["type"]="CFrame",["v"]={0,0,0.08991,1,0,0,0,0.64276,0.76606,0,-0.76606,0.64276}}}},{["nodeId"]=4,["parentId"]=0,["class"]="Beam",["name"]="CustomBeam",["properties"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.9292897,0.4502022,0.00039673}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.9292897,0.4502022,0.00039673}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""}},{["nodeId"]=5,["parentId"]=0,["class"]="MeshPart",["name"]="Glass",["properties"]={["Reflectance"]=0,["TextureID"]="",["MeshId"]="rbxassetid://127037890709284",["Size"]={["type"]="Vector3",["v"]={0.46142468,0.46142474,1.40328562}},["CFrame"]={["type"]="CFrame",["v"]={0,0.39822,-0.44937,1,0,0,0,1,0,0,0,1}},["Transparency"]=0.80000001,["Color"]={["type"]="Color3",["v"]={0.96078432,0.83137256,0.74509805}},["MeshSize"]={["type"]="Vector3",["v"]={9.23009109,9.230093,28.07057381}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}}},["anchor"]=0} end end
+if not scopeOnly then data.weapons.Gun["SnowcannonChroma"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Tool",["name"]="Gun",["properties"]={["Enabled"]=true,["CanBeDropped"]=false,["RequiresHandle"]=true,["Grip"]={["type"]="CFrame",["v"]={0,-0.06318772,0.53308105,1,0,0,0,1,0,0,0,1}},["TextureId"]="rbxassetid://85283931666319"},["attributes"]={["ItemName"]="Snowcannon",["ItemType"]="Gun",["Event"]="Christmas",["IsWeapon"]=true,["Chroma"]=true,["ItemID"]="SnowcannonChroma",["Year"]="2025",["Rarity"]="Godly",["Image"]="rbxassetid://85283931666319",["IsGun"]=true}},{["nodeId"]=1,["parentId"]=0,["class"]="Part",["name"]="Handle",["properties"]={["Reflectance"]=0,["Color"]={["type"]="Color3",["v"]={0.63921571,0.63529414,0.64705884}},["CFrame"]={["type"]="CFrame",["v"]={0,0,0,1,0,0,0,1,0,0,0,1}},["Transparency"]=0,["Size"]={["type"]="Vector3",["v"]={0.55900002,1.35500002,2.5}},["Material"]="Enum.Material.Plastic"}},{["nodeId"]=5,["parentId"]=0,["class"]="Folder",["name"]="Sounds",["properties"]={}},{["nodeId"]=6,["parentId"]=0,["class"]="Folder",["name"]="Animations",["properties"]={}},{["nodeId"]=7,["parentId"]=0,["class"]="BillboardGui",["name"]="CantShoot",["properties"]={["Enabled"]=false,["MaxDistance"]="inf",["StudsOffsetWorldSpace"]={["type"]="Vector3",["v"]={0,0,0}},["Size"]={["y"]={0.60000002,0},["type"]="UDim2",["x"]={0.60000002,0}},["AlwaysOnTop"]=true,["StudsOffset"]={["type"]="Vector3",["v"]={0,0,0}}}},{["nodeId"]=8,["parentId"]=1,["class"]="Sound",["name"]="AltSound",["properties"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381"}},{["nodeId"]=9,["parentId"]=1,["class"]="Decal",["name"]="Chroma",["properties"]={["Transparency"]=0,["Color3"]={["type"]="Color3",["v"]={0.74955952,0,1}},["Face"]="Enum.NormalId.Left",["ZIndex"]=1,["Texture"]="rbxassetid://84894022221722"},["attributes"]={["StaticLayer"]="rbxassetid://18363568406"}},{["nodeId"]=10,["parentId"]=1,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["type"]="CFrame",["v"]={0,-0.2515,0.11306,1,0,0,0,0.64276,0.76606,0,-0.76606,0.64276}}}},{["nodeId"]=11,["parentId"]=1,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["type"]="Vector3",["v"]={0,0,0}},["VertexColor"]={["type"]="Vector3",["v"]={1,1,1}},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["type"]="Vector3",["v"]={0.04963818,0.04963819,0.0496382}},["MeshId"]="rbxassetid://99836890880541",["TextureId"]="rbxassetid://122392330922281"}},{["nodeId"]=12,["parentId"]=1,["class"]="Beam",["name"]="CustomBeam",["properties"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={1,0,0.01568628}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.66666669,0,0.61176473}},["time"]=0.183391},{["value"]={["type"]="Color3",["v"]={0,0,0.77254903}},["time"]=0.39100346},{["value"]={["type"]="Color3",["v"]={0,1,0.96862745}},["time"]=0.6193772},{["value"]={["type"]="Color3",["v"]={0,0.65098041,0.04313726}},["time"]=0.80449831},{["value"]={["type"]="Color3",["v"]={1,0.93333334,0}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.5,["time"]=0,["envelope"]=0},{["value"]=0.5,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""}},{["nodeId"]=13,["parentId"]=1,["class"]="MeshPart",["name"]="Barrel",["properties"]={["Reflectance"]=0,["TextureID"]="",["MeshId"]="rbxassetid://127037890709284",["Size"]={["type"]="Vector3",["v"]={0.45528251,0.4552826,1.38460612}},["CFrame"]={["type"]="CFrame",["v"]={0,0.39295,-0.44714,1,0,0,0,1,0,0,0,1}},["Transparency"]=0.80000001,["Color"]={["type"]="Color3",["v"]={0.97254902,0.97254902,0.97254902}},["MeshSize"]={["type"]="Vector3",["v"]={9.23009109,9.230093,28.07057381}},["Material"]="Enum.Material.SmoothPlastic"}},{["nodeId"]=15,["parentId"]=5,["class"]="Sound",["name"]="Gunshot",["properties"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1,["RollOffMaxDistance"]=10000,["Volume"]=0.69999999,["SoundId"]="http://www.roblox.com/asset/?id=10209803"}},{["nodeId"]=16,["parentId"]=5,["class"]="Sound",["name"]="Reload",["properties"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1,["RollOffMaxDistance"]=10000,["Volume"]=1,["SoundId"]="rbxassetid://4753414199"}},{["nodeId"]=17,["parentId"]=6,["class"]="Animation",["name"]="Shoot",["properties"]={["AnimationId"]="rbxassetid://124281955370937"}},{["nodeId"]=18,["parentId"]=6,["class"]="Animation",["name"]="Reload",["properties"]={["AnimationId"]="rbxassetid://127786188145385"}}},["anchor"]=1} end end
+if not scopeOnly then data.weapons.Gun["SnowcannonGold"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="MeshPart",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["TextureID"]="rbxassetid://140506373376890",["MeshId"]="rbxassetid://99836890880541",["Size"]={["type"]="Vector3",["v"]={0.55858392,1.3548882,2.49956727}},["CFrame"]={["type"]="CFrame",["v"]={0,0,0,1,0,0,0,1,0,0,0,1}},["Transparency"]=0,["Color"]={["type"]="Color3",["v"]={0.63921571,0.63529414,0.64705884}},["MeshSize"]={["type"]="Vector3",["v"]={11.17361259,27.10245705,50}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}},{["nodeId"]=1,["parentId"]=0,["class"]="Sound",["name"]="AltSound",["properties"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381"}},{["nodeId"]=2,["parentId"]=0,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["type"]="CFrame",["v"]={0,0,0.08991,1,0,0,0,0.64276,0.76606,0,-0.76606,0.64276}}}},{["nodeId"]=4,["parentId"]=0,["class"]="Beam",["name"]="CustomBeam",["properties"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.9889372,0.85192645,0}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.9889372,0.85192645,0}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""}},{["nodeId"]=5,["parentId"]=0,["class"]="MeshPart",["name"]="Glass",["properties"]={["Reflectance"]=0,["TextureID"]="",["MeshId"]="rbxassetid://127037890709284",["Size"]={["type"]="Vector3",["v"]={0.46142468,0.46142474,1.40328562}},["CFrame"]={["type"]="CFrame",["v"]={0,0.39825,-0.44936,1,0,0,0,1,0,0,0,1}},["Transparency"]=0.80000001,["Color"]={["type"]="Color3",["v"]={0.97254902,0.90196079,0.82352942}},["MeshSize"]={["type"]="Vector3",["v"]={9.23009109,9.230093,28.07057381}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}}},["anchor"]=0} end end
+if not scopeOnly then data.weapons.Gun["SnowcannonRed"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="MeshPart",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["TextureID"]="rbxassetid://72438203217422",["MeshId"]="rbxassetid://99836890880541",["Size"]={["type"]="Vector3",["v"]={0.55858392,1.3548882,2.49956727}},["CFrame"]={["type"]="CFrame",["v"]={0,0,0,1,0,0,0,1,0,0,0,1}},["Transparency"]=0,["Color"]={["type"]="Color3",["v"]={0.63921571,0.63529414,0.64705884}},["MeshSize"]={["type"]="Vector3",["v"]={11.17361259,27.10245705,50}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}},{["nodeId"]=1,["parentId"]=0,["class"]="Sound",["name"]="AltSound",["properties"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381"}},{["nodeId"]=2,["parentId"]=0,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["type"]="CFrame",["v"]={0,0,0.08991,1,0,0,0,0.64276,0.76606,0,-0.76606,0.64276}}}},{["nodeId"]=4,["parentId"]=0,["class"]="Beam",["name"]="CustomBeam",["properties"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={1,0,0}},["time"]=0},{["value"]={["type"]="Color3",["v"]={1,0,0}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""}},{["nodeId"]=5,["parentId"]=0,["class"]="MeshPart",["name"]="Glass",["properties"]={["Reflectance"]=0,["TextureID"]="",["MeshId"]="rbxassetid://127037890709284",["Size"]={["type"]="Vector3",["v"]={0.46142468,0.46142474,1.40328562}},["CFrame"]={["type"]="CFrame",["v"]={0,0.39828,-0.44937,1,0,0,0,1,0,0,0,1}},["Transparency"]=0.80000001,["Color"]={["type"]="Color3",["v"]={0.97254902,0.82745099,0.82745099}},["MeshSize"]={["type"]="Vector3",["v"]={9.23009109,9.230093,28.07057381}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}}},["anchor"]=0} end end
+if not scopeOnly then data.weapons.Gun["SnowcannonSilver"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="MeshPart",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["TextureID"]="rbxassetid://136486734226800",["MeshId"]="rbxassetid://99836890880541",["Size"]={["type"]="Vector3",["v"]={0.55858392,1.3548882,2.49956727}},["CFrame"]={["type"]="CFrame",["v"]={0,0,0,1,0,0,0,1,0,0,0,1}},["Transparency"]=0,["Color"]={["type"]="Color3",["v"]={0.63921571,0.63529414,0.64705884}},["MeshSize"]={["type"]="Vector3",["v"]={11.17361259,27.10245705,50}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}},{["nodeId"]=1,["parentId"]=0,["class"]="Sound",["name"]="AltSound",["properties"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["Looped"]=false,["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381"}},{["nodeId"]=2,["parentId"]=0,["class"]="Attachment",["name"]="CustomAttachment",["properties"]={["CFrame"]={["type"]="CFrame",["v"]={0,0,0.08991,1,0,0,0,0.64276,0.76606,0,-0.76606,0.64276}}}},{["nodeId"]=4,["parentId"]=0,["class"]="Beam",["name"]="CustomBeam",["properties"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.88505381,0.92541391,0.99165332}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.88505381,0.92541391,0.99165332}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""}},{["nodeId"]=5,["parentId"]=0,["class"]="MeshPart",["name"]="Glass",["properties"]={["Reflectance"]=0,["TextureID"]="",["MeshId"]="rbxassetid://127037890709284",["Size"]={["type"]="Vector3",["v"]={0.46142468,0.46142474,1.40328562}},["CFrame"]={["type"]="CFrame",["v"]={0,0.39825,-0.44936,1,0,0,0,1,0,0,0,1}},["Transparency"]=0.80000001,["Color"]={["type"]="Color3",["v"]={0.86274511,0.93725491,0.97254902}},["MeshSize"]={["type"]="Vector3",["v"]={9.23009109,9.230093,28.07057381}},["Material"]="Enum.Material.SmoothPlastic"},["attributes"]={["CollisionFidelity"]="Default"}}},["anchor"]=0} end end
 if not scopeOnly then data.weapons.Gun["Snowflake_G_2018"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.SmoothPlastic",["Size"]={["v"]={0.2,1.83000016,1.02999997},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,1,1},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={1.5,1.5,1.5},["type"]="Vector3"},["MeshId"]="http://www.roblox.com/asset/?id=79401392 ",["TextureId"]="rbxassetid://2669622213"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
 if not scopeOnly then data.weapons.Gun["Snowflake_G_2022"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.SmoothPlastic",["Size"]={["v"]={0.2,1.83000016,1.02999997},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,1,1},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={1.5,1.5,1.5},["type"]="Vector3"},["MeshId"]="http://www.roblox.com/asset/?id=79401392",["TextureId"]="rbxassetid://11830940122"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
 if not scopeOnly then data.weapons.Gun["Snowflake_G_2023"]=function() return {["nodes"]={{["nodeId"]=0,["class"]="Part",["name"]="GunDisplay",["properties"]={["Reflectance"]=0,["Color"]={["v"]={0.63921571,0.63529414,0.64705884},["type"]="Color3"},["Transparency"]=0,["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"},["Material"]="Enum.Material.SmoothPlastic",["Size"]={["v"]={0.2,1.83000016,1.02999997},["type"]="Vector3"}}},{["nodeId"]=1,["parentId"]=0,["class"]="SpecialMesh",["name"]="Mesh",["properties"]={["Offset"]={["v"]={0,0,0},["type"]="Vector3"},["VertexColor"]={["v"]={1,1,1},["type"]="Vector3"},["MeshType"]="Enum.MeshType.FileMesh",["Scale"]={["v"]={1.5,1.5,1.5},["type"]="Vector3"},["MeshId"]="http://www.roblox.com/asset/?id=79401392",["TextureId"]="rbxassetid://15351058932"}},{["nodeId"]=3,["parentId"]=0,["class"]="Attachment",["name"]="Attachment",["properties"]={["CFrame"]={["v"]={0,0,0,1,0,0,0,1,0,0,0,1},["type"]="CFrame"}}}},["anchor"]=0} end end
@@ -6820,14 +6724,14 @@ if not scopeOnly then data.gunBehavior["RaygunGold"]={["shoot"]={["RollOffMinDis
 if not scopeOnly then data.gunBehavior["RaygunRed"]={["shoot"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=1,["SoundId"]="rbxassetid://76985543647435",["equalizer"]={["Enabled"]=true,["LowGain"]=-5,["HighGain"]=0,["MidGain"]=0,["Priority"]=0}},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={1,0,0}},["time"]=0},{["value"]={["type"]="Color3",["v"]={1,0,0}},["time"]=1}}},["Width0"]=0.2,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.5,["time"]=0,["envelope"]=0},{["value"]=0.5,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.2,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""},["animations"]={}} end
 if not scopeOnly then data.gunBehavior["RaygunSilver"]={["shoot"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=1,["SoundId"]="rbxassetid://76985543647435",["equalizer"]={["Enabled"]=true,["LowGain"]=-5,["HighGain"]=0,["MidGain"]=0,["Priority"]=0}},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.7843138,0.7843138,1}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.7843138,0.7843138,1}},["time"]=1}}},["Width0"]=0.2,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.5,["time"]=0,["envelope"]=0},{["value"]=0.5,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.2,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""},["animations"]={}} end
 if not scopeOnly then data.gunBehavior["SilverHarvester"]={["shoot"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=1,["SoundId"]="rbxassetid://7808472682"},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.7843138,0.7843138,0.7843138}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.7843138,0.7843138,0.7843138}},["time"]=1}}},["Width0"]=0.2,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.5,["time"]=0,["envelope"]=0},{["value"]=0.5,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.2,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""},["animations"]={}} end
-if not scopeOnly then data.gunBehavior["Snowcannon"]={["shoot"]={["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://138706272607549",["RollOffMinDistance"]=10},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["points"]={{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=0},{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=1}},["type"]="ColorSequence"},["Segments"]=10,["Transparency"]={["points"]={{["value"]=0.5,["time"]=0,["envelope"]=0},{["value"]=0.5,["time"]=1,["envelope"]=0}},["type"]="NumberSequence"},["Width0"]=0.5,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize1"]=0,["CurveSize0"]=0,["Texture"]=""},["animations"]={}} end
-if not scopeOnly then data.gunBehavior["SnowcannonBronze"]={["shoot"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://138706272607549"},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.9292897,0.4502022,0.00039673}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.9292897,0.4502022,0.00039673}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""},["animations"]={}} end
-if not scopeOnly then data.gunBehavior["SnowcannonChroma"]={["shoot"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://138706272607549"},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={1,0,0.01568628}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.66666669,0,0.61176473}},["time"]=0.183391},{["value"]={["type"]="Color3",["v"]={0,0,0.77254903}},["time"]=0.39100346},{["value"]={["type"]="Color3",["v"]={0,1,0.96862745}},["time"]=0.6193772},{["value"]={["type"]="Color3",["v"]={0,0.65098041,0.04313726}},["time"]=0.80449831},{["value"]={["type"]="Color3",["v"]={1,0.93333334,0}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.5,["time"]=0,["envelope"]=0},{["value"]=0.5,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""},["animations"]={["Shoot"]="rbxassetid://124281955370937",["Reload"]="rbxassetid://127786188145385"}} end
+if not scopeOnly then data.gunBehavior["Snowcannon"]={["shoot"]={["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381",["RollOffMinDistance"]=10},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["points"]={{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=0},{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=1}},["type"]="ColorSequence"},["Segments"]=10,["Transparency"]={["points"]={{["value"]=0.5,["time"]=0,["envelope"]=0},{["value"]=0.5,["time"]=1,["envelope"]=0}},["type"]="NumberSequence"},["Width0"]=0.5,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize1"]=0,["CurveSize0"]=0,["Texture"]=""},["animations"]={}} end
+if not scopeOnly then data.gunBehavior["SnowcannonBronze"]={["shoot"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381"},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.9292897,0.4502022,0.00039673}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.9292897,0.4502022,0.00039673}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""},["animations"]={}} end
+if not scopeOnly then data.gunBehavior["SnowcannonChroma"]={["shoot"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381"},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={1,0,0.01568628}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.66666669,0,0.61176473}},["time"]=0.183391},{["value"]={["type"]="Color3",["v"]={0,0,0.77254903}},["time"]=0.39100346},{["value"]={["type"]="Color3",["v"]={0,1,0.96862745}},["time"]=0.6193772},{["value"]={["type"]="Color3",["v"]={0,0.65098041,0.04313726}},["time"]=0.80449831},{["value"]={["type"]="Color3",["v"]={1,0.93333334,0}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.5,["time"]=0,["envelope"]=0},{["value"]=0.5,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""},["animations"]={["Shoot"]="rbxassetid://124281955370937",["Reload"]="rbxassetid://127786188145385"}} end
 end)()
 ;(function()
-if not scopeOnly then data.gunBehavior["SnowcannonGold"]={["shoot"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://138706272607549"},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.9889372,0.85192645,0}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.9889372,0.85192645,0}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""},["animations"]={}} end
-if not scopeOnly then data.gunBehavior["SnowcannonRed"]={["shoot"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://138706272607549"},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={1,0,0}},["time"]=0},{["value"]={["type"]="Color3",["v"]={1,0,0}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""},["animations"]={}} end
-if not scopeOnly then data.gunBehavior["SnowcannonSilver"]={["shoot"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://138706272607549"},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.88505381,0.92541391,0.99165332}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.88505381,0.92541391,0.99165332}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""},["animations"]={}} end
+if not scopeOnly then data.gunBehavior["SnowcannonGold"]={["shoot"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381"},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.9889372,0.85192645,0}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.9889372,0.85192645,0}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""},["animations"]={}} end
+if not scopeOnly then data.gunBehavior["SnowcannonRed"]={["shoot"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381"},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={1,0,0}},["time"]=0},{["value"]={["type"]="Color3",["v"]={1,0,0}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""},["animations"]={}} end
+if not scopeOnly then data.gunBehavior["SnowcannonSilver"]={["shoot"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381"},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.88505381,0.92541391,0.99165332}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.88505381,0.92541391,0.99165332}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""},["animations"]={}} end
 data.gunBehavior["Voidscope"]=scopeOnly and {["shoot"]={["RollOffMinDistance"]=9.17886162,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1,["RollOffMaxDistance"]=9178.86230469,["Volume"]=0.5,["SoundId"]="rbxassetid://130113322",["equalizer"]={["Enabled"]=true,["LowGain"]=-5,["HighGain"]=0,["MidGain"]=0,["Priority"]=0}},["reload"]={["RollOffMinDistance"]=9.17886162,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=0.80000001,["RollOffMaxDistance"]=9178.86230469,["Volume"]=0.5,["SoundId"]="rbxassetid://130113370",["equalizer"]={["Enabled"]=true,["LowGain"]=-5,["HighGain"]=0,["MidGain"]=0,["Priority"]=0}},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["points"]={{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=0},{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=1}},["type"]="ColorSequence"},["Segments"]=10,["Transparency"]={["points"]={{["value"]=0,["time"]=0,["envelope"]=0},{["value"]=0,["time"]=1,["envelope"]=0}},["type"]="NumberSequence"},["Width0"]=0.2,["Width1"]=0.2,["LightEmission"]=0.5,["CurveSize1"]=0,["CurveSize0"]=0,["Texture"]=""},["hold"]="rbxassetid://134818020160275",["animations"]={["CustomHold"]="rbxassetid://134818020160275",["Shoot"]="rbxassetid://124281955370937",["Reload"]="rbxassetid://127786188145385"},["flicker"]={["interval"]=0.01666667,["colors"]={{["type"]="ColorSequence",["points"]={{["time"]=0,["value"]={["type"]="Color3",["v"]={1,1,1}}},{["time"]=1,["value"]={["type"]="Color3",["v"]={1,1,1}}}}},{["type"]="ColorSequence",["points"]={{["time"]=0,["value"]={["type"]="Color3",["v"]={0,0,0}}},{["time"]=1,["value"]={["type"]="Color3",["v"]={0,0,0}}}}}}}} or {["shoot"]={["RollOffMinDistance"]=9.17886162,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1,["RollOffMaxDistance"]=9178.86230469,["Volume"]=0.5,["SoundId"]="rbxassetid://130113322",["equalizer"]={["Enabled"]=true,["LowGain"]=-5,["HighGain"]=0,["MidGain"]=0,["Priority"]=0}},["reload"]={["RollOffMinDistance"]=9.17886162,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=0.80000001,["RollOffMaxDistance"]=9178.86230469,["Volume"]=0.5,["SoundId"]="rbxassetid://130113370",["equalizer"]={["Enabled"]=true,["LowGain"]=-5,["HighGain"]=0,["MidGain"]=0,["Priority"]=0}},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["points"]={{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=0},{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=1}},["type"]="ColorSequence"},["Segments"]=10,["Transparency"]={["points"]={{["value"]=0,["time"]=0,["envelope"]=0},{["value"]=0,["time"]=1,["envelope"]=0}},["type"]="NumberSequence"},["Width0"]=0.2,["Width1"]=0.2,["LightEmission"]=0.5,["CurveSize1"]=0,["CurveSize0"]=0,["Texture"]=""},["hold"]="rbxassetid://15666234025",["animations"]={["CustomHold"]="rbxassetid://15666234025",["Shoot"]="rbxassetid://124281955370937",["Reload"]="rbxassetid://127786188145385"},["flicker"]={["interval"]=0.01666667,["colors"]={{["type"]="ColorSequence",["points"]={{["time"]=0,["value"]={["type"]="Color3",["v"]={1,1,1}}},{["time"]=1,["value"]={["type"]="Color3",["v"]={1,1,1}}}}},{["type"]="ColorSequence",["points"]={{["time"]=0,["value"]={["type"]="Color3",["v"]={0,0,0}}},{["time"]=1,["value"]={["type"]="Color3",["v"]={0,0,0}}}}}}}}
 end)()
 ;(function()
@@ -7190,7 +7094,7 @@ if not scopeOnly then data.metadata.Gun["VampireGunChroma"]={["year"]="2024",["i
 if not scopeOnly then data.metadata.Gun["Vampire_G_2022"]={["itemname"]="Vampire",["rarity"]="Legendary",["itemid"]=11255503583,["image"]="http://www.roblox.com/Thumbs/Asset.ashx?format=png&width=250&height=250&assetId=11255503583",["event"]="Halloween",["year"]="2022"} end
 if not scopeOnly then data.metadata.Gun["Vines_G_2023"]={["image"]="http://www.roblox.com/Thumbs/Asset.ashx?format=png&width=250&height=250&assetId=15091402817",["year"]="2023",["rarity"]="Common",["itemid"]=15091402817,["event"]="Halloween",["itemname"]="Vines"} end
 if not scopeOnly then data.metadata.Gun["Viper"]={["image"]="http://www.roblox.com/Thumbs/Asset.ashx?format=png&width=250&height=250&assetId=160299600",["itemid"]=196752926,["rarity"]="Legendary",["itemname"]="Viper"} end
-data.metadata.Gun["Voidscope"]={["image"]="http://www.roblox.com/asset/?id=80649487175462",["itemid"]=84264267520629,["fx"]=true,["rarity"]="Secret",["season"]=1,["itemname"]="Voidscope"}
+data.metadata.Gun["Voidscope"]={["event"]="Halloween",["year"]="2025",["image"]="http://www.roblox.com/asset/?id=80649487175462",["itemid"]=84264267520629,["fx"]=true,["rarity"]="Secret",["season"]=1,["itemname"]="Voidscope"}
 if not scopeOnly then data.metadata.Gun["Watcher_G_2021"]={["image"]="http://www.roblox.com/Thumbs/Asset.ashx?format=png&width=250&height=250&assetId=7800256309",["year"]="2021",["rarity"]="Rare",["itemid"]=7800256309,["event"]="Halloween",["itemname"]="Watcher"} end
 if not scopeOnly then data.metadata.Gun["WaterBalloons_G_2024"]={["image"]="http://www.roblox.com/Thumbs/Asset.ashx?format=png&width=250&height=250&assetId=18323751962",["rarity"]="Common",["itemid"]=18323751962,["season"]=1,["itemname"]="Balloons"} end
 if not scopeOnly then data.metadata.Gun["Watergun"]={["image"]="http://www.roblox.com/Thumbs/Asset.ashx?format=png&width=250&height=250&assetId=18351388416",["rarity"]="Godly",["itemid"]=18351388416,["season"]=1,["itemname"]="Watergun"} end
@@ -8163,6 +8067,20 @@ local function decode(value,objects)
     if kind=="Instance" then return objects and objects[value.nodeId] end
     error("Unsupported captured visual type: "..tostring(kind))
 end
+
+-- Native shot recordings supplied 2026-10-16; keep each variant's beam colors.
+if not scopeOnly then
+    for id,behavior in pairs(data.gunBehavior) do
+        if id:find("Harvester",1,true) then behavior.shoot={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=1,["SoundId"]="rbxassetid://7808472682"} end
+    end
+    for id,behavior in pairs(data.gunBehavior) do
+        if id:find("Snowcannon",1,true) then behavior.shoot={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381"} end
+    end
+    for id,behavior in pairs(data.gunBehavior) do
+        if id:find("Raygun",1,true) then behavior.shoot={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=1,["SoundId"]="rbxassetid://76985543647435",["equalizer"]={["Enabled"]=true,["LowGain"]=-5,["HighGain"]=0,["MidGain"]=0,["Priority"]=0}} end
+    end
+end
+
 local gripSources={Gun={
     BlueHarvester="Harvester",BronzeHarvester="Harvester",SilverHarvester="Harvester",GoldHarvester="Harvester",
     ElderwoodGunBlue="ElderwoodGun",ElderwoodGunBronze="ElderwoodGun",ElderwoodGunSilver="ElderwoodGun",ElderwoodGunGold="ElderwoodGun",
@@ -8173,7 +8091,11 @@ local gripSources={Gun={
 },Knife={BlueCandy="Candy",BronzeCandy="Candy",SilverCandy="Candy",GoldCandy="Candy"}}
 local inheritedGrips={}
 local function weaponGrip(category,id,record)
-if record.grip then return record.grip end
+    -- Every Harvester trophy uses the native held Harvester grip from the scan.
+    if category=="Gun" and id:find("Harvester",1,true) then
+        return {type="CFrame",v={0,-0.5109372138977051,0.34054040908813477,1,0,0,0,1,0,0,0,1}}
+    end
+    if record.grip then return record.grip end
     for _,node in ipairs(record.nodes) do
         if node.class=="Tool" and node.properties.Grip then return node.properties.Grip end
     end
@@ -9173,7 +9095,7 @@ local staticMM2={
     {"Knife","SantasMagic",{["itemid"]=4535483042,["itemname"]="Santa's Magic",["itemtype"]="Knife",["rarity"]="Legendary",["year"]="2019"}},
     {"Knife","SantasSpirit",{["itemid"]=6123357775,["itemname"]="Santa's Spirit",["itemtype"]="Knife",["rarity"]="Legendary",["year"]="2020"}},
     {"Knife","Saw",{["itemid"]=235381341,["itemname"]="Saw",["itemtype"]="Knife",["rarity"]="Godly"}},
-{"Knife","SawChroma",{["chroma"]=true,["itemid"]=3187392992,["itemname"]="Saw",["itemtype"]="Knife",["rarity"]="Godly"}},
+    {"Knife","SawChroma",{["chroma"]=true,["itemid"]=3187392992,["itemname"]="Saw",["itemtype"]="Knife",["rarity"]="Godly"}},
     {"Knife","Scarf_K_2023",{["itemid"]=15415482999,["itemname"]="Scarf",["itemtype"]="Knife",["rarity"]="Common"}},
     {"Knife","Scratch",{["itemid"]=531873371,["itemname"]="Scratch",["itemtype"]="Knife",["rarity"]="Legendary",["year"]="2016"}},
     {"Knife","ScratchBlue",{["itemid"]=1133316381,["itemname"]="Scratch",["itemtype"]="Knife",["rarity"]="Legendary",["year"]="2017"}},
@@ -9652,6 +9574,39 @@ local function buildTemplate(entry)
     end
     if not root:IsDescendantOf(model) then model:Destroy(); return nil,"The weapon Handle is unavailable" end
     model.PrimaryPart=root
+    local totalRate=0
+    local emitters={}
+    for _,object in ipairs(model:GetDescendants()) do
+        if object:IsA("ParticleEmitter") and object.Enabled then
+            emitters[#emitters+1]=object;totalRate=totalRate+object.Rate
+        end
+    end
+    if totalRate>80 then
+        for _,emitter in ipairs(emitters) do emitter.Rate=emitter.Rate*(80/totalRate) end
+    end
+    -- A grip attachment is not a muzzle. Use a named muzzle when captured;
+    -- otherwise project the recorded tool's forward axis to its visible barrel edge.
+    if entry.kind=="Gun" then
+        local muzzle
+        for _,object in ipairs(model:GetDescendants()) do
+            local name=compact(object.Name)
+            if object:IsA("Attachment") and (name=="muzzle" or name=="muzzleattachment"
+                or name=="barreltip" or name=="barrelattachment") then muzzle=object;break end
+        end
+        if muzzle then muzzle.Name="VisualsV2_Muzzle"
+        else
+            muzzle=Instance.new("Attachment");muzzle.Name="VisualsV2_Muzzle"
+            local forward=(grip or attachmentGrip or CFrame.new()).LookVector
+            local half=root.Size*0.5
+            local distance=math.huge
+            for _,axis in ipairs({"X","Y","Z"}) do
+                if math.abs(forward[axis])>0.001 then distance=math.min(distance,half[axis]/math.abs(forward[axis])) end
+            end
+            muzzle.Position=forward*(distance<math.huge and distance or 0)
+            muzzle.Parent=root
+        end
+        muzzle:SetAttribute("VisualsV2_GunCosmetic",true)
+    end
     return {model=model,root=root,grip=grip,attachmentGrip=attachmentGrip,holsterGrip=holsterGrip,useToolGrip=useToolGrip,scopeHold=scopeHold,chroma=data.chroma==true,
         revision=entry.revision,lastUsed=os.clock(),source=sourceName,attempts=attempts}
 end
@@ -9742,6 +9697,12 @@ local function stopScopeHold(state)
     end
     for track,weight in pairs(hold.suppressed or {}) do
         pcall(function() if track.IsPlaying then track:AdjustWeight(weight,0.12) end end)
+    end
+    if not hold.owned and hold.track and hold.nativePriority then
+        pcall(function()
+            hold.track.Priority=hold.nativePriority;hold.track.Looped=hold.nativeLooped
+            if hold.nativeWeight then hold.track:AdjustWeight(hold.nativeWeight,0.12) end
+        end)
     end
     if hold.owned then
         pcall(function() hold.track:Stop(0.12) end)
@@ -9938,6 +9899,9 @@ local function updateScopeHold(tool,state,entry)
         if state.hold or state.holdPending then stopScopeHold(state) end
         return
     end
+    local existing=state.hold
+    if existing and not existing.pose and existing.animator==animator and existing.skinSignature==state.applied
+        and existing.track and existing.track.IsPlaying then return end
     local rig=tostring(humanoid.RigType)
     if humanoid.RigType==Enum.HumanoidRigType.R6 then
         r6ScopeHold(tool,state,humanoid)
@@ -10032,8 +9996,12 @@ local function updateScopeHold(tool,state,entry)
         state.holdError=nil
         nativeScopeHolds[rig]=id
         SetCfg(scopeCacheKey(rig),id)
-        hold={track=track,animation=animation,animator=animator,signature=signature,
-            owned=ownsTrack,suppressed={}}
+        local priority,looped,weight=track.Priority,track.Looped,track.WeightTarget
+        pcall(function()
+            track.Priority=Enum.AnimationPriority.Action2;track.Looped=true;track:AdjustWeight(1,0.12)
+        end)
+        hold={track=track,animation=animation,animator=animator,signature=signature,skinSignature=state.applied,
+            owned=ownsTrack,nativePriority=not ownsTrack and priority or nil,nativeLooped=looped,nativeWeight=weight,suppressed={}}
         state.hold=hold
         model:SetAttribute("ScopeHoldAnimationID",id)
         hold.died=humanoid.Died:Connect(function()
@@ -10173,7 +10141,7 @@ local function equippedGrip(tool,handle,state)
         joint=nil
         local character=player.Character
         local hand=character and (character:FindFirstChild("RightHand") or character:FindFirstChild("Right Arm"))
-for _,container in pairs({hand,handle}) do
+        for _,container in pairs({hand,handle}) do
             for _,candidate in ipairs(container:GetChildren()) do
                 if candidate:IsA("JointInstance") and candidate.Name=="RightGrip" and candidate.Part1==handle then
                     joint=candidate;break
@@ -10354,7 +10322,13 @@ local function refreshHolsters()
     local humanoid=character and character:FindFirstChildOfClass("Humanoid")
     for kind,settings in pairs(kinds) do
         local entry=settings.enabled and catalog[kind][settings.selected]
-        if not alive or not runtimeAlive or not entry or not body or not body:IsA("BasePart")
+        local equipped=false
+        if character then
+            for _,tool in ipairs(character:GetChildren()) do
+                if tool:IsA("Tool") and actualKind(tool)==kind then equipped=true;break end
+            end
+        end
+        if not alive or not runtimeAlive or equipped or not entry or not body or not body:IsA("BasePart")
             or not humanoid or humanoid.Health<=0 then
             clearHolster(kind)
         else
@@ -10397,6 +10371,10 @@ local function refreshHolsters()
                             weld.Parent=part
                             parts[#parts+1]=part
                         end
+                    end
+                    for _,object in ipairs(model:GetDescendants()) do
+                        if object:IsA("ParticleEmitter") then object.Rate=object.Rate*0.35
+                        elseif object:IsA("Light") then object.Enabled=false end
                     end
                     model.Name="VisualsV2_Client"..kind.."Holster"
                     model:SetAttribute(MARKER,true)
@@ -10455,8 +10433,9 @@ updateWatching=function()
     local colorAt=0
     hideFrame=RunService.RenderStepped:Connect(function()
         local now=os.clock()
-        local colorDue=now-colorAt>=1/30
-        if colorDue then colorAt=now end
+        if now-colorAt<1/30 then return end
+        colorAt=now
+        local colorDue=true
         for _,state in pairs(holsters) do
             if state.model then
                 if colorDue then updateChroma(state) end
@@ -10581,9 +10560,14 @@ env.VisualsV2Runtime.ClientWeaponSkins={
         local state=toolStates[tool]
         return state and state.model
     end,
+    GetMuzzle=function(tool)
+        local state=toolStates[tool]
+        local model=state and state.model
+        return model and model.Parent and model:FindFirstChild("VisualsV2_Muzzle",true) or nil
+    end,
     GetNativeHolster=function(kind) return nativeHolster(player.Character,kind) end,
     GetDiagnostics=function()
-        local report={build="2026-10-15-skins-1",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
+        local report={build="2026-10-16-skins-2",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
         for kind,settings in pairs(kinds) do
             local entry=catalog[kind][settings.selected]
             local key=entry and cacheKey(entry)
@@ -11483,41 +11467,24 @@ end)()
 local skins=env.VisualsV2Runtime.ClientWeaponSkins
 local originals=env.VisualsV2Runtime.OriginalVisuals
 local alive=true
+local weaponSoundsEnabled=C("vv2WeaponSoundsEnabled",true)
+local SHOT_GAP=0.4
 local states={}
 local connections={}
 local liveBeams={}
 local nativeSounds=setmetatable({}, {__mode="k"})
 local shotRemotes=setmetatable({}, {__mode="k"})
 local nativeAssets={Shot={},Reload={}}
-local nativeShotAnimations={}
 local vanillaAssets={Shot="10209803",Reload="4753414199"}
 local audioTransport
 local soundService=game:GetService("SoundService")
 local sharedShotRemotes=setmetatable({}, {__mode="k"})
 local shotVisual
-local externalWatches=setmetatable({}, {__mode="k"})
-local externalSources=env.VisualsV2KnownShotSources
-if type(externalSources)~="table" then
-    externalSources=setmetatable({}, {__mode="k"})
-    env.VisualsV2KnownShotSources=externalSources
-end
-local observeExternalShot
-local watchExternalSound
 local soundProperties={"SoundId","Volume","PlaybackSpeed","RollOffMinDistance","RollOffMaxDistance","RollOffMode"}
 local beamProperties={"Color","Texture","Width0","Width1","LightEmission","LightInfluence","Transparency",
     "TextureLength","TextureMode","TextureSpeed","Segments","CurveSize0","CurveSize1"}
 local shotNames={gunshot=true,altsound=true,shoot=true,shotsound=true,shootsound=true}
 local reloadNames={reload=true,customreload=true,reloadsound=true}
-local makeSound
-local hostAudio=env.VisualsV2HostGunAudio
-if type(hostAudio)~="table" or hostAudio.version~=1 then
-    hostAudio={version=1}
-    env.VisualsV2HostGunAudio=hostAudio
-end
-local vanillaReload={SoundId="rbxassetid://4753414199",Volume=1,PlaybackSpeed=1,
-    RollOffMinDistance=10,RollOffMaxDistance=10000,RollOffMode=Enum.RollOffMode.Inverse}
-local vanillaShot={SoundId="rbxassetid://10209803",Volume=0.7,PlaybackSpeed=1,
-    RollOffMinDistance=10,RollOffMaxDistance=10000,RollOffMode=Enum.RollOffMode.Inverse}
 local function assetId(value)
     return tostring(value or ""):match("(%d+)")
 end
@@ -11527,62 +11494,6 @@ for id in pairs(originals.Metadata.Gun or {}) do
         for kind,key in pairs({Shot="shoot",Reload="reload"}) do
             local id=behavior[key] and assetId(behavior[key].SoundId)
             if id then nativeAssets[kind][id]=true end
-        end
-        local animation=behavior.animations and assetId(behavior.animations.Shoot)
-        if animation then nativeShotAnimations[animation]=true end
-    end
-end
-local function behaviorFor(id)
-    local captured=originals.GetGunBehavior(id)
-    local customShoot=captured and captured.shoot~=nil or false
-    local customReload=captured and captured.reload~=nil or false
-    local behavior=table.clone(captured or {})
-    if not customShoot then behavior.shoot=hostAudio.Shot end
-    if not customReload then
-        -- A gun with its own shot uses the normal game reload, never ODH's reload.
-        behavior.reload=customShoot and vanillaReload or hostAudio.Reload
-    end
-    return behavior,customShoot,customReload
-end
-local function captureHostAudio(record)
-    local state,sound,kind=record.state,record.sound,record.kind
-    if state.customShoot or state.customReload and kind=="Reload" then return end
-    local id=assetId(sound.SoundId)
-    if not id or id==vanillaAssets[kind] or nativeAssets[kind][id]
-        or id==assetId(record.applied.SoundId) then return end
-    local settings={}
-    for _,key in ipairs(soundProperties) do
-        local value=sound[key]
-        if value==record.applied[key] and record.saved[key]~=nil then value=record.saved[key] end
-        settings[key]=value
-    end
-    -- ODH may retain a muted source and play a separate audible clone.
-    if kind=="Shot" and (tonumber(settings.Volume) or 0)<=0 then return end
-    for _,child in ipairs(sound:GetChildren()) do
-        if child:IsA("EqualizerSoundEffect") then
-            settings.equalizer={Enabled=child.Enabled,LowGain=child.LowGain,MidGain=child.MidGain,
-                HighGain=child.HighGain,Priority=child.Priority}
-            break
-        end
-    end
-    local previous=hostAudio[kind]
-    local changed=not previous
-    if previous then
-        for _,key in ipairs(soundProperties) do if previous[key]~=settings[key] then changed=true;break end end
-        for _,key in ipairs({"Enabled","LowGain","MidGain","HighGain","Priority"}) do
-            if (previous.equalizer and previous.equalizer[key])~=(settings.equalizer and settings.equalizer[key]) then
-                changed=true;break
-            end
-        end
-    end
-    if not changed then return end
-    hostAudio[kind]=settings
-    local key=kind=="Shot" and "shoot" or "reload"
-    for _,candidate in pairs(states) do
-        if not candidate.customShoot and not (kind=="Reload" and candidate.customReload) then
-            candidate.behavior[key]=settings
-            if kind=="Reload" then candidate.suppressReload=true end
-            makeSound(candidate,kind,settings)
         end
     end
 end
@@ -11610,68 +11521,33 @@ local function restoreNativeAudio(record)
     record.saved={};record.applied={}
     record.writing=false
 end
-local function replacementReady(state,kind)
-    local sound=state.overlays[kind]
-    return sound and sound.Parent and sound.IsLoaded
-end
-local function applyNativeSettings(record,settings)
-    local sound=record.sound
-    record.writing=true
-    for _,key in ipairs(soundProperties) do
-        local value=settings[key]
-        if value~=nil then
-            pcall(function()
-                if record.saved[key]==nil or record.applied[key]~=sound[key] then record.saved[key]=sound[key] end
-                value=originals.Decode(value)
-                sound[key]=value;record.applied[key]=value
-            end)
-        end
-    end
-    record.writing=false
-end
+local defaultAudio={
+    Shot={SoundId="rbxassetid://10209803",Volume=0.7,PlaybackSpeed=1},
+    Reload={SoundId="rbxassetid://4753414199",Volume=1,PlaybackSpeed=1},
+}
 local function routeNativeAudio(record)
     if record.writing then return end
     local sound,state=record.sound,record.state
-    captureHostAudio(record)
-    if record.external then
-        -- Centralized controllers can reuse a shared template for several players.
-        -- Intercept its local dispatch without changing the shared sound properties.
-        local id=assetId(sound.SoundId)
-        record.externalShot=not state.customShoot and id and id~=vanillaAssets.Shot
-            and not nativeAssets.Shot[id] and id or nil
-        return
-    end
-    if not replacementReady(state,record.kind) then
-        restoreNativeAudio(record)
-        if state.customShoot then
-            -- Keep MM2 audio audible while a custom asset loads or if Roblox rejects it.
-            applyNativeSettings(record,record.kind=="Shot" and vanillaShot or vanillaReload)
-        end
-        return
-    end
-    if record.kind=="Reload" and state.suppressReload then
+    local muted=state.audioEnabled and (record.kind=="Shot" or state.suppressReload)
+    if muted then
         record.writing=true
-        if record.saved.Volume==nil or record.applied.Volume~=sound.Volume then record.saved.Volume=sound.Volume end
+        if record.saved.Volume==nil then record.saved.Volume=sound.Volume end
         sound.Volume=0;record.applied.Volume=0
         record.writing=false
         return
     end
-    local settings=record.kind=="Shot" and state.behavior.shoot or state.behavior.reload
-    if not settings then return end
+    if state.audioEnabled then return end
     local id=assetId(sound.SoundId)
-    if record.kind=="Shot" then
-        local applied=assetId(record.applied.SoundId)
-        if not state.customShoot and id~=applied and id~=vanillaAssets.Shot and not nativeAssets.Shot[id] then
-            record.externalShot=id
-            restoreNativeAudio(record)
-            return
-        end
-        record.externalShot=nil
-    end
-    local native=state.customShoot or id and (id==vanillaAssets[record.kind] or id==assetId(record.applied.SoundId)
-        or nativeAssets[record.kind][id])
+    local native=id and (id==vanillaAssets[record.kind] or nativeAssets[record.kind][id]
+        or id==assetId(record.applied.SoundId))
+    -- An unrecognized sound ID belongs to ODH or another custom sound setting.
     if not native then restoreNativeAudio(record);return end
-    applyNativeSettings(record,settings)
+    record.writing=true
+    for key,value in pairs(defaultAudio[record.kind]) do
+        if record.saved[key]==nil then record.saved[key]=sound[key] end
+        sound[key]=value;record.applied[key]=value
+    end
+    record.writing=false
 end
 local function retireAudio(host,preserve)
     if not host then return end
@@ -11703,13 +11579,7 @@ local function clear(tool,preserveAudio)
     if not state then return end
     states[tool]=nil
     for _,connection in ipairs(state.connections) do connection:Disconnect() end
-    for sound,record in pairs(state.sounds) do
-        nativeSounds[sound]=nil
-        local watch=externalWatches[sound]
-        if watch and watch.record==record then watch.record=nil;watch.writing=true end
-        restoreNativeAudio(record)
-        if watch then watch.writing=false end
-    end
+    for sound,record in pairs(state.sounds) do nativeSounds[sound]=nil;restoreNativeAudio(record) end
     for remote in pairs(state.remotes) do shotRemotes[remote]=nil end
     for object,values in pairs(state.saved) do
         liveBeams[object]=nil
@@ -11719,18 +11589,14 @@ local function clear(tool,preserveAudio)
     retireAudio(state.audioHost,preserveAudio)
     if audioTransport and not next(states) then audioTransport.handler=nil end
 end
-makeSound=function(state,kind,settings)
-    if not settings then return end
-    local fresh=state.overlays[kind]==nil
-    local sound=state.overlays[kind] or Instance.new("Sound")
-    local previousId=sound.SoundId
+local function makeSound(state,kind,settings)
+    if not state.audioEnabled or not settings then return end
+    local sound=Instance.new("Sound")
     sound.Name="VisualsV2_"..kind.."Overlay"
     sound:SetAttribute("VisualsV2_GunCosmetic",true)
     for _,key in ipairs(soundProperties) do
         if settings[key]~=nil then pcall(function() sound[key]=originals.Decode(settings[key]) end) end
     end
-    local previousEqualizer=sound:FindFirstChildOfClass("EqualizerSoundEffect")
-    if previousEqualizer then previousEqualizer:Destroy() end
     if settings.equalizer then
         local eq=Instance.new("EqualizerSoundEffect")
         for key,value in pairs(settings.equalizer) do pcall(function() eq[key]=value end) end
@@ -11744,22 +11610,11 @@ makeSound=function(state,kind,settings)
     end
     sound.Parent=state.audioHost
     state.overlays[kind]=sound
-    if fresh and kind=="Shot" then
-        state.connections[#state.connections+1]=sound.Played:Connect(function()
-            state.overlayShotEvents=(state.overlayShotEvents or 0)+1
-        end)
-    end
-    if previousId==sound.SoundId and sound.IsLoaded then return end
     task.spawn(function()
         if states[state.tool]~=state or not sound.Parent then return end
-        if kind=="Shot" then state.shotLoadAttempts=(state.shotLoadAttempts or 0)+1 end
         local ok,reason=pcall(function() game:GetService("ContentProvider"):PreloadAsync({sound}) end)
         if states[state.tool]==state and (not ok or not sound.IsLoaded) then
             state.soundError=kind.." "..sound.SoundId..": "..tostring(ok and "Asset was not loaded" or reason)
-            if kind=="Shot" then state.shotLoadFailures=(state.shotLoadFailures or 0)+1 end
-        end
-        if states[state.tool]==state then
-            for _,record in pairs(state.sounds) do if record.kind==kind then routeNativeAudio(record) end end
         end
     end)
 end
@@ -11769,59 +11624,40 @@ local function audible(state,kind)
         and os.clock()-(state.shotAt or -math.huge)<6
 end
 local function confirmed(state,kind,source,authorized)
-    if states[state.tool]~=state or not authorized and not audible(state,kind) then return end
+    if states[state.tool]~=state or (not authorized and not audible(state,kind)) then return end
     local now=os.clock()
     if kind=="Shot" then
-        if now-(state.shotAt or -math.huge)>0.12 and now-(state.remoteAt or -math.huge)>0.12 then
+        if now-math.max(state.shotAt or -math.huge,state.remoteAt or -math.huge)>SHOT_GAP then
             state.shotCycle=(state.shotCycle or 0)+1
         end
         state.shotAt=now
     end
+    if not state.audioEnabled then return end
     local settings=kind=="Shot" and state.behavior.shoot or state.behavior.reload
-    if not settings or not replacementReady(state,kind) then return end
-    if kind=="Shot" and source and source.Volume<=0 then source=false end
-    if source==nil then
-        if state.evidence[kind] or now-(state.lastPlay[kind] or -math.huge)<0.12 then return end
-        local token={}
-        state.evidence[kind]=token
-        task.delay(0.08,function()
-            if states[state.tool]==state and state.evidence[kind]==token then
-                state.evidence[kind]=nil
-                confirmed(state,kind,false,true)
-            end
-        end)
-        return
-    end
-    state.evidence[kind]=nil
-    local pending=state.pending[kind]
-    if pending then if source then pending.sources[source]=true end;return end
-    if now-(state.lastPlay[kind] or -math.huge)<0.12 then return end
-    if kind=="Reload" then
-        local cycle=state.shotCycle or 0
-        if state.reloadCycle==cycle and now-(state.reloadDispatchedAt or -math.huge)<6 then return end
-        state.reloadCycle=cycle;state.reloadDispatchedAt=now
-    end
-    pending={sources={}}
-    if source then pending.sources[source]=true end
-    state.pending[kind]=pending
-    task.defer(function()
-        if states[state.tool]~=state or state.pending[kind]~=pending then return end
+    if not settings or now-(state.lastPlay[kind] or -math.huge)<SHOT_GAP then return end
+    if kind=="Reload" and state.reloadCycle==(state.shotCycle or 0)
+        and now-(state.reloadDispatchedAt or -math.huge)<6 then return end
+    if state.pending[kind] then return end
+    local token={}
+    state.pending[kind]=token
+    local function dispatch()
+        if states[state.tool]~=state or not state.audioEnabled or state.pending[kind]~=token then return end
         state.pending[kind]=nil
-        state.lastPlay[kind]=os.clock()
-        -- A source here is an ODH/custom sound that is already allowed to play.
-        -- Native sounds are intercepted and submit false, so they cannot consume
-        -- this dispatch and then be stopped by their Played listener.
-        if next(pending.sources) then return end
+        local at=os.clock()
+        if at-(state.lastPlay[kind] or -math.huge)<SHOT_GAP then return end
+        state.lastPlay[kind]=at
+        if kind=="Reload" then
+            state.reloadCycle=state.shotCycle or 0;state.reloadDispatchedAt=at
+        end
         local sound=state.overlays[kind]
         if sound and sound.Parent then
             local ok,err=pcall(function() sound.TimePosition=0;sound:Play() end)
-            if ok then state.plays[kind]=state.plays[kind]+1
-            else
-                state.soundError=tostring(err)
-                if kind=="Shot" then state.shotPlaybackErrors=(state.shotPlaybackErrors or 0)+1 end
-            end
+            if ok then state.plays[kind]=state.plays[kind]+1 else state.soundError=tostring(err) end
         end
-    end)
+    end
+    -- Native Play, the shot remote, animation and beam can describe one shot.
+    -- One dispatcher owns playback; muted native sources never play alongside it.
+    if source==nil then task.delay(0.04,dispatch) else task.defer(dispatch) end
 end
 local function configureObject(tool,state,object)
     if owned(object,tool) then return end
@@ -11834,20 +11670,15 @@ local function configureObject(tool,state,object)
             routeNativeAudio(record)
             state.connections[#state.connections+1]=object.Played:Connect(function()
                 if states[tool]~=state or not audible(state,kind) then return end
-                if not replacementReady(state,kind) then return end
-                local settings=kind=="Shot" and state.behavior.shoot or state.behavior.reload
-                local id=assetId(object.SoundId)
-                local nativeShot=kind=="Shot" and (state.customShoot or id and record.externalShot~=id
-                    and (id==vanillaAssets.Shot or nativeAssets.Shot[id] or settings and id==assetId(settings.SoundId)))
-                if kind=="Reload" and state.suppressReload or nativeShot then
+                if state.audioEnabled and (kind=="Shot" or state.suppressReload) then
                     pcall(function() object:Stop() end)
                     confirmed(state,kind,false)
-                else confirmed(state,kind,object) end
+                end
             end)
             state.connections[#state.connections+1]=object:GetPropertyChangedSignal("SoundId"):Connect(function()
                 if states[tool]==state then routeNativeAudio(record) end
             end)
-            if kind=="Reload" then
+            do
                 state.connections[#state.connections+1]=object:GetPropertyChangedSignal("Volume"):Connect(function()
                     if states[tool]==state then routeNativeAudio(record) end
                 end)
@@ -11858,137 +11689,6 @@ local function configureObject(tool,state,object)
     elseif object:IsA("Beam") and object.Name=="CustomBeam" and state.behavior.beam then
         for _,key in ipairs(beamProperties) do write(state,object,key,state.behavior.beam[key]) end
     end
-end
-local function externalShotState(sound,controller,localPlayback)
-    if typeof(sound)~="Instance" or not sound:IsA("Sound") or owned(sound,nil)
-        or sound.Name:sub(1,10)=="VisualsV2_" then return nil end
-    if not localPlayback and sound.Parent and not sound:IsDescendantOf(soundService)
-        and not sound:IsDescendantOf(workspace) then return nil end
-    local id=assetId(sound.SoundId)
-    if id==vanillaAssets.Reload or id and nativeAssets.Reload[id]
-        or hostAudio.Reload and id==assetId(hostAudio.Reload.SoundId) then return nil end
-    local name=sound.Name:lower():gsub("[^%w]","")
-    local known=id and (id==vanillaAssets.Shot or nativeAssets.Shot[id]
-        or hostAudio.Shot and id==assetId(hostAudio.Shot.SoundId))
-    if not known and not shotNames[name] then return nil end
-    local now=os.clock()
-    -- PlayLocalSound clones storage templates; their model coordinates are not
-    -- the position of the local playback emitter.
-    local part=not (localPlayback and not sound:IsDescendantOf(workspace)) and sound.Parent or nil
-    while part and not part:IsA("BasePart") and not part:IsA("Attachment") do part=part.Parent end
-    for tool,state in pairs(states) do
-        if tool.Parent==LocalPlayer.Character and not sound:IsDescendantOf(tool) then
-            local context=math.max(state.inputAt or -math.huge,state.remoteAt or -math.huge,
-                state.animationShotAt or -math.huge,state.tracerAt or -math.huge)
-            local recent=now-context<=0.45
-            local localPart=part and part:IsDescendantOf(LocalPlayer.Character)
-            if recent or localPart then
-                local matched=true
-                if part then
-                    local ok,position=pcall(function()
-                        return part:IsA("Attachment") and part.WorldPosition or part.Position
-                    end)
-                    if not ok or not position then matched=false
-                    elseif not localPart then
-                        local distance=(position-state.handle.Position).Magnitude
-                        if distance>6 then matched=false
-                        else
-                            -- A nearby opponent's spatial gunshot must retain its own sound.
-                            for _,owner in ipairs(Players:GetPlayers()) do
-                                if owner~=LocalPlayer and owner.Character then
-                                    if part:IsDescendantOf(owner.Character) then matched=false;break end
-                                    local peer=owner.Character:FindFirstChild("Gun")
-                                    local handle=peer and peer:IsA("Tool") and peer:FindFirstChild("Handle",true)
-                                    if handle and handle:IsA("BasePart")
-                                        and (position-handle.Position).Magnitude<=distance+1 then matched=false;break end
-                                end
-                            end
-                        end
-                    end
-                end
-                if matched then
-                    return state,recent and context==state.inputAt
-                end
-            end
-        end
-    end
-end
-local function releaseExternalShot(watch,record)
-    if watch.record~=record then return end
-    watch.writing=true
-    watch.record=nil
-    if nativeSounds[record.sound]==record then nativeSounds[record.sound]=nil end
-    if record.state.sounds[record.sound]==record then record.state.sounds[record.sound]=nil end
-    restoreNativeAudio(record)
-    watch.writing=false
-end
-observeExternalShot=function(sound,controller,playing,localPlayback)
-    local watch=externalWatches[sound]
-    if watch and watch.writing then return nil end
-    if watch and watch.record and watch.record.writing then return watch.record end
-    local state,activation=externalShotState(sound,controller,localPlayback)
-    if not state then
-        if watch and watch.record then releaseExternalShot(watch,watch.record) end
-        return nil
-    end
-    if not watch then watchExternalSound(sound);watch=externalWatches[sound] end
-    if not watch then return nil end
-    externalSources[sound]=true
-    local record=watch.record
-    if record and record.state~=state then releaseExternalShot(watch,record);record=nil end
-    if not record then
-        record={sound=sound,state=state,kind="Shot",saved={},applied={},nativeId=assetId(sound.SoundId),external=true}
-        watch.record=record;state.sounds[sound]=record;nativeSounds[sound]=record
-        state.externalShotSources=(state.externalShotSources or 0)+1
-        if activation then state.activationShotMatches=(state.activationShotMatches or 0)+1 end
-        state.lastExternalShot={name=sound.Name,asset=sound.SoundId,parent=sound.Parent and sound.Parent.Name,
-            caller=controller and controller.Name}
-    end
-    routeNativeAudio(record)
-    local token={};record.expiry=token
-    task.delay(0.5,function()
-        if record.expiry==token then releaseExternalShot(watch,record) end
-    end)
-    if playing then
-        state.externalShotEvents=(state.externalShotEvents or 0)+1
-        local settings=state.behavior.shoot
-        local id=assetId(sound.SoundId)
-        if replacementReady(state,"Shot") and settings and (state.customShoot
-            or record.externalShot~=id and id and (id==vanillaAssets.Shot or nativeAssets.Shot[id]
-                or id==assetId(settings.SoundId))) then
-            pcall(function() sound:Stop() end)
-            confirmed(state,"Shot",false)
-        else confirmed(state,"Shot",sound) end
-    end
-    return record
-end
-watchExternalSound=function(sound)
-    if not sound:IsA("Sound") or owned(sound,nil) or externalWatches[sound] then return end
-    local watch={connections={}}
-    externalWatches[sound]=watch
-    local function dispose()
-        if watch.record then releaseExternalShot(watch,watch.record) end
-        externalWatches[sound]=nil
-        externalSources[sound]=nil
-        for _,connection in ipairs(watch.connections) do connection:Disconnect() end
-        table.clear(watch.connections)
-    end
-    watch.connections[#watch.connections+1]=sound.Played:Connect(function()
-        if not alive or not runtimeAlive then return end
-        local record=nativeSounds[sound]
-        if record and not record.external then return end
-        observeExternalShot(sound,nil,true)
-    end)
-    watch.connections[#watch.connections+1]=sound:GetPropertyChangedSignal("SoundId"):Connect(function()
-        if not alive or not runtimeAlive then return end
-        local record=nativeSounds[sound]
-        if record and not record.external then return end
-        observeExternalShot(sound)
-    end)
-    watch.connections[#watch.connections+1]=sound:GetPropertyChangedSignal("Parent"):Connect(function()
-        if not sound.Parent then task.defer(function() if not sound.Parent then dispose() end end) end
-    end)
-    if sound.Destroying then watch.connections[#watch.connections+1]=sound.Destroying:Connect(dispose) end
 end
 local function installAudioTransport()
     local bridge=env.VisualsV2GunAudioBridge
@@ -12010,7 +11710,7 @@ local function installAudioTransport()
             end
             if state and state.tool.Parent==LocalPlayer.Character then
                 state.remoteShots=(state.remoteShots or 0)+1
-                if os.clock()-(state.remoteAt or -math.huge)>0.12 then state.shotCycle=(state.shotCycle or 0)+1 end
+                if os.clock()-(state.remoteAt or -math.huge)>SHOT_GAP then state.shotCycle=(state.shotCycle or 0)+1 end
                 state.remoteAt=os.clock()
                 confirmed(state,"Shot")
                 if shotVisual then shotVisual(state,object,first,...) end
@@ -12019,11 +11719,9 @@ local function installAudioTransport()
         end
         local sound=method=="PlayLocalSound" and object==soundService and first or method=="Play" and object
         local record=sound and nativeSounds[sound]
-        local controller
-        if sound and typeof(sound)=="Instance" and sound:IsA("Sound") and type(callingScript)=="function" then
+        if not record and sound and type(callingScript)=="function" then
             local ok,script=pcall(callingScript)
-            if ok then controller=script end
-            if not record and ok and script then
+            if ok and script then
                 local current=script
                 local state
                 while current do
@@ -12034,39 +11732,18 @@ local function installAudioTransport()
                 if state and typeof(sound)=="Instance" and sound.ClassName=="Sound" then
                     local name=sound.Name:lower():gsub("[^%w]","")
                     local kind=shotNames[name] and "Shot" or reloadNames[name] and "Reload"
-                    if kind then record={sound=sound,state=state,kind=kind,saved={},applied={}} end
+                    if kind then record={sound=sound,state=state,kind=kind} end
                 end
             end
         end
-        if sound and (not record or record.external) then
-            record=observeExternalShot(sound,controller,false,method=="PlayLocalSound" and object==soundService)
-        end
         if not record or not audible(record.state,record.kind) then return end
-        captureHostAudio(record)
         local state,kind=record.state,record.kind
-        local settings=kind=="Shot" and state.behavior.shoot or state.behavior.reload
         state.nativeCalls[kind]=state.nativeCalls[kind]+1
-        if record.external then state.externalShotCalls=(state.externalShotCalls or 0)+1 end
-        if not replacementReady(state,kind) then
-            if state.customShoot and not record.external then
-                applyNativeSettings(record,kind=="Shot" and vanillaShot or vanillaReload)
-            end
-            return
-        end
-        if kind=="Reload" then
-            if not state.suppressReload then return end
-            state.suppressedReloads=(state.suppressedReloads or 0)+1
-            confirmed(state,kind,false)
-            return "skip"
-        end
-        if not settings then return end
-        local id=assetId(sound.SoundId)
-        if state.customShoot or id and record.externalShot~=id
-            and (id==vanillaAssets.Shot or nativeAssets.Shot[id] or id==assetId(settings.SoundId)) then
-            confirmed(state,kind,false)
-            return "skip"
-        end
-        confirmed(state,kind,sound)
+        if not state.audioEnabled then return end
+        if kind=="Reload" and not state.suppressReload then return end
+        if kind=="Reload" then state.suppressedReloads=(state.suppressedReloads or 0)+1 end
+        confirmed(state,kind,false)
+        return "skip"
     end
     local functionHook=hookfunction or env.hookfunction
     local closure=newcclosure or env.newcclosure
@@ -12152,30 +11829,24 @@ local function bindAnimator(state)
             local native=animations and animations:FindFirstChild(pair[1])
             local expected=native and assetId(native.AnimationId)
                 or state.behavior.animations and assetId(state.behavior.animations[pair[1]])
-            if id and (id==expected or pair[2]=="Shot" and nativeShotAnimations[id]) then
-                if pair[2]=="Shot" then
-                    state.animationShotAt=os.clock()
-                    state.animationShots=(state.animationShots or 0)+1
-                end
-                confirmed(state,pair[2]);return
-            end
+            if id and id==expected then confirmed(state,pair[2]);return end
         end
     end)
     state.connections[#state.connections+1]=state.animationConnection
 end
 local function update()
     local enabled,id=skins.GetState("Gun")
-    local behavior,customShoot,customReload=behaviorFor(id)
+    local behavior=enabled and originals.GetGunBehavior(id)
     local current={}
     local backpack=LocalPlayer:FindFirstChildOfClass("Backpack")
     for _,container in pairs({LocalPlayer.Character,backpack}) do
         for _,tool in ipairs(container:GetChildren()) do
-            if enabled and tool:IsA("Tool") and skins.GetKind(tool)=="Gun" then current[tool]=true end
+            if tool:IsA("Tool") and skins.GetKind(tool)=="Gun" and behavior then current[tool]=true end
         end
     end
     for tool,state in pairs(states) do
-        if not current[tool] or state.id~=id or state.handle~=tool:FindFirstChild("Handle",true) then
-            clear(tool,enabled and state.id==id)
+        if not current[tool] or state.id~=id or state.handle~=tool:FindFirstChild("Handle",true) or state.audioEnabled~=weaponSoundsEnabled then
+            clear(tool,enabled and state.id==id and state.audioEnabled==weaponSoundsEnabled)
         end
     end
     for tool in pairs(current) do
@@ -12183,8 +11854,9 @@ local function update()
         if not state then
             local handle=tool:FindFirstChild("Handle",true)
             if handle and handle:IsA("BasePart") then
-                state={id=id,tool=tool,handle=handle,behavior=table.clone(behavior),customShoot=customShoot,customReload=customReload,
-                    suppressReload=behavior.reload~=nil,
+                local scope=id:lower():find("scope",1,true)~=nil
+                state={id=id,tool=tool,handle=handle,behavior=behavior,audioEnabled=weaponSoundsEnabled,
+                    suppressReload=weaponSoundsEnabled and (scope or behavior.reload~=nil),
                     saved={},created={},connections={},
                     sounds=setmetatable({}, {__mode="k"}),remotes={},overlays={},pending={},evidence={},lastPlay={},
                     plays={Shot=0,Reload=0},nativeCalls={Shot=0,Reload=0}}
@@ -12254,10 +11926,32 @@ local function matchShot(beam)
         end
     end
 end
+local function visualMuzzle(state)
+    local muzzle=skins.GetMuzzle and skins.GetMuzzle(state.tool)
+    if muzzle and muzzle:IsA("Attachment") then return muzzle end
+    return state.muzzle
+end
+local function reanchorShot(beam,state)
+    local muzzle=visualMuzzle(state)
+    if not muzzle or not beam.Attachment0 or not beam.Attachment1 then return end
+    local origin=state.fireOrigin and os.clock()-(state.fireAt or -math.huge)<0.4 and state.fireOrigin or muzzle.WorldPosition
+    local native=state.muzzle and state.muzzle.WorldPosition or state.handle.Position
+    local first=(beam.Attachment0.WorldPosition-native).Magnitude<=(beam.Attachment1.WorldPosition-native).Magnitude
+    local carrier=Instance.new("Part")
+    carrier.Name="VisualsV2_BarrelOrigin";carrier:SetAttribute("VisualsV2_GunCosmetic",true)
+    carrier.Size=Vector3.new(0.01,0.01,0.01);carrier.Transparency=1;carrier.Anchored=true
+    carrier.CanCollide=false;carrier.CanTouch=false;carrier.CanQuery=false;carrier.CastShadow=false
+    carrier.CFrame=CFrame.new(origin)
+    local attachment=Instance.new("Attachment");attachment.Parent=carrier
+    carrier.Parent=workspace
+    write(state,beam,first and "Attachment0" or "Attachment1",attachment)
+    game:GetService("Debris"):AddItem(carrier,0.5)
+end
 local function applyShot(beam)
     if not beam.Parent or liveBeams[beam] then return liveBeams[beam]~=nil end
     local state=matchShot(beam)
     if not state then return false end
+    reanchorShot(beam,state)
     for _,key in ipairs(beamProperties) do write(state,beam,key,state.behavior.beam[key]) end
     write(state,beam,"Enabled",true)
     write(state,beam,"FaceCamera",true)
@@ -12285,11 +11979,13 @@ shotVisual=function(state,remote,...)
     local target=shotTarget(remote,...)
     if not target then return end
     local stamp=os.clock()
-    local muzzle=state.muzzle
+    local muzzle=visualMuzzle(state)
     local origin=muzzle and muzzle.WorldPosition or state.handle.Position
+    state.fireOrigin=origin;state.fireAt=stamp
     if (target-origin).Magnitude<0.01 then return end
     task.delay(0.025,function()
-        if not alive or not runtimeAlive or states[state.tool]~=state or (state.tracerAt or -math.huge)>=stamp then return end
+        if not alive or not runtimeAlive or states[state.tool]~=state or state.fireAt~=stamp
+            or (state.tracerAt or -math.huge)>=stamp then return end
         local carrier=Instance.new("Part")
         carrier.Name="VisualsV2_ShotTrace"
         carrier:SetAttribute("VisualsV2_GunCosmetic",true)
@@ -12349,9 +12045,6 @@ local function bindAudioContainers()
         audioContainerConnections[#audioContainerConnections+1]=container.DescendantAdded:Connect(function(object)
             if object.Name=="Handle" or object:IsA("Animator") then scheduleAudio() end
         end)
-        if container==LocalPlayer.Character then
-            for _,object in ipairs(container:GetDescendants()) do watchExternalSound(object) end
-        end
     end
     scheduleAudio()
 end
@@ -12361,17 +12054,8 @@ connections[#connections+1]=LocalPlayer.ChildAdded:Connect(function(object)
     if object:IsA("Backpack") then bindAudioContainers() end
 end)
 bindAudioContainers()
-for sound in pairs(externalSources) do
-    if sound.Parent then watchExternalSound(sound) else externalSources[sound]=nil end
-end
-for _,object in ipairs(soundService:GetDescendants()) do watchExternalSound(object) end
-local camera=workspace.CurrentCamera
-if camera then for _,object in ipairs(camera:GetDescendants()) do watchExternalSound(object) end end
-connections[#connections+1]=soundService.DescendantAdded:Connect(watchExternalSound)
 connections[#connections+1]=workspace.DescendantAdded:Connect(function(object)
-    if not alive or not runtimeAlive then return end
-    if object:IsA("Sound") then watchExternalSound(object);return end
-    if not object:IsA("Beam") then return end
+    if not alive or not runtimeAlive or not object:IsA("Beam") then return end
     if object.Name=="VisualsV2_ShotBeam" then return end
     local active=false
     for tool,state in pairs(states) do
@@ -12413,7 +12097,14 @@ connections[#connections+1]=RunService.Heartbeat:Connect(function(dt)
     elapsed=elapsed+dt
     if elapsed>=0.75 then elapsed=0;update() end
 end)
-env.VisualsV2Runtime.GunCosmetics={Refresh=update,GetAudioSource=function(tool,kind)
+env.VisualsV2Runtime.GunCosmetics={Refresh=update,
+SetSoundsEnabled=function(value)
+    weaponSoundsEnabled=value==true
+    SetCfg("vv2WeaponSoundsEnabled",weaponSoundsEnabled)
+    update()
+end,
+GetSoundsEnabled=function() return weaponSoundsEnabled end,
+GetAudioSource=function(tool,kind)
     local state=states[tool]
     return state and state.overlays[kind]
 end,GetDiagnostics=function()
@@ -12423,17 +12114,9 @@ end,GetDiagnostics=function()
         return {asset=sound.SoundId,loaded=sound.IsLoaded,length=sound.TimeLength,playing=sound.IsPlaying,
             speed=sound.PlaybackSpeed,volume=sound.Volume}
     end
-    for tool,state in pairs(states) do result[#result+1]={tool=tool.Name,id=state.id,customShoot=state.customShoot,
-        customReload=state.customReload,hostShoot=not state.customShoot and state.behavior.shoot~=nil,
-        hostReload=not state.customShoot and not state.customReload and state.behavior.reload~=nil,
-        hostShootObserved=hostAudio.Shot and hostAudio.Shot.SoundId,hostReloadObserved=hostAudio.Reload and hostAudio.Reload.SoundId,
-        customBeam=state.behavior.beam~=nil,
+    for tool,state in pairs(states) do result[#result+1]={tool=tool.Name,id=state.id,customShoot=state.behavior.shoot~=nil,
+        customReload=state.behavior.reload~=nil,weaponSoundsEnabled=state.audioEnabled,customBeam=state.behavior.beam~=nil,
         inputs=state.inputs or 0,shotPlays=state.plays.Shot,reloadPlays=state.plays.Reload,tracers=state.tracers or 0,
-        externalShotSources=state.externalShotSources or 0,externalShotCalls=state.externalShotCalls or 0,
-        externalShotEvents=state.externalShotEvents or 0,activationShotMatches=state.activationShotMatches or 0,
-        animationShots=state.animationShots or 0,lastExternalShot=state.lastExternalShot,
-        overlayShotEvents=state.overlayShotEvents or 0,shotLoadAttempts=state.shotLoadAttempts or 0,
-        shotLoadFailures=state.shotLoadFailures or 0,shotPlaybackErrors=state.shotPlaybackErrors or 0,
         remoteShots=state.remoteShots or 0,nativeShotCalls=state.nativeCalls.Shot,nativeReloadCalls=state.nativeCalls.Reload,
         suppressedReloads=state.suppressedReloads or 0,suppressReload=state.suppressReload,
         directAudioMethods=audioTransport and audioTransport.methods,
@@ -12447,11 +12130,6 @@ env.VisualsV2Runtime.RegisterReset(function()
     if not runtimeAlive then
         alive=false
         if audioTransport then audioTransport.handler=nil end
-        for sound,watch in pairs(externalWatches) do
-            if watch.record then releaseExternalShot(watch,watch.record) end
-            for _,connection in ipairs(watch.connections) do connection:Disconnect() end
-            externalWatches[sound]=nil
-        end
         for _,connection in ipairs(connections) do connection:Disconnect() end
         for _,connection in ipairs(audioContainerConnections) do connection:Disconnect() end
     end
@@ -12476,7 +12154,7 @@ local stats={scans=0,toolWrites=0,imageWrites=0}
 local refresh,schedule
 
 local function imageKey(value)
-value=tostring(value or ""):lower()
+    value=tostring(value or ""):lower()
     return value:match("rbxassetid://(%d+)") or value:match("[?&]assetid=(%d+)")
         or value:match("[?&]id=(%d+)") or value:match("^%s*(%d+)%s*$") or value
 end
@@ -12744,6 +12422,10 @@ local pets=env.VisualsV2Runtime.ClientPets
 local storage=game:GetService("ReplicatedStorage")
 local mmv=game.GameId==10413186812 or game.PlaceId==93017634738276
 section:AddParagraph("Client-Sided Visuals","Weapons / Knife Effects / Pets\n\nMay be buggy.\n\nOnly enable the visuals you use to improve game performance.\n\nYou can find all visuals in your MM2 inventory.")
+local gunAudio=env.VisualsV2Runtime.GunCosmetics
+addToggle(section,"Use Weapon Shoot Sounds",gunAudio.GetSoundsEnabled(),function(value)
+    gunAudio.SetSoundsEnabled(value)
+end)
 local MARKER="VisualsV2_InventoryVisual"
 local alive=true
 local records={}
@@ -12752,7 +12434,10 @@ local guiConnections={}
 local nativeButtons={}
 local playerGui=nil
 local queued=false
-local refresh,schedule
+local refresh,schedule,visible
+local tradeRoots={}
+local sortRanks={}
+local sortReady=false
 local discoveryDirty=true
 local nativeData={}
 local infoCache={}
@@ -12760,8 +12445,8 @@ local ownedCache={}
 local inventoryModule=nil
 local profile=nil
 local controls={}
-local stats={filterRuns=0,builds=0,cardsCreated=0,cardsRemoved=0,uiPolls=0,discoveries=0,publishYields=0,
-    imagesLoaded=0,imageFailures=0,iconsAssigned=0,buildYields=0,publications=0,preloadTimeouts=0}
+local stats={filterRuns=0,builds=0,cardsCreated=0,cardsRemoved=0,uiPolls=0,discoveries=0,publishYields=0,imagesLoaded=0}
+local loadVisibleImages
 local definitions={
     Gun={label=mmv and "Matrixscope / Voidscope" or "Guns",key=mmv and "clientScopeEnabled" or "clientGunEnabled",entries=skins.Catalog.Gun},
     Knife={label="Knives",key="clientKnifeEnabled",entries=skins.Catalog.Knife},
@@ -12776,6 +12461,31 @@ local rarityColours={Unique=Color3.fromRGB(255,140,0),Ancient=Color3.fromRGB(105
 local function disconnect(items)
     for _,connection in ipairs(items) do pcall(function() connection:Disconnect() end) end
     table.clear(items)
+end
+
+local function excludedInventory(object)
+    local current=object
+    while current and current~=playerGui do
+        local name=current.Name:lower():gsub("[^%w]","")
+        if name:find("trade",1,true) or name:find("trading",1,true) or name=="shop"
+            or name=="spectate" or name=="inspectinventory" or name=="viewinventory" then return true end
+        current=current.Parent
+    end
+    return current~=playerGui
+end
+
+local function tradeRoot(object)
+    if not (object:IsA("GuiObject") or object:IsA("ScreenGui")) or object:IsA("GuiButton") then return false end
+    local name=object.Name:lower():gsub("[^%w]","")
+    return name=="trade" or name=="trading" or name=="tradegui" or name=="tradinggui"
+        or name=="tradeframe" or name=="tradewindow" or name=="tradescreen"
+end
+local function inTrade()
+    for object in pairs(tradeRoots) do
+        if not object.Parent then tradeRoots[object]=nil
+        elseif visible(object) then return true end
+    end
+    return false
 end
 
 local function own(object)
@@ -12800,36 +12510,22 @@ end
 local preloadQueue={}
 local imageQueued={}
 local imageLoaded={}
-local preloadHead,preloadTail=1,0
-local preloadWorkers=0
+local preloading=false
 local providerOk,contentProvider=pcall(function() return game:GetService("ContentProvider") end)
 local function preloadImage(value)
     if not providerOk or type(value)~="string" or value=="" or imageQueued[value] or imageLoaded[value] then return end
-    imageQueued[value]=true;preloadTail=preloadTail+1;preloadQueue[preloadTail]=value
-    if preloadWorkers>=3 then return end
-    preloadWorkers=preloadWorkers+1
+    imageQueued[value]=true;preloadQueue[#preloadQueue+1]=value
+    if preloading then return end
+    preloading=true
     task.defer(function()
-        while alive and runtimeAlive and preloadHead<=preloadTail do
+        while alive and runtimeAlive and #preloadQueue>0 do
             local batch={}
-            for _=1,math.min(48,preloadTail-preloadHead+1) do
-                batch[#batch+1]=preloadQueue[preloadHead]
-                preloadQueue[preloadHead]=nil;preloadHead=preloadHead+1
-            end
-            if preloadHead>preloadTail then preloadHead=1;preloadTail=0 end
-            local ok=pcall(function()
-                contentProvider:PreloadAsync(batch,function(asset,status)
-                    if status==Enum.AssetFetchStatus.Success and not imageLoaded[asset] then
-                        imageLoaded[asset]=true;stats.imagesLoaded=stats.imagesLoaded+1
-                    end
-                end)
-            end)
-            for _,asset in ipairs(batch) do
-                imageQueued[asset]=nil
-                if not ok or not imageLoaded[asset] then stats.imageFailures=stats.imageFailures+1 end
-            end
+            for _=1,math.min(32,#preloadQueue) do batch[#batch+1]=table.remove(preloadQueue,1) end
+            local ok=pcall(function() contentProvider:PreloadAsync(batch) end)
+            for _,asset in ipairs(batch) do imageQueued[asset]=nil;if ok then imageLoaded[asset]=true end end
             task.wait()
         end
-        preloadWorkers=preloadWorkers-1
+        preloading=false
     end)
 end
 
@@ -12879,7 +12575,7 @@ local function holiday(value)
 end
 
 local function inventoryClass(entry,data)
-    if entry.games then return "Current" end
+    if entry.id=="Matrixscope" or entry.id=="Voidscope" then return "Halloween" end
     local event=holiday(data.Event)
     if event then return event end
     if data.Season~=nil and data.Season~=false then
@@ -12920,7 +12616,7 @@ local function info(kind,entry)
     if entry.games then
         data.ItemName=entry.id;data.FX=true;data.ScopeStyle=true
     end
-    if entry.games then data.Season=1;data.Event=nil end
+    if entry.id=="Matrixscope" or entry.id=="Voidscope" then data.Season=nil;data.Event="Halloween";data.Year="2025" end
     data.InventoryClass=(kind=="Effects" or kind=="Pets") and "Current" or inventoryClass(entry,data)
     infoCache[key]=data
     return data
@@ -12962,7 +12658,7 @@ local function itemsFor(main,kind)
     return child(category,"Items") or child(category,"ItemList") or category
 end
 
-local function fill(frame,data)
+local function fill(frame,data,lazyImage)
     local title=child(frame,"ItemName")
     local label=child(title,"Label")
     local coloured=child(title,"ColoredName")
@@ -12979,9 +12675,8 @@ local function fill(frame,data)
         if coloured then coloured.Visible=false end
     end
     if icon then
-        icon.Image=image(data.Image)
-        preloadImage(icon.Image)
-        stats.iconsAssigned=stats.iconsAssigned+1
+        icon.Image=lazyImage and "" or image(data.Image)
+        if not lazyImage then preloadImage(icon.Image) end
     end
     if amount then amount.Text="" end
     local tags=child(frame,"Tags")
@@ -13047,6 +12742,115 @@ local function targetFor(main,kind,data)
     end
 end
 
+local rarityOrder={Unique=1,Ancient=2,Secret=2,Classic=3,Godly=4,Legendary=5,Rare=6,Uncommon=7,Common=8}
+local iconEntries={}
+local function imageKey(value)
+    value=tostring(value or ""):lower()
+    return value:match("rbxassetid://(%d+)") or value:match("[?&]assetid=(%d+)")
+        or value:match("[?&]id=(%d+)") or value:match("^(%d+)$") or value
+end
+local function prepareSort()
+    if sortReady then return end
+    sortReady=true
+    local entries={}
+    for kind,definition in pairs(definitions) do
+        definition.sorted={}
+        for _,entry in pairs(definition.entries) do
+            local data=info(kind,entry)
+            local item={entry=entry,kind=kind,data=data}
+            entries[#entries+1]=item
+            local key=imageKey(image(data.Image))
+            local candidates=iconEntries[key] or {};iconEntries[key]=candidates;candidates[#candidates+1]=item
+        end
+    end
+    table.sort(entries,function(a,b)
+        local ar,br=rarityOrder[a.data.Rarity] or 9,rarityOrder[b.data.Rarity] or 9
+        if ar~=br then return ar<br end
+        if (a.data.Chroma==true)~=(b.data.Chroma==true) then return a.data.Chroma==true end
+        local an,bn=a.data.ItemName:lower(),b.data.ItemName:lower()
+        if an~=bn then return an<bn end
+        if a.entry.id~=b.entry.id then return a.entry.id<b.entry.id end
+        return a.kind<b.kind
+    end)
+    for rank,item in ipairs(entries) do
+        sortRanks[item.kind..":"..item.entry.id]=rank
+        local sorted=definitions[item.kind].sorted;sorted[#sorted+1]=item.entry
+    end
+end
+local function restoreNativeOrders(record)
+    for frame,saved in pairs(record.nativeOrders) do
+        if frame.Parent and frame.LayoutOrder==saved.applied then frame.LayoutOrder=saved.value end
+    end
+    table.clear(record.nativeOrders)
+    for layout,value in pairs(record.layouts) do
+        if layout.Parent and layout.SortOrder==Enum.SortOrder.LayoutOrder then layout.SortOrder=value end
+    end
+    table.clear(record.layouts)
+end
+local function sortNativeCards(record)
+    prepareSort()
+    local function arrange(frame,kind,id)
+        if typeof(frame)~="Instance" or not frame:IsA("GuiObject") or own(frame)
+            or not frame:IsDescendantOf(record.main) or excludedInventory(frame) then return end
+        local rank=sortRanks[kind..":"..tostring(id)]
+        if not rank then return end
+        local saved=record.nativeOrders[frame]
+        if not saved then saved={value=frame.LayoutOrder};record.nativeOrders[frame]=saved
+        elseif frame.LayoutOrder~=saved.applied then saved.value=frame.LayoutOrder end
+        saved.applied=rank;frame.LayoutOrder=rank
+    end
+    local inventory=inventoryModule and inventoryModule.MyInventory and inventoryModule.MyInventory.Data
+    if type(inventory)=="table" then
+        for _,group in ipairs({"Weapons","Effects","Pets"}) do
+            for _,tab in pairs(inventory[group] or {}) do
+                if type(tab)=="table" then
+                    for key,entry in pairs(tab) do
+                        if type(entry)=="table" and entry.Frame then
+                            local id=entry.ItemID or entry.ID or entry.Id or entry.ItemId or key
+                            local kind=(group=="Effects" or group=="Pets") and group or entry.ItemType
+                            if definitions[kind] then arrange(entry.Frame,kind,id) end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local seen={}
+    for _,kind in ipairs({"Gun","Knife","Effects","Pets"}) do
+        for _,entry in ipairs(definitions[kind].sorted or {}) do
+            local target=targetFor(record.main,kind,info(kind,entry))
+            if target and not seen[target] then
+                seen[target]=true
+                local layout=target:FindFirstChildOfClass("UIGridLayout") or target:FindFirstChildOfClass("UIListLayout")
+                if layout then
+                    if record.layouts[layout]==nil then record.layouts[layout]=layout.SortOrder end
+                    layout.SortOrder=Enum.SortOrder.LayoutOrder
+                end
+                for _,frame in ipairs(target:GetChildren()) do
+                    if frame:IsA("GuiObject") and not own(frame) then
+                        local id=frame:GetAttribute("ItemID") or frame:GetAttribute("WeaponID") or frame.Name
+                        local group=(kind=="Effects" or kind=="Pets") and {kind} or {"Gun","Knife"}
+                        local matched=false
+                        for _,candidate in ipairs(group) do
+                            if definitions[candidate].entries[id] then arrange(frame,candidate,id);matched=true;break end
+                        end
+                        if not matched then
+                            local icon=child(child(frame,"Container"),"Icon")
+                            local label=child(child(frame,"ItemName"),"Label")
+                            local choices=icon and iconEntries[imageKey(icon.Image)] or {}
+                            for _,item in ipairs(choices) do
+                                if table.find(group,item.kind) and (not label or label.Text==item.data.ItemName) then
+                                    arrange(frame,item.kind,item.entry.id);break
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
 local function removePreview(record,kind)
     local preview=record.previews[kind]
     if not preview then return end
@@ -13054,6 +12858,27 @@ local function removePreview(record,kind)
     disconnect(preview.connections)
     pcall(function() preview.frame:Destroy() end)
     if preview.original.Parent and preview.original.Visible==false then preview.original.Visible=preview.visible end
+end
+
+local function watchImages(record,target)
+    local viewport=target
+    while viewport and viewport~=record.main and not viewport:IsA("ScrollingFrame") do viewport=viewport.Parent end
+    if not viewport or not viewport:IsA("ScrollingFrame") then return nil end
+    if not record.imageWatches[viewport] then
+        record.imageWatches[viewport]=true
+        local function changed()
+            if record.imageQueued then return end
+            record.imageQueued=true
+            task.delay(0.04,function()
+                record.imageQueued=false
+                if alive and runtimeAlive and records[record.main]==record and loadVisibleImages then loadVisibleImages(record) end
+            end)
+        end
+        for _,property in ipairs({"CanvasPosition","AbsoluteSize"}) do
+            record.imageConnections[#record.imageConnections+1]=viewport:GetPropertyChangedSignal(property):Connect(changed)
+        end
+    end
+    return viewport
 end
 
 local function watchCanvas(record,target)
@@ -13078,14 +12903,9 @@ local function watchCanvas(record,target)
             canvas.writing=false
         end
     end
-    local function scheduleResize()
-        if canvas.queued then return end
-        canvas.queued=true
-        task.defer(function() canvas.queued=false;resize() end)
-    end
-    canvas.connections[1]=layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(scheduleResize)
+    canvas.connections[1]=layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(resize)
     canvas.connections[2]=target:GetPropertyChangedSignal("CanvasSize"):Connect(function()
-        if not canvas.writing and target.CanvasSize~=canvas.applied then canvas.native=target.CanvasSize;scheduleResize() end
+        if not canvas.writing and target.CanvasSize~=canvas.applied then canvas.native=target.CanvasSize;resize() end
     end)
     task.defer(resize)
     return canvas
@@ -13110,18 +12930,10 @@ local function removeCard(record,key)
     releaseCanvas(record,card.canvas)
 end
 
-local function revealTargets(record)
-    for target,hidden in pairs(record.hiddenTargets) do
-        hidden.connection:Disconnect()
-        if target.Parent and not target.Visible then target.Visible=hidden.visible end
-        record.hiddenTargets[target]=nil
-    end
-end
-
 local function release(record)
     record.generation=record.generation+1
     record.building=false
-    revealTargets(record)
+    restoreNativeOrders(record)
     for kind in pairs(record.previews) do removePreview(record,kind) end
     for key in pairs(record.cards) do removeCard(record,key) end
 end
@@ -13184,7 +12996,7 @@ local function updatePreview(record,kind)
     frame.Parent=original.Parent
 end
 
-local function visible(object)
+visible=function(object)
     if not object or not object.Parent then return false end
     local current=object
     while current and current~=playerGui do
@@ -13199,6 +13011,27 @@ local function categoryOpen(record,kind)
     return visible(categoryFor(record.main,kind))
 end
 
+loadVisibleImages=function(record)
+    if not record.open then return end
+    for _,card in pairs(record.cards) do
+        if not card.imageLoaded and card.frame.Parent==card.target and card.frame.Visible and categoryOpen(record,card.kind) then
+            local viewport=card.viewport
+            local within=true
+            if viewport then
+                local p,size=card.frame.AbsolutePosition,card.frame.AbsoluteSize
+                local origin,bounds=viewport.AbsolutePosition,viewport.AbsoluteSize
+                local margin=math.max(size.Y,64)
+                within=size.Y>0 and p.Y+size.Y>=origin.Y-margin and p.Y<=origin.Y+bounds.Y+margin
+                    and p.X+size.X>=origin.X-margin and p.X<=origin.X+bounds.X+margin
+            end
+            if within and card.icon then
+                card.icon.Image=image(card.data.Image)
+                card.imageLoaded=true;stats.imagesLoaded=stats.imagesLoaded+1
+            end
+        end
+    end
+end
+
 local function updatePreviews(record)
     for kind in pairs(definitions) do
         if categoryOpen(record,kind) then updatePreview(record,kind) else removePreview(record,kind) end
@@ -13210,7 +13043,7 @@ local function cacheFilters(record)
     record.filterConnections={}
     record.filterRefs={}
     local function changed()
-        record.filterDirty=true
+        record.filterDirty=true;record.dirty=true
         if schedule then schedule() end
     end
     for _,name in ipairs({"Weapons","Effects","Pets"}) do
@@ -13231,7 +13064,7 @@ local function cacheFilters(record)
         end
         if category then
             record.filterConnections[#record.filterConnections+1]=category:GetPropertyChangedSignal("Visible"):Connect(function()
-                record.filterDirty=true
+                record.dirty=true
                 if schedule then schedule() end
             end)
         end
@@ -13274,6 +13107,7 @@ local function filterCards(record)
     for _,card in pairs(record.cards) do applyCardFilter(record,card) end
     record.filterDirty=false
     updatePreviews(record)
+    loadVisibleImages(record)
 end
 
 local function addCard(record,kind,entry)
@@ -13292,39 +13126,24 @@ local function addCard(record,kind,entry)
     frame.Name="VisualsV2_"..kind.."_"..entry.id
     frame:SetAttribute("WeaponID",entry.id)
     frame:SetAttribute("VisualKind",kind)
-    fill(frame,data)
-    local rarityOrder={Unique=1,Ancient=2,Secret=2,Classic=3,Godly=4,Legendary=5,Rare=6,Uncommon=7,Common=8}
-    frame.LayoutOrder=entry.games and (entry.id=="Matrixscope" and -2000000 or -1999999)
-        or (rarityOrder[data.Rarity] or 9)*100000+(entry.order or 0)
+    fill(frame,data,true)
+    frame.LayoutOrder=sortRanks[kind..":"..entry.id] or 100000
     local button=child(child(frame,"Container"),"ActionButton")
     if not button or not button:IsA("GuiButton") then frame:Destroy();record.waiting[kind]="Item button unavailable";return end
-    local card={kind=kind,id=entry.id,frame=frame,data=data,target=target,connections={},canvas=watchCanvas(record,target)}
+    local card={kind=kind,id=entry.id,frame=frame,data=data,target=target,connections={},canvas=watchCanvas(record,target),
+        viewport=watchImages(record,target),icon=child(child(frame,"Container"),"Icon")}
     record.cards[key]=card
     stats.cardsCreated=stats.cardsCreated+1
     card.connections[1]=button.Activated:Connect(function()
-        if not alive or not runtimeAlive or not enabled(kind) then return end
+        if not alive or not runtimeAlive or not enabled(kind) or inTrade() or excludedInventory(frame) then return end
         if selectItem(kind,entry.id) then
             for _,other in pairs(records) do updatePreviews(other) end
             pcall(shared.Notify,data.ItemName.." selected",2)
         end
     end)
-    card.connections[2]=frame.AncestryChanged:Connect(function()
-        if not frame.Parent and record.cards[key]==card then
-            record.dirty=true
-            if schedule then schedule() end
-        end
-    end)
-    card.connections[3]=frame:GetPropertyChangedSignal("Visible"):Connect(function()
-        if not card.settingVisible and alive and runtimeAlive then applyCardFilter(record,card) end
-    end)
     applyCardFilter(record,card)
     frame.Parent=record.staging
-end
 
-local function imageKey(value)
-    value=tostring(value or ""):lower()
-    return value:match("rbxassetid://(%d+)") or value:match("[?&]assetid=(%d+)")
-        or value:match("[?&]id=(%d+)") or value:match("^(%d+)$") or value
 end
 
 local function observeNativeButtons(record)
@@ -13343,7 +13162,11 @@ local function observeNativeButtons(record)
     if type(data)=="table" then
         for _,group in ipairs({"Weapons","Effects","Pets"}) do
             for _,tab in pairs(data[group] or {}) do
-                for _,entry in pairs(tab) do bind(entry.Frame,(group=="Effects" or group=="Pets") and group or entry.ItemType) end
+                if type(tab)=="table" then
+                    for _,entry in pairs(tab) do
+                        if type(entry)=="table" and entry.Frame then bind(entry.Frame,(group=="Effects" or group=="Pets") and group or entry.ItemType) end
+                    end
+                end
             end
         end
     end
@@ -13386,123 +13209,70 @@ local function nativeOwns(kind,id)
     return cached[id]==true
 end
 
-local function hideTarget(record,target)
-    if not target:IsA("GuiObject") or record.hiddenTargets[target] then return end
-    local hidden={visible=target.Visible,writing=false}
-    record.hiddenTargets[target]=hidden
-    hidden.connection=target:GetPropertyChangedSignal("Visible"):Connect(function()
-        if hidden.writing then return end
-        hidden.visible=target.Visible
-        if target.Visible then
-            hidden.writing=true;target.Visible=false;hidden.writing=false
-        end
-    end)
-    hidden.writing=true;target.Visible=false;hidden.writing=false
+local function suspendRecord(record)
+    if record.trading then return end
+    record.trading=true;record.generation=record.generation+1
+    record.building=false;record.dirty=true
+    for kind in pairs(record.previews) do removePreview(record,kind) end
+    restoreNativeOrders(record)
+    for _,card in pairs(record.cards) do
+        if card.frame.Parent==card.target then card.frame.Parent=record.staging end
+    end
 end
-
 local function updateRecord(record)
+    if inTrade() or excludedInventory(record.main) then suspendRecord(record);return end
+    if record.trading then record.trading=false;record.dirty=true;record.filterDirty=true end
     local isOpen=visible(record.main)
     if record.open~=isOpen then record.filterDirty=true end
     record.open=isOpen
-    if record.dirty and not record.building then
+    if record.dirty then
         table.clear(ownedCache)
         for key,card in pairs(record.cards) do
             if not enabled(card.kind) or not card.frame.Parent or not card.target.Parent
-                or not card.target:IsDescendantOf(record.main)
-                or card.target~=targetFor(record.main,card.kind,card.data)
                 or nativeOwns(card.kind,card.id) then removeCard(record,key) end
         end
-        if record.refsDirty then record.refsDirty=false;cacheFilters(record) end
         observeNativeButtons(record)
     end
-    if record.filterDirty then filterCards(record)
-    elseif isOpen then updatePreviews(record) end
-    if not isOpen then for kind in pairs(record.previews) do removePreview(record,kind) end end
+    if record.filterDirty then filterCards(record) end
+    if isOpen then loadVisibleImages(record)
+    else for kind in pairs(record.previews) do removePreview(record,kind) end end
     if record.building or not record.dirty then return end
+    prepareSort()
     record.dirty=false;record.building=true;record.waiting={}
     stats.builds=stats.builds+1
     local generation=record.generation
     task.spawn(function()
-        local function current()
-            return alive and runtimeAlive and generation==record.generation and record.main.Parent
+        local count=0
+        local started=os.clock()
+        for _,kind in ipairs({"Gun","Knife","Effects","Pets"}) do
+            local definition=definitions[kind]
+            if enabled(kind) then
+                -- Build while the inventory is closed as well. Stage every category
+                -- off-screen and publish in one sorted update, including owned items.
+                for _,entry in ipairs(definition.sorted) do
+                    if not alive or not runtimeAlive or generation~=record.generation or not record.main.Parent then return end
+                    if inTrade() then suspendRecord(record);return end
+                    if not enabled(kind) then break end
+                    if not nativeOwns(kind,entry.id) and not record.cards[kind..":"..entry.id] then
+                        addCard(record,kind,entry);count=count+1
+                    end
+                    if count>=48 or os.clock()-started>=0.003 then
+                        count=0;task.wait();started=os.clock()
+                    end
+                end
+            end
         end
-        local ok,reason=pcall(function()
-            local started=os.clock()
-            local pendingImages={}
-            for _,kind in ipairs({"Gun","Knife","Effects","Pets"}) do
-                local definition=definitions[kind]
-                if enabled(kind) then
-                    if not definition.sorted then
-                        definition.sorted={}
-                        for _,entry in pairs(definition.entries) do definition.sorted[#definition.sorted+1]=entry end
-                        table.sort(definition.sorted,function(a,b)
-                            return info(kind,a).ItemName:lower()<info(kind,b).ItemName:lower()
-                        end)
-                    end
-                    for index,entry in ipairs(definition.sorted) do
-                        if not current() then return end
-                        if not enabled(kind) then break end
-                        entry.order=index
-                        -- Warm other tabs and filtered items during the same preparation pass.
-                        local asset=image(info(kind,entry).Image)
-                        preloadImage(asset)
-                        if asset~="" and imageQueued[asset] then pendingImages[asset]=true end
-                        if not nativeOwns(kind,entry.id) and not record.cards[kind..":"..entry.id] then addCard(record,kind,entry) end
-                        if os.clock()-started>=0.004 then
-                            stats.buildYields=stats.buildYields+1;task.wait();started=os.clock()
-                        end
-                    end
-                end
-            end
-            if not current() then return end
-            -- Keep native cards usable during a short, bounded icon warmup. Failed or slow
-            -- network requests must never prevent the completed inventory from appearing.
-            local deadline=os.clock()+0.75
-            while current() and next(pendingImages) do
-                for asset in pairs(pendingImages) do
-                    if imageLoaded[asset] or not imageQueued[asset] then pendingImages[asset]=nil end
-                end
-                if not next(pendingImages) then break end
-                if os.clock()>=deadline then stats.preloadTimeouts=stats.preloadTimeouts+1;break end
-                task.wait()
-            end
-            if not current() then return end
-            readFilters(record)
-            -- Keep the live inventory intact while cloning; reveal the completed lists together.
-            for _,card in pairs(record.cards) do
-                if card.frame.Parent==record.staging and enabled(card.kind) and card.target.Parent then
-                    hideTarget(record,card.target)
-                end
-            end
-            local publishStarted=os.clock()
-            for key,card in pairs(record.cards) do
-                if not current() then return end
-                if not enabled(card.kind) or not card.target.Parent or not card.target:IsDescendantOf(record.main)
-                    or nativeOwns(card.kind,card.id) then removeCard(record,key)
-                elseif card.frame.Parent==record.staging then
-                    applyCardFilter(record,card)
-                    card.frame.Parent=card.target
-                end
-                if os.clock()-publishStarted>=0.004 then
-                    stats.publishYields=stats.publishYields+1;task.wait();publishStarted=os.clock()
-                end
-            end
-            if current() then
-                filterCards(record)
-                stats.publications=stats.publications+1
-                -- Let the layout settle while targets are hidden, including closed inventories.
-                task.wait()
-            end
-        end)
-        if generation~=record.generation then return end
-        revealTargets(record)
+        if generation~=record.generation or not alive or not runtimeAlive then return end
+        if inTrade() then suspendRecord(record);return end
+        filterCards(record)
+        sortNativeCards(record)
+        -- No yield while publishing: the first rendered list has its final order.
+        for key,card in pairs(record.cards) do
+            if not enabled(card.kind) or not card.target.Parent or nativeOwns(card.kind,card.id) then removeCard(record,key)
+            elseif card.frame.Parent==record.staging then card.frame.Parent=card.target end
+        end
         record.building=false
-        if not ok then
-            record.waiting.Build=tostring(reason)
-            for key,card in pairs(record.cards) do
-                if card.frame.Parent==record.staging then removeCard(record,key) end
-            end
-        end
+        loadVisibleImages(record)
         if record.dirty and schedule then schedule() end
     end)
 end
@@ -13512,33 +13282,53 @@ local function forgetRecord(record)
     if record.staging then record.staging:Destroy() end
     disconnect(record.filterConnections or {})
     disconnect(record.visibilityConnections or {})
+    disconnect(record.contentConnections or {})
+    disconnect(record.imageConnections or {})
     for kind,template in pairs(record.templates) do template:Destroy();record.templates[kind]=nil end
 end
 
 local function discover()
     if not playerGui then return end
     stats.discoveries=stats.discoveries+1
-    for _,object in ipairs(playerGui:GetDescendants()) do
-        if (object.Name=="Inventory" or object.Name=="Inventory2") and not own(object) then
-            local main=child(object,"Main")
-            if main and child(main,"Weapons") and not records[main] then
-                local record={main=main,cards={},previews={},canvases={},templates={},waiting={},generation=0,
-                    building=false,dirty=true,open=false,filterDirty=true,visibilityConnections={},hiddenTargets={}}
-                record.staging=Instance.new("Folder")
-                record.staging.Name="VisualsV2_InventoryBuild"
-                records[main]=record
-                local ancestor=main
-                while ancestor and ancestor~=playerGui do
-                    local property=ancestor:IsA("GuiObject") and "Visible" or ancestor:IsA("ScreenGui") and "Enabled"
-                    if property then
-                        record.visibilityConnections[#record.visibilityConnections+1]=ancestor:GetPropertyChangedSignal(property):Connect(function()
-                            if schedule then schedule() end
-                        end)
+    local pending={playerGui}
+    while #pending>0 do
+        local object=table.remove(pending)
+        if tradeRoot(object) then tradeRoots[object]=true end
+        if not own(object) and not excludedInventory(object) then
+            if object.Name=="Inventory" or object.Name=="Inventory2" then
+                local main=child(object,"Main")
+                if main and child(main,"Weapons") and not records[main] then
+                    local record={main=main,cards={},previews={},canvases={},templates={},waiting={},generation=0,
+                        building=false,dirty=true,open=false,filterDirty=true,visibilityConnections={},imageWatches={},imageConnections={},
+                        nativeOrders=setmetatable({}, {__mode="k"}),layouts=setmetatable({}, {__mode="k"}),contentConnections={}}
+                    record.staging=Instance.new("Folder");record.staging.Name="VisualsV2_InventoryBuild"
+                    records[main]=record
+                    record.contentConnections[1]=main.DescendantRemoving:Connect(function(removed)
+                        if removed:GetAttribute(MARKER) and removed:GetAttribute("WeaponID") then
+                            local key=tostring(removed:GetAttribute("VisualKind"))..":"..tostring(removed:GetAttribute("WeaponID"))
+                            local card=record.cards[key]
+                            if card and card.frame==removed and not record.trading and not record.building then
+                                task.defer(function()
+                                    if records[main]==record and card.frame.Parent~=record.staging
+                                        and card.frame.Parent~=card.target then record.dirty=true;schedule() end
+                                end)
+                            end
+                        end
+                    end)
+                    local ancestor=main
+                    while ancestor and ancestor~=playerGui do
+                        local property=ancestor:IsA("GuiObject") and "Visible" or ancestor:IsA("ScreenGui") and "Enabled"
+                        if property then
+                            record.visibilityConnections[#record.visibilityConnections+1]=ancestor:GetPropertyChangedSignal(property):Connect(function()
+                                if schedule then schedule() end
+                            end)
+                        end
+                        ancestor=ancestor.Parent
                     end
-                    ancestor=ancestor.Parent
+                    cacheFilters(record)
                 end
-                cacheFilters(record)
             end
+            for _,child in ipairs(object:GetChildren()) do pending[#pending+1]=child end
         end
     end
 end
@@ -13546,7 +13336,6 @@ end
 refresh=function()
     if not alive or not runtimeAlive then return end
     local active=enabled("Gun") or enabled("Knife") or enabled("Effects") or enabled("Pets")
-    if not active then discoveryDirty=true end
     if active and discoveryDirty then discoveryDirty=false;discover() end
     for main,record in pairs(records) do
         if not playerGui or not main:IsDescendantOf(playerGui) or not active then
@@ -13563,28 +13352,41 @@ end
 
 local function bindGui()
     discoveryDirty=true
+    table.clear(tradeRoots)
     disconnect(guiConnections)
     playerGui=LocalPlayer:FindFirstChildOfClass("PlayerGui")
     if playerGui then
-        local function nativeChanged(object)
-            if own(object) then return end
-            if object.Name=="Inventory" or object.Name=="Inventory2" or object.Name=="Main"
-                or object.Name=="Weapons" or object.Name=="Effects" or object.Name=="Pets" or object.Name=="Items"
-                or object.Name=="ItemList" or object.Name=="WeaponEffects" or object.Name=="ActionButton"
-                or object.Name=="Current" or object.Name=="Classic" or object.Name=="Holiday"
-                or object.Name=="Christmas" or object.Name=="Halloween" or object.Name=="Season1" or object.Name=="Season 1" then
-                if not next(records) or object.Name=="Inventory" or object.Name=="Inventory2" or object.Name=="Main" then discoveryDirty=true end
-                for _,record in pairs(records) do
-                    if object:IsDescendantOf(record.main) or record.main:IsDescendantOf(object) then
-                        record.dirty=true
-                        if object.Name~="ActionButton" then record.refsDirty=true end
-                    end
-                end
+        local function watchTrade(object)
+            if not tradeRoot(object) or tradeRoots[object] then return end
+            tradeRoots[object]=true
+            local property=object:IsA("ScreenGui") and "Enabled" or "Visible"
+            guiConnections[#guiConnections+1]=object:GetPropertyChangedSignal(property):Connect(function()
+                if visible(object) then for _,record in pairs(records) do suspendRecord(record) end end
+                schedule()
+            end)
+        end
+        for _,object in ipairs(playerGui:GetDescendants()) do watchTrade(object) end
+        guiConnections[#guiConnections+1]=playerGui.DescendantAdded:Connect(function(object)
+            watchTrade(object)
+            if tradeRoot(object) and visible(object) then
+                for _,record in pairs(records) do suspendRecord(record) end
                 schedule()
             end
-        end
-        guiConnections[#guiConnections+1]=playerGui.DescendantAdded:Connect(nativeChanged)
-        guiConnections[#guiConnections+1]=playerGui.DescendantRemoving:Connect(nativeChanged)
+            if own(object) then
+                if object:GetAttribute(MARKER) and excludedInventory(object) then
+                    task.defer(function() if object.Parent and excludedInventory(object) then object:Destroy() end end)
+                end
+                return
+            end
+            if excludedInventory(object) then return end
+            if object.Name=="Inventory" or object.Name=="Inventory2" or object.Name=="Main"
+                or object.Name=="Weapons" or object.Name=="Effects" or object.Name=="Pets" or object.Name=="Items"
+                or object.Name=="ItemList" or object.Name=="WeaponEffects" or object.Name=="ActionButton" then
+                if not next(records) or object.Name=="Inventory" or object.Name=="Inventory2" or object.Name=="Main" then discoveryDirty=true end
+                for _,record in pairs(records) do record.dirty=true end
+                schedule()
+            end
+        end)
     end
     schedule()
 end
@@ -13617,7 +13419,9 @@ connections[#connections+1]=RunService.Heartbeat:Connect(function(dt)
     elapsed=0
     stats.uiPolls=stats.uiPolls+1
     for main,record in pairs(records) do
-        if playerGui and main:IsDescendantOf(playerGui) then updateRecord(record) else schedule() end
+        if playerGui and main:IsDescendantOf(playerGui) then
+            if record.dirty or record.filterDirty or record.trading or record.open~=visible(main) or inTrade() then updateRecord(record) end
+        else schedule() end
     end
     for button,list in pairs(nativeButtons) do
         if not playerGui or not button:IsDescendantOf(playerGui) then disconnect(list);nativeButtons[button]=nil end
@@ -13630,7 +13434,7 @@ env.VisualsV2Runtime.VisualWeaponInventory={
             local count=0
             for _ in pairs(record.cards) do count=count+1 end
             report.inventories[#report.inventories+1]={name=record.main.Parent and record.main.Parent.Name,
-                open=record.open,cards=count,building=record.building,waiting=table.clone(record.waiting)}
+                open=record.open,cards=count,building=record.building,trading=record.trading==true,waiting=table.clone(record.waiting)}
         end
         return report
     end,
@@ -13764,8 +13568,8 @@ local function collect()
         pets=runtime.ClientPets and runtime.ClientPets.GetDiagnostics(),
         gunCosmetics=runtime.GunCosmetics and runtime.GunCosmetics.GetDiagnostics(),
         presentation=runtime.WeaponPresentation and runtime.WeaponPresentation.GetDiagnostics(),
-        animations=runtime.FEAnimations and runtime.FEAnimations.GetDiagnostics(),
         inventoryTools=runtime.InventoryTools and runtime.InventoryTools.GetDiagnostics(),
+        jumpGun=runtime.JumpGunFollowup and runtime.JumpGunFollowup.GetDiagnostics(),
         tools={},character={},originalDefinitions={},availableTemplates={},storageRoots={}}
     pcall(function() report.executor=identifyexecutor() end)
     local selected={}
@@ -15110,8 +14914,45 @@ local fonts={
     ["Highway"]=Enum.Font.Highway,
     ["Code"]=Enum.Font.Code,
     ["Legacy"]=Enum.Font.Legacy,
+    ["Starborn"]=true,
 }
-local fontNames={"SourceSansBold (Original)","Gotham","Arcade","Arial","ArialBold","Cartoon","Fantasy","Highway","Code","Legacy"}
+local fontNames={"SourceSansBold (Original)","Gotham","Arcade","Arial","ArialBold","Cartoon","Fantasy","Highway","Code","Legacy","Starborn"}
+-- Starborn by Darrell Flood / Hawtpixel, original TTF, personal-use edition.
+-- Source and licensing: https://www.dafont.com/starborn.font
+local starbornFace=nil
+local starbornAttempted=false
+local function loadStarborn()
+    if starbornAttempted then return starbornFace end
+    starbornAttempted=true
+    local asset=getcustomasset or getsynasset or env.getcustomasset or env.getsynasset
+    if type(asset)~="function" or type(write)~="function" then
+        pcall(shared.Notify,"Starborn needs custom-font support in your executor",4)
+        return nil
+    end
+    local ok,result=pcall(function()
+        local encoded="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A4IF/QbtAA0AGwAAATMWHQEUAwYHJjU0EzQlMxYdARQDBgcmNTQTNAGzF9LGQ3jpmARKF9LGQ3jpmAbtK5s6yP67TREvuy0BSOIqK5s6yP67TREvuy0BSOIAAAAAAwAyAIUHAQJbABMAJwA7AAABFxYVFA8BBiMiLwEmNTQ/ATYzMgUXFhUUDwEGIyIvASY1ND8BNjMyBRcWFRQPAQYjIi8BJjU0PwE2MzIBfx9qHRJbXzIzHmodElxeMgKvHmodEltfMjMeah4RXF8xAq8eax4RXF8xMx9pHRJbXzECPhJbXzIzHmodEltfMjIfah0SW18yMx5qHRJbXzIyH2odEltfMjMeah0SW18xMx9qAAAAAQAy/8YGzgZWACgAAAEzMhcVBisBIicEFRYVFAciFRY7ATI3MjcyFxQFByADNCcmNTQ3EiU2BHuA21Q5mSMdb/7FmK+AWb86rb0dQLsj/ee7/e/ldF71kAFO3wZW0l66Iz5aWJGXRxeAowz18ZAMAd5rIVtsn1UBWLVeAAEAMgINApwEVAAOAAABMhMUBwYrASIvATU2NzQBef4luhQnLuJZDD7DBFT+xqVcDK9GXdYUCwAAAAABAAAlvgABBkgYAAAKDbAABAAL/5gABAAO/5gABAAP/3gABAAQ/5gABAAT/5gABAAX/3gABAAZ/5gABAAe/3gABAAf/5gABAAj/5gABAAk/5gABAAl/3gABAAm/5gABAAn/3gABAAq/5gABAAr/5gABAAy/5gABAA0/5gABAA4/5gABABB/5gABABC/3gABABF/5gABABH/5gABABI/5gABABJ/5gABABP/5gABABQ/5gABQAE/3IABQAO/3IABQAPAJYABQAQ/7EABQARAJYABQAS/rUABQAW/7EABQAX/1IABQAe/3IABQAk/rUABQAl/5EABQAr/5EABQAt/pUABQAw/1IABQA9/7EABQBCAJYABQBH/5EABQBI/7EABQBOAJYABQBP/3IABgAE/5gABgAM/3kABgAP/1kABgAR/5gABgAS/5gABgAW/5gABgAX/5gABgAa/5gABgAe/5gABgAi/zoABgAk/3kABgAl/5gABgAt/5gABgAw/5gABgA9/5gABgBA/3kABgBC/3kABgBO/5gABwAH/3oABwAV/5kABwAi/5kABwA2/3oABwBB/3oABwBD/5kABwBL/5kABwBN/5kACAAM/68ACAAO/1AACAAP/68ACAAQ/48ACAAe/68ACAAl/68ACAAr/68ACABH/48ACABI/68ACABJ/68ACABP/1AACABQ/68ACQAF/vwACQAH/zsACQAK/vwACQAN/vwACQAO/zsACQAQ/vwACQAT/5oACQAU/xwACQAV/5oACQAX/5oACQAa/vwACQAc/t0ACQAf/t0ACQAg/5oACQAh/1sACQAi/vwACQAj/3oACQAm/5oACQAq/3oACQAr/5oACQAy/5oACQAz/vwACQA0/5oACQA1/vwACQA2/zsACQA3/vwACQA5/vwACQA6/vwACQA8/vwACQA//vwACQBB/l8ACQBD/3oACQBF/5oACQBH/zsACQBI/3oACQBJ/3oACQBK/vwACQBL/t0ACQBM/vwACQBN/t0ACQBP/xwACQBQ/xwACgAE/3sACgAPAJYACgARAJYACgAS/t0ACgAX/3sACgAe/5oACgAk/t0ACgAl/5oACgAr/5oACgAt/p4ACgAw/3sACgBCAJYACgBOAJYACgBP/5oACwAE/6YACwAG/6YACwAH/2cACwAL/4cACwAO/wkACwAQ/wkACwAR/6YACwAT/0gACwAV/4cACwAX/ygACwAZ/4cACwAc/2cACwAf/wkACwAg/6YACwAj/ygACwAm/0gACwAp/6YACwAq/ygACwAr/0gACwAt/6YACwAy/0gACwA0/0gACwA2/2cACwA4/6YACwBB/ygACwBD/2cACwBF/0gACwBH/wkACwBI/wkACwBJ/ygACwBL/6YACwBN/6YACwBP/wkACwBQ/wkADAAE/7IADAAM/5MADAAP/1QADAAR/7IADAAS/7IADAAW/7IADAAe/7IADAAi/7IADAAk/3MADAAl/7IADAAw/7IADABA/7IADABC/1QADABO/7IADQAE/4UADQAM/6UADQAP/wcADQAR/koADQAS/ycADQAe/0YADQAk/wcADQAl/6UADQAt/ycADQAw/2YADQBC/BMADQBO/sgADgAE/3wADgAF/10ADgAI/10ADgAM/z0ADgAP/10ADgAR/t8ADgAS/5wADgAU/v4ADgAV/3wADgAW/t8ADgAa/oAADgAe/5wADgAi/r8ADgAk/10ADgAl/5wADgAt/5wADgAz/t8ADgA1/v4ADgA3/t8ADgA5/10ADgA6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/34ARAAf/50ARAAj/50ARAAk/34ARAAl/34ARAAm/50ARAAn/50ARAAo/34ARAAq/50ARAAr/50ARAAt/14ARAAw/34ARAAy/50ARAA0/50ARAA9/50ARABB/50ARABC/34ARABF/50ARABH/50ARABI/50ARABJ/50ARABO/14ARABP/50ARABQ/50ARQAM/6YARQAP/4cARQAU/6YARQAa/wkARQAe/6YARQAi/soARQAk/6YARQAl/6YARQAz/2cARQA1/4cARQA3/4cARQA5/4cARQA6/6YARQA7/4cARQA8/2cARQA//4cARQBA/6YARQBC/4cARwAE/4wARwAM/w4ARwAP/y0ARwAR/s8ARwAS/2wARwAW/y0ARwAa/s8ARwAe/6sARwAi/s8ARwAk/y0ARwAl/6sARwAt/2wARwAw/6sARwAz/6sARwA3/6sARwA8/6sARwA9/2wARwA//6sARwBA/q8ARwBC+/oARwBO/y0ASAAa/5oASAAe/5oASAAi/xwASQAO/tMASQAQ/tMASQAT/68ASQAX/5AASQAf/vIASQAj/5AASQAm/68ASQAq/5AASQAr/68ASQAy/68ASQA0/68ASQBB/5AASQBF/68ASQBH/tMASQBI/3AASQBJ/5AASQBP/zEASQBQ/tMASgAE/0IASgAG/6EASgAH/6EASgAL/4EASgAO/uQASgAPAJYASgAQ/yMASgARAJYASgAS/icASgAT/0IASgAW/6EASgAX/sQASgAZ/0IASgAc/6EASgAd/2IASgAe/uQASgAf/0IASgAj/2IASgAk/icASgAl/0IASgAm/2IASgAn/2IASgAo/0IASgAp/4EASgAq/0IASgAr/0IASgAt/mYASgAw/uQASgAx/6EASgAy/0IASgA0/0IASgA2/6EASgA9/6EASgBB/4EASgBCAJYASgBF/0IASgBH/wMASgBI/yMASgBJ/0IASgBL/6EASgBN/6EASgBOAJYASgBP/uQASgBQ/0IASwAE/2IASwAO/uQASwAPAJYASwAQ/yMASwARAJYASwAS/icASwAT/2IASwAX/sQASwAZ/2IASwAd/2IASwAe/uQASwAf/0IASwAj/4EASwAk/icASwAl/2IASwAm/4EASwAn/6EASwAo/2IASwAq/0IASwAr/2IASwAt/oUASwAw/wMASwAy/2IASwA0/2IASwBB/6EASwBCAJYASwBF/2IASwBH/wMASwBI/yMASwBJ/0IASwBOAJYASwBP/uQASwBQ/0IATAAE/1MATAAG/5IATAAH/5IATAAI/7IATAAL/3MATAAO/tUATAAPAJYATAAQ/xQATAARAJYATAAS/hgATAAT/1MATAAV/7IATAAW/7IATAAX/rYATAAZ/zQATAAc/5IATAAd/3MATAAe/vUATAAf/1MATAAj/3MATAAk/hgATAAl/1MATAAm/1MATAAn/1MATAAo/zQATAAp/5IATAAq/1MATAAr/zQATAAs/7IATAAt/lcATAAw/tUATAAx/5IATAAy/1MATAA0/1MATAA2/5IATAA4/7IATAA9/5IATABB/3MATABCAJYATABD/7IATABF/1MATABH/vUATABI/zQATABJ/zQATABL/7IATABN/7IATABOAJYATABP/tUATABQ/zQATQAE/3MATQAL/7IATQAO/tUATQAPAJYATQAQ/xQATQARAJYATQAS/hgATQAT/1MATQAX/rYATQAZ/1MATQAc/7IATQAd/3MATQAe/vUATQAf/1MATQAj/5IATQAk/jgATQAl/3MATQAm/3MATQAn/5IATQAo/1MATQAp/7IATQAq/1MATQAr/3MATQAt/pYATQAw/xQATQAx/7IATQAy/1MATQA0/1MATQA9/7IATQBB/5IATQBCAJYATQBF/1MATQBH/vUATQBI/zQATQBJ/zQATQBOAJYATQBP/tUATQBQ/zQATgAFAJYATgAH/ywATgAKAJYATgAN/hAATgAO/4oATgAQ/ywATgAU/ywATgAV/4oATgAa/o4ATgAc/0sATgAf/wwATgAh/6oATgAi/u0ATgAz/s0ATgA1/wwATgA2/ywATgA3/q4ATgA5/jAATgA6/ywATgA8/s0ATgA//q4ATgBBAJYATgBD/4oATgBH/4oATgBJ/2sATgBKAJYATgBLAJYATgBMAJYATgBNAJYATgBP/4oATgBQ/2sATwAF/34ATwAH/z8ATwAK/34ATwAN/34ATwAO/34ATwAQ/wAATwAU/34ATwAV/54ATwAa/34ATwAc/z8ATwAf/wAATwAh/54ATwAi/34ATwAz/34ATwA1/34ATwA2/18ATwA3/34ATwA5/34ATwA6/34ATwA8/34ATwA//34ATwBB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"
+        local alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        local values={}
+        for i=1,#alphabet do values[alphabet:sub(i,i)]=i-1 end
+        local bytes={}
+        for i=1,#encoded,4 do
+            local a,b,c,d=encoded:sub(i,i),encoded:sub(i+1,i+1),encoded:sub(i+2,i+2),encoded:sub(i+3,i+3)
+            local n=values[a]*262144+values[b]*4096+(values[c] or 0)*64+(values[d] or 0)
+            bytes[#bytes+1]=string.char(math.floor(n/65536)%256)
+            if c~="=" then bytes[#bytes+1]=string.char(math.floor(n/256)%256) end
+            if d~="=" then bytes[#bytes+1]=string.char(n%256) end
+        end
+        write("VisualsV2_Starborn.ttf",table.concat(bytes))
+        local fontAsset=asset("VisualsV2_Starborn.ttf")
+        write("VisualsV2_Starborn.json",HttpService:JSONEncode({name="Starborn",faces={
+            {name="Regular",weight=400,style="normal",assetId=fontAsset}}}))
+        return Font.new(asset("VisualsV2_Starborn.json"),Enum.FontWeight.Regular,Enum.FontStyle.Normal)
+    end)
+    if ok then starbornFace=result
+    else pcall(shared.Notify,"Starborn could not load on this executor; keeping the original font",4) end
+    return starbornFace
+end
+
 local selectedFont=C("vv2TextFont","SourceSansBold (Original)")
 if not fonts[selectedFont] then selectedFont="SourceSansBold (Original)" end
 local fontsEnabled=C("vv2TextFontsEnabled",false)
@@ -15132,7 +14973,7 @@ local function disconnectAll(connections)
 end
 
 local function readFont(object)
-    local result={font=object.Font}
+    local result={font=object.Font,size=object.TextSize}
     pcall(function() result.face=object.FontFace end)
     return result
 end
@@ -15151,6 +14992,15 @@ local function restoreFont(object,record)
     if record.font.face then restored=pcall(function() object.FontFace=record.font.face end) end
     if not restored then pcall(function() object.Font=record.font.font end) end
     record.writing=record.writing-1
+    if record.appliedSize and object.TextSize==record.appliedSize then
+        writeProperty(object,record,"TextSize",record.font.size)
+    end
+    if record.sizeConstraint then
+        if record.ownsConstraint then record.sizeConstraint:Destroy()
+        elseif record.constraintMax then record.sizeConstraint.MaxTextSize=record.constraintMax end
+        record.sizeConstraint=nil;record.ownsConstraint=nil;record.constraintMax=nil
+    end
+    record.appliedSize=nil
     record.font=nil
     record.appliedFont=nil
 end
@@ -15210,7 +15060,31 @@ local function applyFont(object,record)
     local original=record.font or readFont(object)
     if fontsEnabled and not isIconFont(object,original) then
         if not record.font then record.font=original end
-        writeProperty(object,record,"Font",fonts[selectedFont])
+        if selectedFont=="Starborn" then
+            local face=loadStarborn()
+            if not face then restoreFont(object,record);return end
+            writeProperty(object,record,"FontFace",face)
+            local size=math.clamp(math.floor((record.font.size or 14)*0.85+0.5),9,48)
+            writeProperty(object,record,"TextSize",size)
+            record.appliedSize=size
+            if object.TextScaled then
+                local constraint=record.sizeConstraint or object:FindFirstChildOfClass("UITextSizeConstraint")
+                if not constraint then
+                    constraint=Instance.new("UITextSizeConstraint")
+                    constraint.Name="VisualsV2_FontSize";constraint.MinTextSize=8
+                    constraint.Parent=object;record.ownsConstraint=true
+                elseif not record.sizeConstraint then record.constraintMax=constraint.MaxTextSize end
+                record.sizeConstraint=constraint
+                local maximum=math.clamp(math.floor(math.max(size,object.AbsoluteSize.Y*0.65)),11,36)
+                constraint.MaxTextSize=math.max(constraint.MinTextSize,math.min(record.constraintMax or maximum,maximum))
+            end
+        else
+            if record.appliedSize or record.sizeConstraint then
+                local native=record.font
+                restoreFont(object,record);record.font=native
+            end
+            writeProperty(object,record,"Font",fonts[selectedFont])
+        end
         record.appliedFont=readFont(object)
     else
         restoreFont(object,record)
@@ -15270,11 +15144,18 @@ local function process(object)
                 if not fontsEnabled then return end
                 local current=readFont(object)
                 if record.appliedFont and current.font==record.appliedFont.font and current.face==record.appliedFont.face then return end
+                if record.font and record.appliedSize and current.size==record.appliedSize then current.size=record.font.size end
                 record.font=current
                 applyFont(object,record)
             end
             connectProperty(object,record,"Font",fontChanged)
             connectProperty(object,record,"FontFace",fontChanged)
+            connectProperty(object,record,"TextSize",function()
+                if record.font and object.TextSize~=record.appliedSize then
+                    record.font.size=object.TextSize
+                    if selectedFont=="Starborn" then applyFont(object,record) end
+                end
+            end)
         end
         if nameLabel then
             connectProperty(object,record,"Text",function()
@@ -15386,6 +15267,46 @@ end)
 refresh()
 end)()
 
+
+;(function()
+local pending={}
+local runtime=env.VisualsV2Runtime
+local stats={equips=0,shots=0}
+runtime.JumpGunFollowup={Queue=function(key,character,options,delayTime)
+    local token={};pending[key]=token
+    task.delay(delayTime or 0.06,function()
+        local function current()
+            return runtimeAlive and pending[key]==token and LocalPlayer.Character==character
+        end
+        if not current() then return end
+        local equip,shoot=options()
+        if not equip and not shoot then return end
+        local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+        local backpack=LocalPlayer:FindFirstChildOfClass("Backpack")
+        if not humanoid or humanoid.Health<=0 then return end
+        local gun
+        for _,container in pairs({character,backpack}) do
+            for _,tool in ipairs(container:GetChildren()) do
+                if tool:IsA("Tool") and runtime.ClientWeaponSkins.GetKind(tool)=="Gun" then gun=tool;break end
+            end
+            if gun then break end
+        end
+        if not gun then stats.error="No gun in your character or backpack";return end
+        local ok=pcall(function() humanoid:EquipTool(gun) end)
+        if not ok then stats.error="The gun could not be equipped";return end
+        stats.equips=stats.equips+1
+        if not shoot then stats.error=nil;return end
+        task.delay(0.08,function()
+            if not current() or humanoid.Health<=0 or gun.Parent~=character then return end
+            local _,stillShoot=options()
+            if not stillShoot then return end
+            local fired,reason=runtime.ODHShootMurderer()
+            if fired then stats.shots=stats.shots+1;stats.error=nil else stats.error=reason end
+        end)
+    end)
+end,GetDiagnostics=function() return table.clone(stats) end}
+runtime.RegisterReset(function() table.clear(pending) end)
+end)()
 
 ;(function()
 local section=mainTab:AddSection("Customization","Visuals")
@@ -15522,6 +15443,7 @@ task.spawn(function()
 end)
 env.VisualsV2Runtime.RegisterReset(function() toggle:Set(false); enabled=false; alive=false end)
 end)()
+
 ;(function()
 local section=mainTab:AddSection("Coin Aura","Utilities")
 local enabled=C("coinAuraEnabled",false)
@@ -15760,110 +15682,62 @@ local __TS   = getfserv("TweenService")
 
 local POSITIONS_KEY="vv2BombJumpButtonPositions"
 local LEGACY_POSITION_FILE="VisualsV2_BombJump_positions.json"
-local BUTTON_IDS={"VV2_BombJump_Big","VV2_BombJump_Bind","VV2_GoldBombJump_Big","VV2_GoldBombJump_Bind"}
-local positionsForConfig
-local function finiteNumber(value,default)
-    local number=tonumber(value)
-    if number and number==number and math.abs(number)<math.huge then return number end
-    return default
-end
-local function copyPositions(data)
-    local positions={}
-    if type(data)~="table" then return positions end
-    for _,id in ipairs(BUTTON_IDS) do
-        local position=data[id]
-        if type(position)=="table" then
-            local xs,ys=finiteNumber(position.xs,nil),finiteNumber(position.ys,nil)
-            if xs and ys then
-                positions[id]={xs=xs,xo=finiteNumber(position.xo,0),ys=ys,yo=finiteNumber(position.yo,0)}
-            end
-        end
-    end
-    return positions
-end
 local function savePositions(data)
-    positionsForConfig=copyPositions(data)
-    SetCfg(POSITIONS_KEY,positionsForConfig)
+    SetCfg(POSITIONS_KEY,table.clone(data))
 end
 local function loadPositions()
     local saved=C(POSITIONS_KEY,nil)
-    if type(saved)=="table" then
-        local positions=copyPositions(saved)
-        savePositions(positions)
-        return positions
-    end
+    if type(saved)=="table" then return table.clone(saved) end
+
     local ok,result=pcall(function()
         if type(read)=="function" and (type(exists)~="function" or exists(LEGACY_POSITION_FILE)) then
             return HttpService:JSONDecode(read(LEGACY_POSITION_FILE))
         end
     end)
-    local positions=copyPositions(ok and result or nil)
+    local positions={}
+    if ok and type(result)=="table" then
+        for _,id in ipairs({"VV2_BombJump_Big","VV2_BombJump_Bind","VV2_GoldBombJump_Big","VV2_GoldBombJump_Bind"}) do
+            if type(result[id])=="table" then positions[id]=result[id] end
+        end
+    end
     savePositions(positions)
     return positions
 end
-local savedPositions=loadPositions()
-local function rememberButtonPosition(gui,flush)
-    if not positionsForConfig then savePositions(savedPositions) end
-    local position={xs=gui.Position.X.Scale,xo=gui.Position.X.Offset,ys=gui.Position.Y.Scale,yo=gui.Position.Y.Offset}
-    savedPositions[gui.Name]=position
-    -- Runtime cleanup saves this table even if re-execution interrupts a drag.
-    -- File writes remain limited to releasing the button.
-    if positionsForConfig then positionsForConfig[gui.Name]=table.clone(position) end
-    if flush then savePositions(savedPositions) end
-end
+
+local savedPositions = loadPositions()
 
 local BBSystem = {Buttons = {}, Connections = {}, Maids = {}}
 local BindableButtons
-local buttonStorage={}
-local function GetSafeGuiRoot()
-    if type(gethui)=="function" then
-        local ok,parent=pcall(gethui)
-        if ok and typeof(parent)=="Instance" then return parent end
-    end
-    local playerGui=LocalPlayer:FindFirstChild("PlayerGui")
-    if playerGui then return playerGui end
-    return Services.CoreGui
+
+local function bb_safecallback(callback)
+    if not callback then return end
+    local ok, err = xpcall(callback, function(e) return debug.traceback(e) end)
+    if not ok then warn("[BB ERROR] " .. tostring(err)) end
 end
-local function GetButtonStorage(name)
-    local sg=buttonStorage[name]
-    if sg and sg.Parent then return sg end
-    local parent=GetSafeGuiRoot()
-    local stale=parent:FindFirstChild(name)
-    if stale then stale:Destroy() end
-    sg=Instance.new("ScreenGui")
-    sg.Name=name
-    sg.ResetOnSpawn=false
-    sg.IgnoreGuiInset=true
-    pcall(function() sg.ScreenInsets=Enum.ScreenInsets.None end)
-    sg.Parent=parent
-    buttonStorage[name]=sg
-    RootMaid:GiveTask(sg)
-    return sg
-end
-local function ButtonScreenSize(gui)
-    local parent=gui and gui.Parent
-    local screen=parent and parent.AbsoluteSize
-    if screen and screen.X>0 and screen.Y>0 then return screen end
-    local camera=Services.Workspace.CurrentCamera
-    screen=camera and camera.ViewportSize
-    if screen and screen.X>0 and screen.Y>0 then return screen end
-    return __V2(1920,1080)
-end
-local function ClampButtonPosition(gui,position)
-    local screen=ButtonScreenSize(gui)
-    local width=math.min(screen.X,math.max(0,gui.Size.X.Scale*screen.X+gui.Size.X.Offset))
-    local height=math.min(screen.Y,math.max(0,gui.Size.Y.Scale*screen.Y+gui.Size.Y.Offset))
-    local x=math.clamp(position.X.Scale*screen.X+position.X.Offset,width/2,screen.X-width/2)
-    local y=math.clamp(position.Y.Scale*screen.Y+position.Y.Offset,height/2,screen.Y-height/2)
-    return __UD2(position.X.Scale,x-position.X.Scale*screen.X,position.Y.Scale,y-position.Y.Scale*screen.Y)
-end
-local function RestoreButtonPosition(gui,default)
-    local sp=savedPositions[gui.Name]
-    local position=sp and __UD2(sp.xs,sp.xo,sp.ys,sp.yo) or default
-    gui.Position=ClampButtonPosition(gui,position)
-end
+
 local function BB_GetStorage()
-    return GetButtonStorage("VV2_BombJump_BigStorage")
+    local parent = gethui and gethui()
+    if not parent or typeof(parent) ~= "Instance" then
+        parent = getfserv("CoreGui")
+    end
+    if not parent or typeof(parent) ~= "Instance" then
+        parent = __PLRS.LocalPlayer:WaitForChild("PlayerGui", 5)
+    end
+    if typeof(parent) ~= "Instance" then
+        parent = __PLRS.LocalPlayer:WaitForChild("PlayerGui")
+    end
+
+    local sg = parent:FindFirstChild("VV2_BombJump_BigStorage")
+    if not sg then
+        sg = Instance.new("ScreenGui")
+        sg.Name = "VV2_BombJump_BigStorage"
+        sg.ResetOnSpawn = false
+        sg.IgnoreGuiInset = true
+        pcall(function() sg.ScreenInsets = Enum.ScreenInsets.None end)
+        sg.Parent = parent
+        RootMaid:GiveTask(sg)
+    end
+    return sg
 end
 
 local __BB_GRAD_SEQ = ColorSequence.new({
@@ -15872,83 +15746,84 @@ local __BB_GRAD_SEQ = ColorSequence.new({
     ColorSequenceKeypoint.new(1,    __PCLR(0.470588,  0.156863,  0.470588))
 })
 
-local function MakeButtonDraggable(gui,maid,clickFunc,ripple,sound,isBind)
-    local pressInput,dragStart,startPos,hasMoved
-    local normalSize,normalTextSize
-    local tInfo=TweenInfo.new(0.2,Enum.EasingStyle.Quad,Enum.EasingDirection.Out)
-    local function locked()
-        if isBind then return lockBindButtonPos end
-        return lockBigButtonPos
-    end
-    local function finish(cancelled)
-        if not pressInput then return end
-        pressInput=nil
-        if not isBind then
-            __TS:Create(gui,tInfo,{Size=normalSize,TextSize=normalTextSize}):Play()
-        end
-        if hasMoved then
-            rememberButtonPosition(gui,true)
-        elseif not cancelled and alive and runtimeAlive and clickFunc then
-            local ok,err=xpcall(clickFunc,function(e) return debug.traceback(e) end)
-            if not ok then warn("[Bomb Jump Button] "..tostring(err)) end
-        end
-    end
+local function BB_MakeDraggable(gui, maid, func, ripple, sound)
+    local dragging, dragInput, dragStart, startPos
+    local hasMoved = false
+    local tInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local normalSize,normalTxtSize,bigSize,bigTxtSize
+
     maid:GiveTask(gui.InputBegan:Connect(function(input)
-        if pressInput or not alive or not runtimeAlive then return end
-        if input.UserInputType~=Enum.UserInputType.MouseButton1 and input.UserInputType~=Enum.UserInputType.Touch then return end
-        pressInput,dragStart,startPos,hasMoved=input,input.Position,gui.Position,false
-        if not isBind then
-            normalSize,normalTextSize=gui.Size,gui.TextSize
-            __TS:Create(gui,tInfo,{
-                Size=__UD2(normalSize.X.Scale*1.1,normalSize.X.Offset*1.1,normalSize.Y.Scale*1.1,normalSize.Y.Offset*1.1),
-                TextSize=normalTextSize*1.1
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if not alive or not runtimeAlive then return end
+            normalSize,normalTxtSize=gui.Size,gui.TextSize
+            bigSize=__UD2(normalSize.X.Scale*1.1,normalSize.X.Offset*1.1,
+                normalSize.Y.Scale*1.1,normalSize.Y.Offset*1.1)
+            bigTxtSize=normalTxtSize*1.1
+            dragging  = true
+            hasMoved  = false
+            dragStart = input.Position
+            startPos  = gui.Position
+            __TS:Create(gui, tInfo, {Size = bigSize, TextSize = bigTxtSize}):Play()
+            local absPos = gui.AbsolutePosition
+            ripple.Position = __UD2(0, input.Position.X - absPos.X, 0, input.Position.Y - absPos.Y)
+            ripple.Size = __UD2(0, 0, 0, 0)
+            ripple.BackgroundTransparency = 0.5
+            ripple.Visible = true
+            sound:Play()
+            __TS:Create(ripple, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+                Size = __UD2(0, 300, 0, 300),
+                BackgroundTransparency = 1
             }):Play()
+            local rel
+            rel = maid:GiveTask(__UIS.InputEnded:Connect(function(endInput)
+                if endInput.UserInputType == input.UserInputType then
+                    dragging = false
+                    __TS:Create(gui, tInfo, {Size = normalSize, TextSize = normalTxtSize}):Play()
+                    if not hasMoved then bb_safecallback(func) end
+
+                    if not lockBigButtonPos then
+                        savedPositions[gui.Name] = {
+                            xs = gui.Position.X.Scale, xo = gui.Position.X.Offset,
+                            ys = gui.Position.Y.Scale, yo = gui.Position.Y.Offset
+                        }
+                        savePositions(savedPositions)
+                    end
+
+                    rel:Disconnect()
+                end
+            end))
         end
-        sound:Play()
-        local absPos=gui.AbsolutePosition
-        ripple.Position=__UD2(0,input.Position.X-absPos.X,0,input.Position.Y-absPos.Y)
-        ripple.Size=__UD2(0,0,0,0)
-        ripple.BackgroundTransparency=0.5
-        ripple.Visible=true
-        local diameter=isBind and 45 or 300
-        __TS:Create(ripple,TweenInfo.new(0.4,Enum.EasingStyle.Sine,Enum.EasingDirection.Out),{
-            Size=__UD2(0,diameter,0,diameter),BackgroundTransparency=1
-        }):Play()
+    end))
+    maid:GiveTask(gui.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
     end))
     maid:GiveTask(__UIS.InputChanged:Connect(function(input)
-        if not pressInput then return end
-        local matches=input==pressInput or (pressInput.UserInputType==Enum.UserInputType.MouseButton1 and input.UserInputType==Enum.UserInputType.MouseMovement)
-        if not matches then return end
-        if input.UserInputState==Enum.UserInputState.Cancel then finish(true);return end
-        local delta=input.Position-dragStart
-        if delta.Magnitude>7 then hasMoved=true end
-        if locked() then return end
-        if hasMoved then
-            gui.Position=ClampButtonPosition(gui,__UD2(startPos.X.Scale,startPos.X.Offset+delta.X,startPos.Y.Scale,startPos.Y.Offset+delta.Y))
-            rememberButtonPosition(gui,false)
+        if input == dragInput and dragging then
+            if lockBigButtonPos then return end
+            local delta = input.Position - dragStart
+            if delta.Magnitude > 7 then hasMoved = true end
+            gui.Position = __UD2(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
         end
     end))
-    maid:GiveTask(__UIS.InputEnded:Connect(function(input)
-        if not pressInput then return end
-        if input==pressInput or (pressInput.UserInputType==Enum.UserInputType.MouseButton1 and input.UserInputType==Enum.UserInputType.MouseButton1) then
-            finish(input.UserInputState==Enum.UserInputState.Cancel)
-        end
-    end))
-    maid:GiveTask(__UIS.WindowFocusReleased:Connect(function() finish(true) end))
-end
-local function BB_MakeDraggable(gui,maid,func,ripple,sound)
-    MakeButtonDraggable(gui,maid,func,ripple,sound,false)
 end
 
-local function AddBigButton(id, text, func, isGold, size)
+local function AddBigButton(id, text, func, isGold)
     if BBSystem.Buttons[id] then return end
     local storage = BB_GetStorage()
     local buttonMaid=Maid.new()
     BBSystem.Maids[id]=buttonMaid
     local bb = Instance.new("TextButton")
     bb.Name = id
-    local buttonSize=size or 200
-    bb.Size = __UD2(0,buttonSize,0,buttonSize*0.375)
+    bb.Size = __UD2(0, 200, 0, 75)
+
+    local sp = savedPositions[id]
+    if sp then
+        bb.Position = __UD2(sp.xs, sp.xo, sp.ys, sp.yo)
+    else
+        bb.Position = __UD2(0.5, 0, 0.5, 0)
+    end
 
     bb.AnchorPoint = __V2(0.5, 0.5)
     bb.BackgroundColor3 = __RGB(255, 255, 255)
@@ -15963,7 +15838,6 @@ local function AddBigButton(id, text, func, isGold, size)
     bb.AutoButtonColor = false
     bb.ZIndex = 5
     bb.Parent = storage
-    RestoreButtonPosition(bb,__UD2(0.5,0,0.5,0))
 
     Instance.new("UICorner", bb).CornerRadius = __UD(0, 5)
     local stroke = Instance.new("UIStroke")
@@ -16054,24 +15928,111 @@ local __GOLD_WAIT_COLOR = ColorSequence.new({
     ColorSequenceKeypoint.new(1,   __RGB(160, 82, 45))
 })
 
-local function Bind_GetStorage()
-    return GetButtonStorage("VV2_BombJump_BindStorage")
+local function bind_safecallback(callback)
+    if not callback then return end
+    local ok, err = xpcall(callback, function(e) return debug.traceback(e) end)
+    if not ok then warn("[BIND ERROR] " .. tostring(err)) end
 end
-local function Bind_MakeDraggable(gui,maid,ripple,sound,clickFunc)
-    MakeButtonDraggable(gui,maid,clickFunc,ripple,sound,true)
+
+local function Bind_GetStorage()
+    local parent = gethui and gethui()
+    if not parent or typeof(parent) ~= "Instance" then
+        parent = __PLRS.LocalPlayer:WaitForChild("PlayerGui", 5)
+    end
+    if typeof(parent) ~= "Instance" then
+        parent = __PLRS.LocalPlayer:WaitForChild("PlayerGui")
+    end
+
+    local sg = parent:FindFirstChild("VV2_BombJump_BindStorage")
+    if not sg then
+        sg = Instance.new("ScreenGui")
+        sg.Name = "VV2_BombJump_BindStorage"
+        sg.ResetOnSpawn = false
+        sg.IgnoreGuiInset = true
+        pcall(function() sg.ScreenInsets = Enum.ScreenInsets.None end)
+        sg.Parent = parent
+        RootMaid:GiveTask(sg)
+    end
+    return sg
+end
+
+local function Bind_MakeDraggable(gui, maid, ripple, sound, clickFunc)
+    local dragging, dragInput, dragStart, startPos
+    local hasMoved = false
+
+    maid:GiveTask(gui.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if not alive or not runtimeAlive then return end
+            dragging, dragStart, startPos = true, input.Position, gui.Position
+            hasMoved = false
+            sound:Play()
+            local absPos = gui.AbsolutePosition
+            ripple.Position = __UD2(0, input.Position.X - absPos.X, 0, input.Position.Y - absPos.Y)
+            ripple.Size = __UD2(0, 0, 0, 0)
+            ripple.BackgroundTransparency = 0.5
+            ripple.Visible = true
+            __TS:Create(ripple, TweenInfo.new(0.4, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+                Size = __UD2(0, 45, 0, 45),
+                BackgroundTransparency = 1
+            }):Play()
+
+            local rel
+            rel = maid:GiveTask(__UIS.InputEnded:Connect(function(endInput)
+                if endInput.UserInputType == input.UserInputType then
+                    dragging = false
+                    if not hasMoved then
+                        bind_safecallback(clickFunc)
+                    end
+
+                    if not lockBindButtonPos then
+                        savedPositions[gui.Name] = {
+                            xs = gui.Position.X.Scale, xo = gui.Position.X.Offset,
+                            ys = gui.Position.Y.Scale, yo = gui.Position.Y.Offset
+                        }
+                        savePositions(savedPositions)
+                    end
+
+                    rel:Disconnect()
+                end
+            end))
+        end
+    end))
+
+    maid:GiveTask(gui.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end))
+
+    maid:GiveTask(__UIS.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            if lockBindButtonPos then return end
+            local delta = input.Position - dragStart
+            if delta.Magnitude > 7 then hasMoved = true end
+            local screen = gui.Parent.AbsoluteSize
+            gui.Position = __UD2(startPos.X.Scale + (delta.X / screen.X), 0, startPos.Y.Scale + (delta.Y / screen.Y), 0)
+        end
+    end))
 end
 
 function BindableButtons.AddBButton(id, text, clickFunc, isGold)
     if BindableButtons.Buttons[id] then return end
 
     local buttonMaid = Maid.new()
-    local storage=Bind_GetStorage()
-    local screen=ButtonScreenSize({Parent=storage})
+    local camera = workspace.CurrentCamera
+    local screen = camera.ViewportSize
     local buttonSizeY = 0.11
     local widthScale = buttonSizeY * (screen.Y / screen.X)
 
-    local xPos=0.1+((BindableButtons.Count%8)*(widthScale+0.005))
-    local yPos=0.9-(math.floor(BindableButtons.Count/8)*(buttonSizeY+0.015))
+    local sp = savedPositions[id]
+    local xPos, yPos
+    if sp then
+        xPos = sp.xs
+        yPos = sp.ys
+    else
+        xPos = 0.1 + ((BindableButtons.Count % 8) * (widthScale + 0.005))
+        yPos = 0.9 - (math.floor(BindableButtons.Count / 8) * (buttonSizeY + 0.015))
+    end
 
     local ImageButton = Instance.new("ImageButton")
     ImageButton.Name = id
@@ -16083,8 +16044,7 @@ function BindableButtons.AddBButton(id, text, clickFunc, isGold)
     ImageButton.BorderSizePixel = 0
     ImageButton.ClipsDescendants = false
     ImageButton.AutoButtonColor = false
-    ImageButton.Parent = storage
-    RestoreButtonPosition(ImageButton,__UD2(xPos,0,yPos,0))
+    ImageButton.Parent = Bind_GetStorage()
     buttonMaid:GiveTask(ImageButton)
 
     local TextLabel = Instance.new("TextLabel", ImageButton)
@@ -16144,7 +16104,6 @@ function BindableButtons.DeleteBButton(id)
         BindableButtons.Maids[id]:Destroy()
         BindableButtons.Maids[id] = nil
         BindableButtons.Buttons[id] = nil
-        BindableButtons.Count=math.max(0,BindableButtons.Count-1)
     end
 end
 
@@ -16167,6 +16126,22 @@ function BindableButtons.UpdateBButtonText(id, text, isWaiting, isGold)
     end
 end
 
+local function GetSafeGuiRoot()
+    local success, result = pcall(function()
+        return gethui()
+    end)
+    if success and result and typeof(result) == "Instance" then
+        return result
+    end
+    return Services.CoreGui
+end
+
+local hiddenGui = Instance.new("ScreenGui")
+hiddenGui.Name = "VV2_BombJump_HiddenGui"
+hiddenGui.ResetOnSpawn = false
+hiddenGui.IgnoreGuiInset = true
+hiddenGui.Parent = GetSafeGuiRoot()
+RootMaid:GiveTask(hiddenGui)
 
 local section=mainTab:AddSection("Bomb Jump+","Utilities")
 local vv2Controls={}
@@ -16239,6 +16214,8 @@ local CONFIG = {
     DefaultSize = 90
 }
 
+local equipGunAfterJump=false
+local shootAfterJump=false
 local bombJumpEnabled = false
 local onCooldown = false
 local debounce = false
@@ -16436,6 +16413,10 @@ local function FastBombJump()
 
             MakeCharacterJump()
             UnequipBomb()
+            env.VisualsV2Runtime.JumpGunFollowup.Queue("BombJump",actionCharacter,function()
+                if not alive then return false,false end
+                return equipGunAfterJump,shootAfterJump
+            end)
 
             vv2Spawn(function()
                 task.wait(0.1)
@@ -16468,7 +16449,7 @@ local TAP_TIME_THRESHOLD = 0.3
 
 BombJumpMaid:GiveTasks(
     Services.UserInputService.InputBegan:Connect(function(input, gp)
-if gp then return end
+        if gp then return end
         if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
             activeTouches[input] = {startPosition = input.Position, startTime = tick(), moved = false}
         end
@@ -16507,6 +16488,8 @@ if gp then return end
 )
 
 section:AddLabel("Bomb Jump Options")
+section:AddToggle("Equip Gun After Bomb Jump",function(value) equipGunAfterJump=value end)
+section:AddToggle("Shoot Murderer After Bomb Jump (ODH)",function(value) shootAfterJump=value end)
 section:AddToggle("Enable Auto Bomb Jump", function(bool) bombJumpEnabled = bool end)
 
 section:AddToggle("Auto-Get Fake Bomb", function(bool)
@@ -16519,7 +16502,7 @@ end)
 section:AddToggle("Enable BJ Big Button", function(e)
     bigBtnExists = e
     if e then
-        AddBigButton("VV2_BombJump_Big", "Bomb Jump", FastBombJump, false,bigButtonSize)
+        AddBigButton("VV2_BombJump_Big", "Bomb Jump", FastBombJump, false)
         local btn = BBSystem.Buttons["VV2_BombJump_Big"]
         if btn then
             btn.Size = __UD2(0, bigButtonSize, 0, bigButtonSize * 0.375)
@@ -16553,7 +16536,7 @@ section:AddToggle("Enable BJ Bind Button", function(e)
         BindableButtons.AddBButton("VV2_BombJump_Bind", "BJ", FastBombJump, false)
         bjBindButton = BindableButtons.Buttons["VV2_BombJump_Bind"]
         if bjBindButton then
-            local screen=ButtonScreenSize(bjBindButton)
+            local screen = Services.Workspace.CurrentCamera.ViewportSize
             bjBindButton.Size = __UD2(bindButtonSize * (screen.Y / screen.X), 0, bindButtonSize, 0)
             BindableButtons.UpdateBButtonText("VV2_BombJump_Bind", onCooldown and "Wait" or "BJ", onCooldown, false)
         end
@@ -16566,7 +16549,7 @@ end)
 section:AddSlider("BJ Bind Button Size", 5, 25, 11, function(value)
     bindButtonSize = value / 100
     if bjBindButton then
-        local screen=ButtonScreenSize(bjBindButton)
+        local screen = Services.Workspace.CurrentCamera.ViewportSize
         bjBindButton.Size = __UD2(bindButtonSize * (screen.Y / screen.X), 0, bindButtonSize, 0)
     end
 end)
@@ -16576,23 +16559,25 @@ section:AddButton("Reset BJ Bind Button Position", function()
     savePositions(savedPositions)
     local btn = BindableButtons.Buttons["VV2_BombJump_Bind"]
     if btn then
-        btn.Position = ClampButtonPosition(btn,__UD2(0.1,0,0.9,0))
+        local camera = Services.Workspace.CurrentCamera
+        local screen = camera.ViewportSize
+        local buttonSizeY = bindButtonSize
+        local widthScale = buttonSizeY * (screen.Y / screen.X)
+        btn.Position = __UD2(0.1, 0, 0.9, 0)
     end
     shared.Notify("BJ Bind button position reset", 2)
 end)
 
 section:AddKeybind("Bomb Jump Keybind", "E", FastBombJump)
 vv2Features.Jump=FastBombJump
-vv2Features.ResetJump=function()
-    debounce=false
-    justRespawned=false
-    table.clear(activeTouches)
-    ResetCooldown()
-end
 
 if _game == "Murder Mystery Modded" then
 
 local gbjSection = BombJump:AddSection("Gold Bomb Jump+", "MMV")
+local equipGunAfterGoldJump=false
+local shootAfterGoldJump=false
+gbjSection:AddToggle("Equip Gun After Gold Bomb Jump",function(value) equipGunAfterGoldJump=value end)
+gbjSection:AddToggle("Shoot Murderer After Gold Bomb Jump (ODH)",function(value) shootAfterGoldJump=value end)
 
 local gbjOnCooldown = false
 local goldBombJumpEnabled = false
@@ -16743,6 +16728,10 @@ local function FastGoldBombJump()
 
             GBJMakeCharacterJump()
             UnequipGoldBomb()
+            env.VisualsV2Runtime.JumpGunFollowup.Queue("GoldBombJump",actionCharacter,function()
+                if not alive then return false,false end
+                return equipGunAfterGoldJump,shootAfterGoldJump
+            end)
 
             vv2Spawn(function()
                 task.wait(0.1)
@@ -16816,7 +16805,7 @@ end)
 
 gbjSection:AddToggle("Enable GBJ Big Button", function(e)
     if e then
-        AddBigButton("VV2_GoldBombJump_Big", "Gold Bomb Jump", FastGoldBombJump, true,gbjBigButtonSize)
+        AddBigButton("VV2_GoldBombJump_Big", "Gold Bomb Jump", FastGoldBombJump, true)
         local btn = BBSystem.Buttons["VV2_GoldBombJump_Big"]
         if btn then
             btn.Size = __UD2(0, gbjBigButtonSize, 0, gbjBigButtonSize * 0.375)
@@ -16849,7 +16838,7 @@ gbjSection:AddToggle("Enable GBJ Bind Button", function(e)
         BindableButtons.AddBButton("VV2_GoldBombJump_Bind", "GBJ", FastGoldBombJump, true)
         gbjBindButton = BindableButtons.Buttons["VV2_GoldBombJump_Bind"]
         if gbjBindButton then
-            local screen=ButtonScreenSize(gbjBindButton)
+            local screen = Services.Workspace.CurrentCamera.ViewportSize
             gbjBindButton.Size = __UD2(gbjBindButtonSize * (screen.Y / screen.X), 0, gbjBindButtonSize, 0)
             BindableButtons.UpdateBButtonText("VV2_GoldBombJump_Bind", gbjOnCooldown and "Wait" or "GBJ", gbjOnCooldown, true)
         end
@@ -16862,7 +16851,7 @@ end)
 gbjSection:AddSlider("GBJ Bind Button Size", 5, 25, 11, function(value)
     gbjBindButtonSize = value / 100
     if gbjBindButton then
-        local screen=ButtonScreenSize(gbjBindButton)
+        local screen = Services.Workspace.CurrentCamera.ViewportSize
         gbjBindButton.Size = __UD2(gbjBindButtonSize * (screen.Y / screen.X), 0, gbjBindButtonSize, 0)
     end
 end)
@@ -16879,12 +16868,6 @@ end)
 
 gbjSection:AddKeybind("Gold Bomb Jump Keybind", "G", FastGoldBombJump)
 vv2Features.GoldJump=FastGoldBombJump
-vv2Features.ResetGoldJump=function()
-    gbjDebounce=false
-    gbjJustRespawned=false
-    table.clear(gbjActiveTouches)
-    GBJResetCooldown()
-end
 
 end
 
@@ -16908,24 +16891,15 @@ end)
 
 vv2Features.Close=function()
     if not alive then return end
-    local destroying=not runtimeAlive
-    if destroying then alive=false end
+    alive=false
     for record in pairs(pending) do
         if record.thread and type(task.cancel)=="function" then pcall(task.cancel,record.thread) end
         pending[record]=nil
     end
     for _,controller in ipairs(vv2Controls) do controller:Set(false) end
-    if vv2Features.ResetJump then vv2Features.ResetJump() end
-    if vv2Features.ResetGoldJump then vv2Features.ResetGoldJump() end
     for id in pairs(BBSystem.Buttons) do DeleteBigButton(id) end
     for id in pairs(BindableButtons.Buttons) do BindableButtons.DeleteBButton(id) end
-    if destroying then
-        RootMaid:Destroy()
-    else
-        -- A deleted settings file is a live reset; the controls remain reusable.
-        table.clear(savedPositions)
-        positionsForConfig=nil
-    end
+    RootMaid:Destroy()
 end
 env.VisualsV2Runtime.VV2BombJump=vv2Features
 env.VisualsV2Runtime.RegisterReset(vv2Features.Close)
@@ -16933,6 +16907,8 @@ end)()
 
 ;(function()
 local section=mainTab:AddSection("Firefly Clutch","Utilities")
+local equipGunAfterClutch=C("fireflyEquipGun",false)
+local shootAfterClutch=C("fireflyShootMurderer",false)
 local autoClutch=C("fireflyAutoClutch",false)
 local timerEnabled=C("fireflyTimerEnabled",true)
 local timerColors=C("fireflyTimerColors",true)
@@ -17109,11 +17085,15 @@ local function fireJump()
 end
 
 local function startTwoJumpSequence(myCycle)
-
+    local character=player.Character
     fireJump()
     task.delay(JUMP_GAP,function()
-        if autoClutch and myCycle==cycleToken then
+        if autoClutch and myCycle==cycleToken and player.Character==character then
             fireJump()
+            env.VisualsV2Runtime.JumpGunFollowup.Queue("FireflyClutch",character,function()
+                if not autoClutch or myCycle~=cycleToken then return false,false end
+                return equipGunAfterClutch,shootAfterClutch
+            end)
         end
     end)
 end
@@ -17335,6 +17315,12 @@ local autoToggle=addToggle(section,"Auto Firefly Clutch",autoClutch,function(sta
     end
 end)
 
+local equipGunToggle=addToggle(section,"Equip Gun After Firefly Clutch",equipGunAfterClutch,function(value)
+    equipGunAfterClutch=value;SetCfg("fireflyEquipGun",value)
+end)
+local shootToggle=addToggle(section,"Shoot Murderer After Firefly Clutch (ODH)",shootAfterClutch,function(value)
+    shootAfterClutch=value;SetCfg("fireflyShootMurderer",value)
+end)
 local timerToggle=addToggle(section,"Enable Firefly Timer",timerEnabled,function(state)
     timerEnabled=state
     SetCfg("fireflyTimerEnabled",state)
@@ -17373,6 +17359,8 @@ end)
 
 env.VisualsV2Runtime.RegisterReset(function()
     autoToggle:Set(false)
+    equipGunToggle:Set(false)
+    shootToggle:Set(false)
     timerToggle:Set(false)
     timerColorToggle:Set(false)
     fireflyLockToggle:Set(false)
@@ -17484,6 +17472,7 @@ worldSection:AddSlider("Exposure",-2,5,exposure,function(value)
 end)
 
 if fullbrightEnabled then applyFullbright() else disableFullbright() end
+
 local fogSection=mainTab:AddSection("Fog","World")
 fogEnabled=C("fogEnabled",false)
 local fogRainbow=C("fogRainbow",false)
@@ -17777,26 +17766,22 @@ if tonumber(C("autoToySelectionVersion",0))<1 then
     end
     SetCfg("autoToySelectionVersion",1)
 end
-local function firstFunction(...)
-    for index=1,select("#",...) do
-        local candidate=select(index,...)
-        if type(candidate)=="function" then return candidate end
-    end
-end
-local getgc=firstFunction(getgc,env.getgc)
-local getupvalues=firstFunction(debug and debug.getupvalues,getupvalues,env.getupvalues)
-local getupvalue=firstFunction(debug and debug.getupvalue,getupvalue,env.getupvalue)
-local setupvalue=firstFunction(debug and debug.setupvalue,setupvalue,env.setupvalue)
-local getinfo=firstFunction(debug and debug.getinfo,getinfo,env.getinfo)
-local getconstants=firstFunction(debug and debug.getconstants,getconstants,env.getconstants)
+local getgc=getgc or env.getgc
+local getupvalues=(debug and debug.getupvalues) or getupvalues or env.getupvalues
+local getupvalue=(debug and debug.getupvalue) or getupvalue or env.getupvalue
+local setupvalue=(debug and debug.setupvalue) or setupvalue or env.setupvalue
+local getinfo=(debug and debug.getinfo) or getinfo or env.getinfo
+local getconstants=(debug and debug.getconstants) or getconstants or env.getconstants
+local setconstant=(debug and debug.setconstant) or setconstant or env.setconstant
+local getprotos=(debug and debug.getprotos) or getprotos or env.getprotos
+local getfenv=getfenv or env.getfenv
 local debugInfo=debug and debug.info
 local targetFunctions={}
-local targetMetadata=setmetatable({}, {__mode="k"})
+local targetDetails=setmetatable({}, {__mode="k"})
 local targetsScanned=false
 local scanningTargets=false
 local targetEpoch=0
 local lastTargetScan=-math.huge
-local scanRetryDelay=2
 local slotReferences={}
 local observedGui=nil
 local perf={targetScans=0,guiScans=0,slotVisits=0,scanYields=0,targets=0,patchedLimits=0}
@@ -17808,9 +17793,7 @@ local removingCharacter=nil
 local recoveryDeadline=0
 local rescanRequested=false
 local toyAttempts={}
-local toyRecoveryRunning=false
-local toyRecoveryToken=0
-local toyRecoveryDeadline=0
+local activeToyRequest=nil
 local toyOrderDirty=true
 local orderingBackpack=false
 local originalSlotOrders=setmetatable({}, {__mode="k"})
@@ -17823,7 +17806,7 @@ local lifecycleConnections={}
 local dropdowns={}
 local refreshingDropdowns=false
 local guiRefreshToken=0
-local requestRecovery,requestToyRecovery,refreshToyDropdowns
+local requestRecovery,refreshToyDropdowns
 
 local function disconnectAll(connections)
     for _,connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
@@ -17831,63 +17814,68 @@ local function disconnectAll(connections)
 end
 
 local function discoverTargets(force)
-    if scanningTargets or (targetsScanned and not force)
-        or os.clock()-lastTargetScan<scanRetryDelay then return false end
-    if not (getgc and (getupvalues or getupvalue)) then
-        perf.error="This executor does not expose inventory inspection APIs"
-        return false
+    if scanningTargets or (targetsScanned and not force) or os.clock()-lastTargetScan<2 then return end
+    if type(getgc)~="function" or not ((type(getupvalues)=="function" and type(setupvalue)=="function")
+        or (type(getconstants)=="function" and type(setconstant)=="function")) then
+        perf.error="This executor does not expose inventory inspection";return
     end
     scanningTargets=true
     lastTargetScan=os.clock()
     local epoch=targetEpoch
     perf.targetScans=perf.targetScans+1
-    local okGc,objects=pcall(getgc,false)
-    if not okGc or type(objects)~="table" then okGc,objects=pcall(getgc) end
-    if not okGc or type(objects)~="table" then
-        scanningTargets=false
-        perf.error="The executor could not inspect loaded inventory functions"
-        return false
-    end
+    local okGc,objects=pcall(getgc)
+    if not okGc or type(objects)~="table" then scanningTargets=false;return end
     local found={}
-    local slice=os.clock()
-    local visits=0
-    for _,f in pairs(objects) do
-        if not alive or not runtimeAlive or targetEpoch~=epoch or not inventoryEnabled then
-            scanningTargets=false
-            return false
+    local seen={}
+    local names={updateitemframe=true,onitemequipped=true,updatehotbar=true,updatetools=true,
+        addtool=true,onbackpackchildadded=true,updatebackpack=true}
+    local function inspect(f,inherited)
+        if seen[f] or type(f)~="function" then return end
+        seen[f]=true
+        local name,source="",""
+        if type(getinfo)=="function" then
+            local ok,info=pcall(getinfo,f)
+            if ok and type(info)=="table" then name=tostring(info.name or ""):lower();source=tostring(info.source or info.short_src or ""):lower() end
         end
-        visits=visits+1
-        if type(f)=="function" then
-            local metadata=targetMetadata[f]
-            if metadata==nil then
-                local info={}
-                if getinfo then
-                    local success,result=pcall(getinfo,f)
-                    if success and type(result)=="table" then info=result end
-                end
-                if (not info.name or info.name=="") and type(debugInfo)=="function" then
-                    local success,name=pcall(debugInfo,f,"n")
-                    if success then info.name=name end
-                end
-                local name=tostring(info.name or ""):lower()
-                local isTarget=(name=="updateitemframe" or name=="onitemequipped")
-                if not isTarget and info.what~="C" and getconstants then
-                    local cSuccess,constants=pcall(getconstants,f)
-                    if cSuccess and type(constants)=="table" then
-                        local hasTouch,hasEquip=false,false
-                        for _,value in pairs(constants) do
-                            if value=="TouchBinding" then hasTouch=true
-                            elseif value=="EquipButton" then hasEquip=true end
-                        end
-                        isTarget=hasTouch and hasEquip
-                    end
-                end
-                metadata=isTarget and {name=name,nups=tonumber(info.nups)} or false
-                targetMetadata[f]=metadata
+        if name=="" and type(debugInfo)=="function" then
+            local ok,value=pcall(debugInfo,f,"n")
+            if ok then name=tostring(value or ""):lower() end
+        end
+        if source:find("trade",1,true) or source:find("trading",1,true) then return end
+        local contextual=inherited or source:find("backpack",1,true) or source:find("hotbar",1,true)
+        if not contextual and type(getfenv)=="function" then
+            local ok,context=pcall(getfenv,f)
+            local script=ok and type(context)=="table" and rawget(context,"script")
+            if typeof(script)=="Instance" then
+                local path=script:GetFullName():lower()
+                if path:find("trade",1,true) or path:find("trading",1,true) then return end
+                contextual=path:find("backpack",1,true) or path:find("hotbar",1,true)
             end
-            if metadata then found[#found+1]=f end
         end
-        if visits%64==0 or os.clock()-slice>=0.002 then
+        local constants
+        if type(getconstants)=="function" and (names[name] or contextual or name=="") then
+            local ok,result=pcall(getconstants,f)
+            if ok and type(result)=="table" then constants=result end
+        end
+        local touch,equip=false,false
+        for _,value in pairs(constants or {}) do
+            if value=="TouchBinding" then touch=true elseif value=="EquipButton" then equip=true end
+        end
+        local strong=(name=="updateitemframe" or name=="onitemequipped" or touch and equip)
+        if strong or contextual and names[name] then
+            found[#found+1]=f
+            targetDetails[f]={strong=strong,constants=constants}
+            if type(getprotos)=="function" then
+                local ok,protos=pcall(getprotos,f)
+                if ok and type(protos)=="table" then for _,child in pairs(protos) do inspect(child,true) end end
+            end
+        end
+    end
+    local slice=os.clock()
+    for index,f in ipairs(objects) do
+        if not alive or not runtimeAlive or targetEpoch~=epoch or not inventoryEnabled then scanningTargets=false;return end
+        if type(f)=="function" then inspect(f,false) end
+        if index%64==0 or os.clock()-slice>=0.002 then
             perf.scanYields=perf.scanYields+1
             task.wait()
             slice=os.clock()
@@ -17895,8 +17883,8 @@ local function discoverTargets(force)
     end
     targetFunctions=found
     perf.targets=#found
+    targetsScanned=#targetFunctions>0
     scanningTargets=false
-    return true
 end
 
 local limitNames={maxitems=true,maxslots=true,maxtools=true,inventorylimit=true,
@@ -17904,6 +17892,7 @@ local limitNames={maxitems=true,maxslots=true,maxtools=true,inventorylimit=true,
     maxinventory=true,maxinventoryitems=true,maxtoolslots=true,hotbarsize=true,
     inventorysize=true,maxinventoryslots=true,maximumitems=true}
 local originalLimits={}
+local originalConstants=setmetatable({}, {__mode="k"})
 local function isLimitName(name)
     return type(name)=="string" and limitNames[name:lower():gsub("[^%w]","")]==true
 end
@@ -17914,7 +17903,6 @@ local function setLimit(identity,key,readValue,writeValue)
     if not originals then originals={};originalLimits[identity]=originals end
     local record=originals[key]
     if not record then record={original=value,read=readValue,write=writeValue};originals[key]=record end
-    if value==inventoryLimit and record.applied==inventoryLimit then return true end
     if pcall(writeValue,inventoryLimit) then
         local success,current=pcall(readValue)
         if success and current==inventoryLimit then record.applied=inventoryLimit;return true end
@@ -17929,123 +17917,77 @@ local function restoreInventoryLimits()
         end
     end
     table.clear(originalLimits)
-end
-
--- Executors return either (value) or (name, value); the number of return
--- values distinguishes the two even when the upvalue itself is a string/nil.
-local function readOneUpvalue(f,index)
-    if not getupvalue then return false end
-    local result=table.pack(pcall(getupvalue,f,index))
-    if not result[1] then return false end
-    if result.n>=3 and type(result[2])=="string" then
-        return true,result[3],result[2]
-    end
-    if result[2]~=nil then return true,result[2] end
-    return false
-end
-
-local function inspectUpvalues(f)
-    local entries={}
-    local values
-    if getupvalues then
-        local ok,result=pcall(getupvalues,f)
-        if ok and type(result)=="table" then values=result end
-    end
-    local count,maxIndex=0,0
-    for key,value in pairs(values or {}) do
-        count=count+1
-        if type(key)=="number" then
-            maxIndex=math.max(maxIndex,key)
-            local ok,current,name=readOneUpvalue(f,key)
-            if ok then value=current end
-            entries[#entries+1]={key=key,value=value,name=name}
-        end
-    end
-    -- A single-upvalue getter is sufficient when getupvalues is unavailable.
-    -- Some getupvalues implementations return a name-keyed map instead.
-    if getupvalue and maxIndex==0 then
-        local metadata=targetMetadata[f]
-        local knownCount=metadata and metadata.nups
-        local misses=0
-        for index=1,math.min(knownCount or math.max(count,64),256) do
-            local ok,value,name=readOneUpvalue(f,index)
-            if ok then
-                entries[#entries+1]={key=index,value=value,name=name}
-                misses=0
-            else
-                misses=misses+1
-                if not knownCount and count==0 and misses>=3 then break end
+    for f,records in pairs(originalConstants) do
+        local ok,constants=pcall(getconstants,f)
+        if ok and type(constants)=="table" then
+            for index,record in pairs(records) do
+                if constants[index]==record.applied then pcall(setconstant,f,index,record.original) end
             end
         end
     end
-    if maxIndex==0 and #entries==0 then
-        for key,value in pairs(values or {}) do
-            if type(key)=="string" then entries[#entries+1]={key=key,value=value,name=key} end
-        end
-    end
-    return entries
+    table.clear(originalConstants)
 end
-
-local function readCurrentUpvalue(f,key)
-    if type(key)=="number" then
-        local ok,value=readOneUpvalue(f,key)
-        if ok then return value end
-    end
-    if getupvalues then
-        local values=getupvalues(f)
-        return type(values)=="table" and values[key] or nil
-    end
-end
-
 local function applyInventoryLimit(force)
     if not inventoryEnabled then return end
-    local scanned=discoverTargets(force)
+    discoverTargets(force)
     local patched=0
     for _,f in ipairs(targetFunctions) do
-        local entries=inspectUpvalues(f)
-        local legacy={}
-        local identified=false
-        for _,entry in ipairs(entries) do
-            local key,value,name=entry.key,entry.value,entry.name
-            if type(value)=="number" then
-                local anonymous=name==nil or name=="" or name=="?" or name=="_"
-                    or name:match("^v_?u?_?%d+$") or name:lower():match("^upvalue_?%d*$")
-                local originals=originalLimits[f]
-                local previous=originals and originals[key]
-                if setupvalue and isLimitName(name) then
-                    identified=true
-                    if setLimit(f,key,function() return readCurrentUpvalue(f,key) end,
-                        function(limit) setupvalue(f,key,limit) end) then patched=patched+1 end
-                elseif setupvalue and anonymous and (value==3
-                    or (previous and previous.original==3 and value==previous.applied)) then
-                    legacy[#legacy+1]=entry
-                end
-            elseif type(value)=="table" then
-                for key,capacity in pairs(value) do
-                    if isLimitName(key) and type(capacity)=="number" then
-                        identified=true
-                        if setLimit(value,key,function() return value[key] end,function(limit) value[key]=limit end) then
-                            patched=patched+1
+        local ok,upvalues=pcall(function() return type(getupvalues)=="function" and getupvalues(f) or {} end)
+        if ok and type(upvalues)=="table" then
+            for index,value in pairs(upvalues) do
+                if type(index)=="number" and type(value)=="number" then
+                    local hasName,name,namedValue=false,nil,nil
+                    if type(getupvalue)=="function" then
+                        local ok,label,current=pcall(getupvalue,f,index)
+                        local anonymous=type(label)=="string" and (label=="" or label=="?" or label=="_"
+                            or label:match("^v_?u?_?%d+$") or label:lower():match("^upvalue_?%d*$"))
+                        hasName=ok and type(label)=="string" and current==value and not anonymous
+                        if hasName then name,namedValue=label,current end
+                    end
+                    local originals=originalLimits[f]
+                    local previous=originals and originals[index]
+
+                    local legacyLimit=(not hasName or targetDetails[f] and targetDetails[f].strong) and (value==3
+                        or (previous and previous.original==3 and value==previous.applied))
+                    if (hasName and isLimitName(name) and namedValue==value) or legacyLimit then
+                        if type(setupvalue)=="function" and setLimit(f,index,function() return getupvalues(f)[index] end,
+                            function(limit) setupvalue(f,index,limit) end) then patched=patched+1 end
+                    end
+                elseif type(value)=="table" then
+                    for key,capacity in pairs(value) do
+                        if isLimitName(key) and type(capacity)=="number" then
+                            if setLimit(value,key,function() return value[key] end,function(limit) value[key]=limit end) then
+                                patched=patched+1
+                            end
                         end
                     end
                 end
             end
         end
-        -- Known MM2 builds close over their three-slot cap. Do not replace
-        -- other numeric upvalues or ambiguous constants in these functions.
-        if not identified and #legacy==1 then
-            local key=legacy[1].key
-            if setLimit(f,key,function() return readCurrentUpvalue(f,key) end,
-                function(limit) setupvalue(f,key,limit) end) then patched=patched+1 end
+        -- Some MM2 hotbars compile their capacity as a constant, not an upvalue.
+        local detail=targetDetails[f]
+        if detail and detail.strong and type(getconstants)=="function" and type(setconstant)=="function" then
+            local ok,constants=pcall(getconstants,f)
+            if ok and type(constants)=="table" then
+                local records=originalConstants[f]
+                for index,value in pairs(constants) do
+                    local previous=records and records[index]
+                    if type(index)=="number" and (value==3 or previous and value==previous.applied) then
+                        if not records then records={};originalConstants[f]=records end
+                        local record=previous or {original=value}
+                        local changed=pcall(setconstant,f,index,inventoryLimit)
+                        local verified,current=pcall(getconstants,f)
+                        if changed and verified and current[index]==inventoryLimit then
+                            record.applied=inventoryLimit;records[index]=record;patched=patched+1
+                        end
+                    end
+                end
+            end
         end
     end
     perf.patchedLimits=patched
     targetsScanned=#targetFunctions>0 and patched>0
-    if scanned then scanRetryDelay=targetsScanned and 2 or math.min(scanRetryDelay*2,8) end
-    if patched>0 then perf.error=nil
-    elseif getgc and (getupvalues or getupvalue) then
-        perf.error="A writable inventory capacity has not been found yet"
-    end
+    perf.error=patched==0 and "The native inventory capacity has not been found yet" or nil
 end
 local function getBackpack()
     if observedBackpack and observedBackpack.Parent==player then return observedBackpack end
@@ -18103,24 +18045,22 @@ local function isNativeSlot(reference)
     return current==observedGui and slot.Parent:FindFirstChildOfClass("UIListLayout")~=nil
 end
 local function cacheReference(reference)
-    if not autoGetTools or slotReferences[reference] or not reference:IsA("ObjectValue") or not isNativeSlot(reference) then return end
+    if slotReferences[reference] or not reference:IsA("ObjectValue") or not isNativeSlot(reference) then return end
     slotReferences[reference]=reference:GetPropertyChangedSignal("Value"):Connect(function()
         toyOrderDirty=true
         requestRecovery(false)
     end)
     toyOrderDirty=true
-    if requestRecovery then requestRecovery(false) end
 end
 local function clearReferences()
     for _,connection in pairs(slotReferences) do connection:Disconnect() end
     table.clear(slotReferences)
 end
 local function scanSlotReferences(gui)
-    if not autoGetTools or not gui then return end
     perf.guiScans=perf.guiScans+1
     local pending={gui}
     local count=0
-    while #pending>0 and alive and runtimeAlive and autoGetTools and observedGui==gui do
+    while #pending>0 and alive and runtimeAlive and observedGui==gui do
         local object=table.remove(pending)
         local skip=object~=gui and (object.Name:sub(1,10)=="VisualsV2_" or object:GetAttribute("VisualsV2_InventoryVisual"))
         if not skip and (object.Name=="Inventory" or object.Name=="Inventory2") then
@@ -18165,13 +18105,11 @@ local function orderSelectedTools(char,backpack,token)
     return true
 end
 local function cancelToyRequests()
-    toyRecoveryToken=toyRecoveryToken+1
-    toyRecoveryRunning=false
-    toyRecoveryDeadline=0
     for _,attempt in pairs(toyAttempts) do
         if attempt.thread and type(task.cancel)=="function" then pcall(task.cancel,attempt.thread) end
     end
     table.clear(toyAttempts)
+    activeToyRequest=nil
 end
 
 local function cancelRecovery()
@@ -18190,95 +18128,6 @@ local function isCurrentRecovery(token,char)
         and (inventoryEnabled or autoGetTools)
 end
 
-local function requestSelectedTools(char,token)
-    local now=os.clock()
-    local humanoid=char:FindFirstChildOfClass("Humanoid")
-    if not humanoid or humanoid.Health<=0 then return true,now+0.1 end
-    local backpack=getBackpack()
-    local folder=findToyFolder()
-    local remote=toyRemote()
-    if not backpack or not folder or not remote then return true end
-
-    local selected={}
-    for slot=1,4 do
-        local name=selectedToys[slot]
-        if name and name~="None" then selected[name]=true end
-    end
-    -- Acquired/unselected tools no longer need their outstanding coroutine.
-    -- Identity checks below fence late replies even without task.cancel.
-    for name,attempt in pairs(toyAttempts) do
-        if not selected[name] or hasSelectedTool(name,char,backpack) then
-            toyAttempts[name]=nil
-            if attempt.thread and type(task.cancel)=="function" then pcall(task.cancel,attempt.thread) end
-        end
-    end
-
-    local missing=false
-    local nextWake
-    local seen={}
-    local generation=toyRecoveryToken
-    for slot=1,4 do
-        local name=selectedToys[slot]
-        if name and name~="None" and not seen[name] then
-            seen[name]=true
-            if not hasSelectedTool(name,char,backpack) then
-                missing=true
-                local attempt=toyAttempts[name]
-                if not attempt then
-                    attempt={count=0,nextAt=0,inFlight=false}
-                    toyAttempts[name]=attempt
-                end
-                if folder:FindFirstChild(name) and not attempt.inFlight and attempt.count<6 then
-                    if now>=attempt.nextAt then
-                        attempt.count=attempt.count+1
-                        attempt.nextAt=now+math.min(3,0.35*2^(attempt.count-1))
-                        attempt.inFlight=true
-                        attempt.thread=task.spawn(function()
-                            if isCurrentRecovery(token,char) and autoGetTools
-                                and generation==toyRecoveryToken and toyAttempts[name]==attempt then
-                                pcall(function() remote:InvokeServer(name) end)
-                            end
-                            if generation~=toyRecoveryToken or toyAttempts[name]~=attempt then return end
-                            attempt.inFlight=false
-                            attempt.thread=nil
-                            -- Allow replication to settle, without adding a full
-                            -- retry delay on top of a slow server response.
-                            attempt.nextAt=math.max(attempt.nextAt,os.clock()+0.15)
-                            if isCurrentRecovery(token,char) and autoGetTools then requestToyRecovery(char,token) end
-                        end)
-                    end
-                    if not attempt.inFlight and attempt.count<6 then
-                        nextWake=math.min(nextWake or math.huge,attempt.nextAt)
-                    end
-                end
-            end
-        end
-    end
-    return missing,nextWake
-end
-
-requestToyRecovery=function(char,token)
-    if not autoGetTools or not isCurrentRecovery(token,char) then return end
-    toyRecoveryDeadline=math.max(toyRecoveryDeadline,os.clock()+20)
-    if toyRecoveryRunning then return end
-    toyRecoveryRunning=true
-    local generation=toyRecoveryToken
-    -- Defer once to coalesce Backpack/Character events during an equip move.
-    -- Acquisition runs independently of yielding capacity/GUI discovery.
-    task.defer(function()
-        while generation==toyRecoveryToken and autoGetTools and isCurrentRecovery(token,char)
-            and os.clock()<toyRecoveryDeadline do
-            local _,nextWake=requestSelectedTools(char,token)
-            if toyOrderDirty and orderSelectedTools(char,getBackpack(),token) then toyOrderDirty=false end
-            -- Replies, replication, and folder changes restart us; no polling
-            -- is needed while all outstanding calls are in flight.
-            if not nextWake then break end
-            task.wait(math.clamp(nextWake-os.clock(),0.05,0.2))
-        end
-        if generation==toyRecoveryToken then toyRecoveryRunning=false end
-    end)
-end
-
 requestRecovery=function(forceScan)
     if not alive or not runtimeAlive or not (inventoryEnabled or autoGetTools) then return end
     local char=player.Character
@@ -18288,8 +18137,6 @@ requestRecovery=function(forceScan)
         recoveryCharacter=char
     end
     if forceScan then rescanRequested=true end
-    requestToyRecovery(char,recoveryToken)
-    if not inventoryEnabled then return end
     recoveryDeadline=math.max(recoveryDeadline,os.clock()+20)
     if recoveryRunning then return end
     recoveryRunning=true
@@ -18299,7 +18146,8 @@ requestRecovery=function(forceScan)
         local scanTimes={0,1,3,6,10,15}
         local scanIndex=1
         local nextInventoryApply=0
-        while isCurrentRecovery(token,char) and inventoryEnabled and os.clock()<recoveryDeadline do
+        local nextToyRequest=0
+        while isCurrentRecovery(token,char) and os.clock()<recoveryDeadline do
             local now=os.clock()
             local humanoid=char:FindFirstChildOfClass("Humanoid")
             if humanoid and humanoid.Health>0 then
@@ -18309,12 +18157,57 @@ requestRecovery=function(forceScan)
                     repeat scanIndex=scanIndex+1
                     until not scanTimes[scanIndex] or now-startedAt<scanTimes[scanIndex]
                 end
-                -- Consume requests before the yielding scan, so GUI events arriving
-                -- during discovery remain pending for the next recovery pass.
-                rescanRequested=false
                 if inventoryEnabled and (force or (targetsScanned and now>=nextInventoryApply)) then
                     applyInventoryLimit(force)
                     nextInventoryApply=now+1
+                end
+                rescanRequested=false
+
+                if autoGetTools then
+                    local backpack=getBackpack()
+                    if toyOrderDirty and backpack and orderSelectedTools(char,backpack,token) then
+                        toyOrderDirty=false
+                    end
+                end
+                if autoGetTools and not activeToyRequest and now>=nextToyRequest then
+                    local backpack=getBackpack()
+                    local folder=findToyFolder()
+                    local remote=toyRemote()
+                    if backpack and folder and remote then
+                        local seen={}
+                        for slot=1,4 do
+                            local name=selectedToys[slot]
+                            if name and name~="None" and not seen[name] then
+                                seen[name]=true
+                                if not hasSelectedTool(name,char,backpack) then
+                                    local attempt=toyAttempts[name]
+                                    if not attempt then
+                                        attempt={count=0,nextAt=0,inFlight=false}
+                                        toyAttempts[name]=attempt
+                                    end
+                                    if folder:FindFirstChild(name) and not attempt.inFlight and attempt.count<6 and now>=attempt.nextAt then
+                                        attempt.count=attempt.count+1
+                                        attempt.nextAt=now+math.min(3,0.75+attempt.count*0.5)
+                                        attempt.inFlight=true
+                                        activeToyRequest=attempt
+                                        nextToyRequest=now+0.25
+                                        attempt.thread=task.spawn(function()
+                                            if isCurrentRecovery(token,char) and autoGetTools then
+                                                pcall(function() remote:InvokeServer(name) end)
+                                            end
+                                            attempt.inFlight=false
+                                            attempt.thread=nil
+                                            attempt.nextAt=math.max(attempt.nextAt,os.clock()+math.min(3,0.75+attempt.count*0.5))
+                                            if activeToyRequest==attempt then activeToyRequest=nil end
+                                            if isCurrentRecovery(token,char) and autoGetTools then requestRecovery(false) end
+                                        end)
+                                    end
+
+                                    break
+                                end
+                            end
+                        end
+                    end
                 end
             end
             task.wait(0.2)
@@ -18400,12 +18293,11 @@ local function queueGuiRecovery(invalidate)
         targetEpoch=targetEpoch+1
         targetsScanned=false
         lastTargetScan=-math.huge
-        scanRetryDelay=2
     end
     guiRefreshToken=guiRefreshToken+1
     local token=guiRefreshToken
     task.delay(0.35,function()
-        if alive and token==guiRefreshToken then requestRecovery(invalidate or not targetsScanned) end
+        if alive and token==guiRefreshToken then requestRecovery(false) end
     end)
 end
 
@@ -18418,28 +18310,20 @@ local function watchPlayerGui(gui)
     guiConnections[#guiConnections+1]=gui.ChildAdded:Connect(function(child)
         if child.Name=="MainGUI" then queueGuiRecovery(true) end
     end)
-    guiConnections[#guiConnections+1]=gui.ChildRemoved:Connect(function(child)
-        if child.Name=="MainGUI" then queueGuiRecovery(true) end
-    end)
     guiConnections[#guiConnections+1]=gui.DescendantAdded:Connect(function(child)
-        if autoGetTools and child:IsA("ObjectValue") then cacheReference(child)
-        elseif autoGetTools and child:IsA("UIListLayout") and child.Parent then
+        if child:IsA("ObjectValue") then cacheReference(child)
+        elseif child:IsA("UIListLayout") and child.Parent then
             for _,slot in ipairs(child.Parent:GetChildren()) do
                 for _,reference in ipairs(slot:GetChildren()) do cacheReference(reference) end
             end
-        elseif inventoryEnabled and (child.Name=="EquipButton" or child.Name=="TouchBinding") then
-            queueGuiRecovery(not targetsScanned)
-        end
+        elseif child.Name=="EquipButton" or child.Name=="TouchBinding" then queueGuiRecovery(false) end
     end)
 end
 
 local inventoryToggle=addToggle(section,"Increase Inventory",inventoryEnabled,function(state)
     inventoryEnabled=state
     SetCfg("inventoryUnlimiterEnabled",state)
-    if state then
-        lastTargetScan=-math.huge
-        scanRetryDelay=2
-        requestRecovery(true)
+    if state then requestRecovery(true)
     else
         restoreInventoryLimits()
         if not autoGetTools then cancelRecovery() end
@@ -18461,10 +18345,8 @@ local autoToggle=addToggle(section,"Auto Get Tools",autoGetTools,function(state)
     if state then
         if not wasEnabled then cancelToyRequests() end
         requestRecovery(false)
-        if observedGui then task.defer(function() scanSlotReferences(observedGui) end) end
     else
         cancelToyRequests()
-        clearReferences()
         for slot,order in pairs(originalSlotOrders) do pcall(function() slot.LayoutOrder=order end) end
         table.clear(originalSlotOrders)
         if not inventoryEnabled then cancelRecovery() end
@@ -18501,7 +18383,6 @@ lifecycleConnections[#lifecycleConnections+1]=player.CharacterAdded:Connect(func
     removingCharacter=nil
     watchCharacter(char)
     watchBackpack(player:FindFirstChildOfClass("Backpack"))
-    queueGuiRecovery(true)
     requestRecovery(false)
 end)
 lifecycleConnections[#lifecycleConnections+1]=player.ChildAdded:Connect(function(child)
@@ -18524,6 +18405,7 @@ if inventoryEnabled or autoGetTools then task.defer(function() requestRecovery(f
 
 env.VisualsV2Runtime.InventoryTools={GetDiagnostics=function() return table.clone(perf) end}
 env.VisualsV2Runtime.RegisterReset(function()
+    alive=false
     guiRefreshToken=guiRefreshToken+1
     cancelRecovery()
     inventoryToggle:Set(false)
@@ -18533,16 +18415,12 @@ env.VisualsV2Runtime.RegisterReset(function()
     restoreInventoryLimits()
     for slot,order in pairs(originalSlotOrders) do pcall(function() slot.LayoutOrder=order end) end
     table.clear(originalSlotOrders)
-    clearReferences()
-    -- Deleting saved settings resets the live controls too. Keep their
-    -- lifecycle watchers available so the user can enable them again.
-    if runtimeAlive then return end
-    alive=false
     disconnectAll(lifecycleConnections)
     disconnectAll(backpackConnections)
     disconnectAll(characterConnections)
     disconnectAll(toyConnections)
     disconnectAll(guiConnections)
+    clearReferences()
 end)
 end)()
 
@@ -18650,7 +18528,7 @@ local function ensureMonitorStatistic()
     SetCfg("vv2FpsPingShowFps",true)
     pcall(function()
         shared.Notify("Error: Enable at least one statistic, or turn off Monitor UI. FPS has been enabled.",4)
-end)
+    end)
     task.defer(function()
         if showFps and fpsToggle then fpsToggle:Set(true) end
     end)
@@ -19145,7 +19023,7 @@ local ok,present=pcall(exists,CFG_FILE)
 if ok and present then sawSettingsFile=true end
 
 task.spawn(function()
-    while runtimeAlive and env.VisualsV2ConfigWatchToken==myWatchToken do
+    while env.VisualsV2ConfigWatchToken==myWatchToken do
         local checkOk,filePresent=pcall(exists,CFG_FILE)
 
         if checkOk and filePresent then
@@ -19162,7 +19040,16 @@ task.spawn(function()
             end
             configResetting=false
 
-            if saveConfig() then sawSettingsFile=true end
+            if type(write)=="function" then
+                pcall(function()
+                    write(CFG_FILE,HttpService:JSONEncode({
+                        version=2,
+                        settings={},
+                        positions={},
+                    }))
+                end)
+                sawSettingsFile=true
+            end
 
             pcall(function()
                 shared.Notify("VisualsV2 settings reset",2)
@@ -19189,3 +19076,6 @@ creditsSection:AddLabel("anya_bts — 1067515726677684324")
 end)()
 
 saveConfig()
+
+-- Initial control restoration finishes before enabling UI click feedback.
+task.defer(function() task.defer(function() controlsReady=true end) end)
