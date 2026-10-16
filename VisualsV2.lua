@@ -318,7 +318,7 @@ end
 
 loadConfig()
 
-env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-16-ui-perf-5"}
+env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-16-ui-integration-6"}
 env.VisualsV2Runtime.RegisterReset = function(callback)
     if type(callback) == "function" then table.insert(env.VisualsV2Runtime.Resetters, callback) end
 end
@@ -4727,9 +4727,19 @@ local function exactShootText(value)
 end
 local function isTarget(item)
     if not item or not item:IsA("GuiButton") then return false end
+    if identifiedButtons[item] then return true end
     if item:IsA("TextButton") and exactShootText(item.Text) then return true end
-    for _,label in ipairs(item:GetDescendants()) do
-        if label:IsA("TextLabel") and exactShootText(label.Text) then return true end
+    local pending={{item,0}}
+    local index=1
+    while pending[index] and index<=32 do
+        local object,depth=pending[index][1],pending[index][2];index=index+1
+        if depth>0 and object:IsA("TextLabel") and exactShootText(object.Text) then return true end
+        if depth<3 then
+            for _,child in ipairs(object:GetChildren()) do
+                if #pending>=32 then break end
+                pending[#pending+1]={child,depth+1}
+            end
+        end
     end
     -- Only trust a button identified in this run; an old marker may have been
     -- placed on an add-on setting by the former substring search.
@@ -4956,7 +4966,10 @@ end}
 
 local customToggle=addToggle(section,"Enable Button Customization",customEnabled,function(v)
     customEnabled=v; SetCfg("shootCustomizationEnabled",v)
-    if v then update() else restoreOriginal(); dragging=false; dragInput=nil; stopKeeper() end
+    if v then
+        local found=findButton();if found then bind(found) end
+        update()
+    else restoreOriginal(); dragging=false; dragInput=nil; stopKeeper() end
 end)
 section:AddSlider("Button Width",40,300,buttonWidth,function(v) buttonWidth=v; SetCfg("shootButtonWidth",v); update() end)
 section:AddSlider("Button Height",20,150,buttonHeight,function(v) buttonHeight=v; SetCfg("shootButtonHeight",v); update() end)
@@ -4972,23 +4985,23 @@ section:AddButton("Reset Shoot Murderer Button Position",resetShootMurdererPosit
 discoveryConnections[#discoveryConnections+1]=UserInputService.InputBegan:Connect(function(input) lastInput=input end)
 local discoveryQueued=false
 local function discoverLater()
-    if discoveryQueued or not runtimeAlive then return end
+    if discoveryQueued or not runtimeAlive or not customEnabled then return end
     discoveryQueued=true
     task.delay(0.15,function()
         discoveryQueued=false
-        if not runtimeAlive then return end
+        if not runtimeAlive or not customEnabled then return end
         local found=findButton();if found then bind(found) end
     end)
 end
 task.defer(function()
     task.wait(0.5)
     if not runtimeAlive then return end
-    local found=findButton(); if found then bind(found) end
+    if customEnabled then local found=findButton(); if found then bind(found) end end
     for _,root in ipairs(roots()) do
         pcall(function()
             discoveryConnections[#discoveryConnections+1]=root.DescendantAdded:Connect(function(item)
-                if not runtimeAlive then return end
-                if item.Name=="Identity" or item:IsA("GuiButton") or item:IsA("TextLabel") then discoverLater() end
+                if not runtimeAlive or not customEnabled then return end
+                if item.Name=="Identity" or (item:IsA("TextButton") or item:IsA("TextLabel")) and exactShootText(item.Text) then discoverLater() end
             end)
         end)
     end
@@ -10799,7 +10812,7 @@ env.VisualsV2Runtime.ClientWeaponSkins={
     end,
     GetNativeHolster=function(kind) return nativeHolster(player.Character,kind) end,
     GetDiagnostics=function()
-        local report={build="2026-10-16-ui-perf-5",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
+        local report={build="2026-10-16-ui-integration-6",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
         for kind,settings in pairs(kinds) do
             local entry=catalog[kind][settings.selected]
             local key=entry and cacheKey(entry)
@@ -12612,12 +12625,8 @@ local function bindGui()
     table.clear(hudRoots)
     playerGui=LocalPlayer:FindFirstChildOfClass("PlayerGui")
     if playerGui then hudRoots[playerGui]=true end
-    pcall(function() hudRoots[game:GetService("CoreGui")]=true end)
-    local getUI=gethui or env.gethui
-    if type(getUI)=="function" then
-        local ok,root=pcall(getUI)
-        if ok and typeof(root)=="Instance" then hudRoots[root]=true end
-    end
+    -- Tool.TextureId already feeds Roblox's backpack icons. This observer only
+    -- needs the game's HUD; traversing ODH's menu has no cosmetic purpose.
     for root in pairs(hudRoots) do
         local ok,objects=pcall(function() return root:GetDescendants() end)
         if ok then
@@ -13138,20 +13147,27 @@ end
 local function watchImages(record,target)
     local viewport=target
     while viewport and viewport~=record.main and not viewport:IsA("ScrollingFrame") do viewport=viewport.Parent end
-    if not viewport or not viewport:IsA("ScrollingFrame") then return nil end
+    if not viewport or not viewport:IsA("GuiObject") then viewport=record.main end
+    local function changed()
+        record.layoutRetries=0
+        if record.imageQueued then return end
+        record.imageQueued=true
+        task.delay(0.04,function()
+            record.imageQueued=false
+            if alive and runtimeAlive and records[record.main]==record and loadVisibleImages then loadVisibleImages(record) end
+        end)
+    end
     if not record.imageWatches[viewport] then
         record.imageWatches[viewport]=true
-        local function changed()
-            if record.imageQueued then return end
-            record.imageQueued=true
-            task.delay(0.04,function()
-                record.imageQueued=false
-                if alive and runtimeAlive and records[record.main]==record and loadVisibleImages then loadVisibleImages(record) end
-            end)
-        end
-        for _,property in ipairs({"CanvasPosition","AbsoluteSize"}) do
+        local properties=viewport:IsA("ScrollingFrame") and {"CanvasPosition","AbsoluteSize"} or {"AbsoluteSize"}
+        for _,property in ipairs(properties) do
             record.imageConnections[#record.imageConnections+1]=viewport:GetPropertyChangedSignal(property):Connect(changed)
         end
+    end
+    local layout=target:FindFirstChildWhichIsA("UIGridLayout") or target:FindFirstChildWhichIsA("UIListLayout")
+    if layout and not record.imageWatches[layout] then
+        record.imageWatches[layout]=true
+        record.imageConnections[#record.imageConnections+1]=layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(changed)
     end
     return viewport
 end
@@ -13224,6 +13240,9 @@ mountCard=function(record,card)
         end
         frame.Name="VisualsV2_CardContents"
         frame.Size=UDim2.fromScale(1,1);frame.Position=UDim2.new();frame.AnchorPoint=Vector2.new()
+        for _,constraint in ipairs(frame:GetChildren()) do
+            if constraint:IsA("UIAspectRatioConstraint") or constraint:IsA("UISizeConstraint") then constraint:Destroy() end
+        end
         view={frame=frame}
         view.connection=button.Activated:Connect(function()
             local item=view.card
@@ -13351,6 +13370,7 @@ loadVisibleImages=function(record)
     local openTargets={}
     local desired={}
     local pending={}
+    local zeroSize=0
     for _,card in pairs(record.cards) do
         if openTargets[card.target]==nil then openTargets[card.target]=visible(card.target) end
         if openKinds[card.kind] and openTargets[card.target] and card.frame.Parent==card.target and card.frame.Visible then
@@ -13362,6 +13382,7 @@ loadVisibleImages=function(record)
                 local margin=math.max(size.Y,64)
                 within=size.Y>0 and bounds.Y>0 and p.Y+size.Y>=origin.Y-margin and p.Y<=origin.Y+bounds.Y+margin
                     and p.X+size.X>=origin.X-margin and p.X<=origin.X+bounds.X+margin
+                if size.Y<=0 or size.X<=0 then zeroSize=zeroSize+1 end
             end
             if within then
                 desired[card]=true
@@ -13381,12 +13402,21 @@ loadVisibleImages=function(record)
             if stats.liveCards>=96 then return end
             local card=pending[index];index=index+1
             if card.frame.Parent==card.target and card.frame.Visible and enabled(card.kind) then
-                mountCard(record,card);count=count+1
+                local ok,reason=pcall(mountCard,record,card)
+                if not ok then stats.error=tostring(reason);record.waiting[card.kind]="Item card could not render: "..tostring(reason) end
+                count=count+1
             end
         end
         if index<=#pending then task.delay(0.02,populate) end
     end
     if #pending>0 then task.defer(populate) end
+    record.zeroSizeSlots=zeroSize
+    if zeroSize>0 and (record.layoutRetries or 0)<8 then
+        record.layoutRetries=(record.layoutRetries or 0)+1
+        task.delay(0.1,function()
+            if alive and runtimeAlive and records[record.main]==record and record.renderToken==token then loadVisibleImages(record) end
+        end)
+    end
 end
 
 local function updatePreviews(record)
@@ -13483,6 +13513,12 @@ local function addCard(record,kind,entry)
     -- is pooled and exists only for the portion of the list on screen.
     local frame=Instance.new("Frame")
     frame.Size=template.Size;frame.BackgroundTransparency=1;frame.BorderSizePixel=0
+    frame.SizeConstraint=template.SizeConstraint;frame.ZIndex=template.ZIndex
+    for _,constraint in ipairs(template:GetChildren()) do
+        if constraint:IsA("UIAspectRatioConstraint") or constraint:IsA("UISizeConstraint") then
+            constraint:Clone().Parent=frame
+        end
+    end
     frame:SetAttribute(MARKER,true)
     frame.Name="VisualsV2_"..kind.."_"..entry.id
     frame:SetAttribute("WeaponID",entry.id)
@@ -13827,7 +13863,7 @@ env.VisualsV2Runtime.VisualWeaponInventory={
             for _ in pairs(record.cards) do count=count+1 end
             local live=0;for _ in pairs(record.activeCards) do live=live+1 end
             report.inventories[#report.inventories+1]={name=record.main.Parent and record.main.Parent.Name,
-                open=record.open,cards=count,liveCards=live,paused=record.paused==true,
+                open=record.open,cards=count,liveCards=live,paused=record.paused==true,zeroSizeSlots=record.zeroSizeSlots or 0,
                 building=record.building,trading=record.trading==true,waiting=table.clone(record.waiting)}
         end
         return report
@@ -15329,6 +15365,7 @@ local fontNames={"SourceSansBold (Original)","Gotham","Arcade","Arial","ArialBol
 -- Source / licensing: https://www.dafont.com/starborn.font
 local STARBORN_PIXELS=48
 local STARBORN_LINE_HEIGHT=54
+local STARBORN_MAX_SPRITES=UserInputService.TouchEnabled and 600 or 1000
 local STARBORN_GLYPHS={["32"]={4,4,23,0,0,47,23.4219},["33"]={84,4,20,45,0,2,20.0},["34"]={164,4,25,42,0,5,25.3125},["35"]={244,4,46,42,0,6,45.8281},["36"]={324,4,41,53,0,1,41.375},["37"]={404,4,36,36,0,13,35.7031},["38"]={484,4,41,45,0,4,40.625},["39"]={564,4,13,43,0,4,13.2969},["40"]={644,4,20,44,0,4,20.3906},["41"]={724,4,20,43,0,4,20.1094},["42"]={804,4,33,38,0,9,32.9844},["43"]={884,4,30,31,0,16,30.2344},["44"]={4,84,17,21,0,29,16.8281},["45"]={84,84,27,25,0,22,26.9531},["46"]={164,84,17,15,0,32,17.375},["47"]={244,84,28,38,0,9,28.0625},["48"]={324,84,44,37,0,11,44.0156},["49"]={404,84,21,38,0,10,21.2188},["50"]={484,84,38,42,0,6,37.625},["51"]={564,84,40,43,0,7,40.3594},["52"]={644,84,39,40,0,8,38.7188},["53"]={724,84,34,41,0,6,34.0625},["54"]={804,84,33,40,0,7,32.9844},["55"]={884,84,37,41,0,7,36.7969},["56"]={4,164,34,44,0,5,34.3438},["57"]={84,164,32,41,0,7,32.1562},["58"]={164,164,13,28,0,19,13.2969},["59"]={244,164,17,31,0,20,16.5781},["60"]={324,164,29,33,0,14,28.875},["61"]={404,164,26,36,0,11,25.8594},["62"]={484,164,27,35,0,12,26.6719},["63"]={564,164,35,48,0,-1,35.4375},["64"]={644,164,42,42,0,5,42.0},["65"]={724,164,41,39,0,11,41.1875},["66"]={804,164,45,44,0,8,45.0469},["67"]={884,164,37,39,0,9,36.7969},["68"]={4,244,39,40,0,11,39.2656},["69"]={84,244,39,41,0,10,39.2656},["70"]={164,244,31,40,0,10,30.7812},["71"]={244,244,42,39,0,10,42.2656},["72"]={324,244,42,39,0,9,41.75},["73"]={404,244,14,36,0,11,13.8281},["74"]={484,244,34,36,0,12,33.8438},["75"]={564,244,36,41,0,9,35.9844},["76"]={644,244,28,40,0,8,27.7812},["77"]={724,244,51,40,0,9,51.1406},["78"]={804,244,39,40,0,8,39.1719},["79"]={884,244,44,37,0,11,44.0156},["80"]={4,324,40,44,0,7,40.2969},["81"]={84,324,44,39,0,12,44.1562},["82"]={164,324,42,42,0,8,42.0781},["83"]={244,324,41,42,0,7,41.375},["84"]={324,324,31,39,0,8,30.5156},["85"]={404,324,42,38,0,9,41.7188},["86"]={484,324,41,37,0,10,40.9062},["87"]={564,324,48,37,0,10,48.2812},["88"]={644,324,35,41,0,9,35.4375},["89"]={724,324,38,45,0,6,37.625},["90"]={804,324,40,40,0,7,40.0781},["91"]={884,324,23,42,0,6,23.3906},["92"]={4,404,25,40,0,7,25.3125},["93"]={84,404,23,42,0,6,22.8594},["94"]={164,404,33,41,0,6,32.9844},["95"]={244,404,39,13,0,36,38.9844},["97"]={324,404,47,44,0,4,46.6875},["98"]={404,404,45,44,0,8,45.0469},["99"]={484,404,37,39,0,9,36.7969},["100"]={564,404,39,40,0,11,39.2656},["101"]={644,404,39,41,0,10,39.2656},["102"]={724,404,31,40,0,10,30.7812},["103"]={804,404,42,39,0,10,42.2656},["104"]={884,404,42,39,0,9,41.75},["105"]={4,484,18,47,0,4,17.6562},["106"]={84,484,34,36,0,12,33.8438},["107"]={164,484,36,41,0,9,35.9844},["108"]={244,484,28,40,0,8,27.7812},["109"]={324,484,51,40,0,9,51.1406},["110"]={404,484,39,40,0,8,39.1719},["111"]={484,484,44,38,0,10,44.0156},["112"]={564,484,40,44,0,7,40.2969},["113"]={644,484,44,39,0,12,44.1562},["114"]={724,484,42,42,0,8,42.0781},["115"]={804,484,41,42,0,7,41.375},["116"]={884,484,31,39,0,8,30.5156},["117"]={4,564,42,38,0,9,41.7188},["118"]={84,564,41,37,0,10,40.9062},["119"]={164,564,48,37,0,10,48.2812},["120"]={244,564,35,41,0,9,35.4375},["121"]={324,564,38,45,0,6,37.625},["122"]={404,564,40,40,0,7,40.0781},["124"]={484,564,15,40,0,7,14.9375},["126"]={564,564,37,30,0,17,36.5156},["162"]={644,564,28,37,0,11,28.0625},["163"]={724,564,38,42,0,7,37.9062},["8216"]={804,564,17,42,0,5,16.8281},["8217"]={884,564,17,42,0,5,16.8281},["8220"]={4,644,37,42,0,5,37.1094},["8221"]={84,644,37,42,0,5,37.1094},["8230"]={164,644,43,14,0,33,43.2031},["8364"]={244,644,42,40,0,9,42.0},["8482"]={324,644,17,26,0,21,16.8281}}
 local starbornSpriteCount=0
 local starbornAsset=nil
@@ -15479,6 +15516,7 @@ local function starbornVisible(object)
     while current do
         if current:IsA("GuiObject") then
             if not current.Visible then return false end
+            if current:IsA("CanvasGroup") and current.GroupTransparency>=1 then return false end
             if current~=object and current.ClipsDescendants then
                 local q,bounds=current.AbsolutePosition,current.AbsoluteSize
                 if p.X+size.X<q.X or p.X>q.X+bounds.X or p.Y+size.Y<q.Y or p.Y>q.Y+bounds.Y then return false end
@@ -15512,7 +15550,7 @@ local function starbornLines(text,size,width,wrapped)
     end
     return lines,glyphCount,scale
 end
-local function renderStarborn(object,record)
+local function drawStarborn(object,record)
     if object:IsA("TextBox") or not starbornVisible(object) then clearStarborn(object,record);return end
     local atlas=loadStarborn()
     if not atlas then clearStarborn(object,record);return end
@@ -15535,7 +15573,7 @@ local function renderStarborn(object,record)
     if record.starbornFrame and record.starbornSignature==signature then return end
     local alpha=record.starbornAlpha or object.TextTransparency
     local allocated=record.starbornGlyphCount or 0
-    if starbornSpriteCount+math.max(0,count-allocated)>1800 then clearStarborn(object,record);return end
+    if starbornSpriteCount+math.max(0,count-allocated)>STARBORN_MAX_SPRITES then clearStarborn(object,record);return end
     record.starbornAlpha=alpha
     local frame=record.starbornFrame
     if not frame then
@@ -15576,6 +15614,35 @@ local function renderStarborn(object,record)
     if frame.Parent~=object then frame.Parent=object end
     record.starbornAppliedAlpha=1
     writeProperty(object,record,"TextTransparency",1)
+end
+
+local fontRenderPending={}
+local fontRenderQueue={}
+local fontRenderRunning=false
+local function renderStarborn(object,record)
+    if not fontsEnabled or selectedFont~="Starborn" then return end
+    if not starbornVisible(object) then clearStarborn(object,record);return end
+    if fontRenderPending[object] then return end
+    fontRenderPending[object]=record;fontRenderQueue[#fontRenderQueue+1]=object
+    if fontRenderRunning then return end
+    fontRenderRunning=true
+    task.defer(function()
+        local index=1
+        while alive and runtimeAlive and index<=#fontRenderQueue do
+            local started=os.clock()
+            local count=0
+            repeat
+                local item=fontRenderQueue[index];index=index+1
+                local saved=fontRenderPending[item];fontRenderPending[item]=nil
+                if saved and records[item]==saved and item.Parent and fontsEnabled and selectedFont=="Starborn" then
+                    pcall(drawStarborn,item,saved)
+                end
+                count=count+1
+            until index>#fontRenderQueue or count>=4 or os.clock()-started>=0.0015
+            if index<=#fontRenderQueue then task.wait() end
+        end
+        table.clear(fontRenderQueue);table.clear(fontRenderPending);fontRenderRunning=false
+    end)
 end
 
 local function applyFont(object,record)
@@ -15775,7 +15842,7 @@ end)
 
 env.VisualsV2Runtime.TextFonts={GetDiagnostics=function()
     return {enabled=fontsEnabled,font=selectedFont,starbornAssetReady=starbornAsset~=nil,
-        glyphSprites=starbornSpriteCount,availableFonts=#fontNames}
+        glyphSprites=starbornSpriteCount,glyphBudget=STARBORN_MAX_SPRITES,queuedLabels=#fontRenderQueue,availableFonts=#fontNames}
 end}
 env.VisualsV2Runtime.RegisterReset(function()
     resetting=true
@@ -18393,7 +18460,12 @@ local hotbarKeysBound=false
 local toolSequence=0
 local refreshHotbar
 local nativeSlotFor
+local nativeHudContext
 local nativeBars={}
+local nativeImages=setmetatable({}, {__mode="k"})
+local nativeIconSlots=setmetatable({}, {__mode="k"})
+local nativeIconSlot
+local nativeHideQueued=false
 local coreBackpackSaved,coreBackpackConnection
 local ACTION_PREFIX="VisualsV2_ExpandedTool_"
 local hotbarKeys={Enum.KeyCode.One,Enum.KeyCode.Two,Enum.KeyCode.Three,Enum.KeyCode.Four,Enum.KeyCode.Five,
@@ -18416,6 +18488,23 @@ end
 local function hideNativeSlots()
     hideCoreBackpack()
     local targets={}
+    local icons={}
+    local function addIcon(value)
+        value=tostring(value or ""):lower()
+        local key=value:match("rbxassetid://(%d+)") or value:match("[?&]id=(%d+)") or value:match("^(%d+)$") or value
+        if key~="" then icons[key]=true end
+    end
+    local presentation=env.VisualsV2Runtime.WeaponPresentation
+    for _,container in pairs({player.Character,getBackpack()}) do
+        for _,tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") then
+                addIcon(tool.TextureId)
+                if presentation and presentation.GetNativeIcon then
+                    local ok,value=pcall(presentation.GetNativeIcon,tool);if ok then addIcon(value) end
+                end
+            end
+        end
+    end
     for reference,connection in pairs(slotReferences) do
         if not reference.Parent then connection:Disconnect();slotReferences[reference]=nil
         else
@@ -18424,7 +18513,16 @@ local function hideNativeSlots()
         end
     end
     for bar in pairs(nativeBars) do
-        if bar.Parent then targets[bar]=true else nativeBars[bar]=nil end
+        if bar.Parent and (not nativeHudContext or nativeHudContext(bar)) then targets[bar]=true else nativeBars[bar]=nil end
+    end
+    if nativeIconSlot then
+        for object in pairs(nativeImages) do
+            if not object.Parent then nativeImages[object]=nil;nativeIconSlots[object]=nil
+            else
+                local slot=nativeIconSlot(object,icons)
+                if slot then targets[slot]=true end
+            end
+        end
     end
     for slot,record in pairs(hiddenSlots) do
         if not targets[slot] then
@@ -18639,11 +18737,14 @@ end
 
 local nativeBarNames={hotbar=true,toolbar=true,toolslots=true,toolinventory=true,toolbarframe=true,
     backpack=true,backpackframe=true,itembar=true,toybar=true}
-local function nativeHudContext(object)
+nativeHudContext=function(object)
     local current=object
     while current and current~=observedGui do
         local name=current.Name:lower()
         if name:find("trade",1,true) or name:find("trading",1,true) then return false end
+        if name=="shop" or name=="spectate" or name=="spectating" or name=="roundend" or name=="roundresults"
+            or name=="victory" or name=="results" or name=="emotes" or name=="emotemenu"
+            or name=="notifications" then return false end
         if current.Name:sub(1,10)=="VisualsV2_" or current:GetAttribute("VisualsV2_InventoryVisual") then return false end
         if current.Name=="Inventory" or current.Name=="Inventory2" then
             local main=current:FindFirstChild("Main") or current
@@ -18652,6 +18753,43 @@ local function nativeHudContext(object)
         current=current.Parent
     end
     return current==observedGui
+end
+nativeIconSlot=function(object,icons)
+    if not nativeHudContext(object) then nativeIconSlots[object]=nil;return nil end
+    local value=tostring(object.Image or ""):lower()
+    local key=value:match("rbxassetid://(%d+)") or value:match("[?&]id=(%d+)") or value:match("^(%d+)$") or value
+    if not icons[key] then nativeIconSlots[object]=nil;return nil end
+    local previous=nativeIconSlots[object]
+    if previous and previous.Parent and nativeHudContext(previous) then return previous end
+    local camera=workspace.CurrentCamera
+    if not camera then return nil end
+    local screen=camera.ViewportSize
+    local p,size=object.AbsolutePosition,object.AbsoluteSize
+    local x,y=p.X+size.X*0.5,p.Y+size.Y*0.5
+    if size.X<8 or size.Y<8 or y<screen.Y*0.72 or x<screen.X*0.18 or x>screen.X*0.82 then return nil end
+    local slot=object
+    local current=object.Parent
+    while current and current~=observedGui and current:IsA("GuiObject") do
+        local name=current.Name:lower():gsub("[^%w]","")
+        local bounds=current.AbsoluteSize
+        if name=="inventory" or nativeBarNames[name] then slot=current;break end
+        if bounds.X>screen.X*0.78 or bounds.Y>screen.Y*0.35 then break end
+        slot=current
+        current=current.Parent
+    end
+    nativeIconSlots[object]=slot
+    return slot
+end
+local function cacheNativeImage(object)
+    if not (object:IsA("ImageLabel") or object:IsA("ImageButton")) or not nativeHudContext(object) then return end
+    nativeImages[object]=true
+    if inventoryEnabled and not nativeHideQueued then
+        nativeHideQueued=true
+        task.defer(function()
+            nativeHideQueued=false
+            if alive and runtimeAlive and inventoryEnabled and hotbarGui then hideNativeSlots() end
+        end)
+    end
 end
 local function cacheNativeBar(object)
     if not object:IsA("GuiObject") or object:IsA("GuiButton") then return end
@@ -18695,6 +18833,7 @@ local function clearReferences()
     for _,connection in pairs(slotReferences) do connection:Disconnect() end
     table.clear(slotReferences)
     table.clear(nativeBars)
+    table.clear(nativeImages);table.clear(nativeIconSlots)
 end
 local function scanSlotReferences(gui)
     perf.guiScans=perf.guiScans+1
@@ -18711,6 +18850,7 @@ local function scanSlotReferences(gui)
         end
         if not skip then
             cacheNativeBar(object)
+            cacheNativeImage(object)
             cacheReference(object)
             for _,child in ipairs(object:GetChildren()) do pending[#pending+1]=child end
         end
@@ -18926,6 +19066,7 @@ local function watchPlayerGui(gui)
     end)
     guiConnections[#guiConnections+1]=gui.DescendantAdded:Connect(function(child)
         cacheNativeBar(child)
+        cacheNativeImage(child)
         if child:IsA("ObjectValue") then cacheReference(child)
         elseif (child:IsA("UIListLayout") or child:IsA("UIGridLayout")) and child.Parent then
             for _,slot in ipairs(child.Parent:GetChildren()) do
@@ -19032,7 +19173,15 @@ lifecycleConnections[#lifecycleConnections+1]=RunService.Heartbeat:Connect(funct
     end
 end)
 
-env.VisualsV2Runtime.InventoryTools={GetDiagnostics=function() return table.clone(perf) end}
+env.VisualsV2Runtime.InventoryTools={GetDiagnostics=function()
+    local report=table.clone(perf)
+    report.hiddenNativeSlots={}
+    for slot in pairs(hiddenSlots) do
+        if slot.Parent then report.hiddenNativeSlots[#report.hiddenNativeSlots+1]=slot:GetFullName() end
+    end
+    report.hotbarVisible=hotbarGui and hotbarGui.Enabled or false
+    return report
+end}
 env.VisualsV2Runtime.RegisterReset(function()
     alive=false
     guiRefreshToken=guiRefreshToken+1
