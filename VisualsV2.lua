@@ -318,7 +318,7 @@ end
 
 loadConfig()
 
-env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-16-odh-clutch-4"}
+env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-16-ui-perf-5"}
 env.VisualsV2Runtime.RegisterReset = function(callback)
     if type(callback) == "function" then table.insert(env.VisualsV2Runtime.Resetters, callback) end
 end
@@ -10799,7 +10799,7 @@ env.VisualsV2Runtime.ClientWeaponSkins={
     end,
     GetNativeHolster=function(kind) return nativeHolster(player.Character,kind) end,
     GetDiagnostics=function()
-        local report={build="2026-10-16-odh-clutch-4",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
+        local report={build="2026-10-16-ui-perf-5",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
         for kind,settings in pairs(kinds) do
             local entry=catalog[kind][settings.selected]
             local key=entry and cacheKey(entry)
@@ -11537,9 +11537,15 @@ local lastError=nil
 local motionMode="none"
 local nativeAnchor=nil
 local petHalfHeight=.5
+local hiddenPet,hiddenPetConnection
+local nextSpawnAttempt=0
+local raycastParams,groundY
+local groundAt=-math.huge
 for id,data in pairs(originals.Metadata.Pets) do catalog[id]={id=id,name=data.name or id,data=data} end
 if not catalog[selected] then selected="None" end
 local function restoreNative()
+    if hiddenPetConnection then hiddenPetConnection:Disconnect();hiddenPetConnection=nil end
+    hiddenPet=nil
     for object,record in pairs(hidden) do pcall(function() object[record.property]=record.value end) end
     table.clear(hidden)
 end
@@ -11550,23 +11556,38 @@ local function nativePet()
 end
 local function hideNative(pet)
     if not pet then return end
-    local objects={pet}
-    for _,object in ipairs(pet:GetDescendants()) do objects[#objects+1]=object end
-    for _,object in ipairs(objects) do
-        local property=object:IsA("BasePart") and "LocalTransparencyModifier" or object:IsA("BillboardGui") and "Enabled"
+    local function cache(object)
+        local property=object:IsA("BasePart") and "LocalTransparencyModifier"
+            or (object:IsA("BillboardGui") or object:IsA("ParticleEmitter") or object:IsA("Trail")
+                or object:IsA("Beam") or object:IsA("Light")) and "Enabled"
         if property then
             if not hidden[object] then hidden[object]={property=property,value=object[property]} end
-            if property=="Enabled" then object[property]=false else object[property]=1 end
+        end
+    end
+    if hiddenPet~=pet then
+        restoreNative();hiddenPet=pet
+        cache(pet)
+        for _,object in ipairs(pet:GetDescendants()) do cache(object) end
+        hiddenPetConnection=pet.DescendantAdded:Connect(cache)
+    end
+    for object,record in pairs(hidden) do
+        if not object.Parent then hidden[object]=nil
+        else
+            local desired=1
+            if record.property=="Enabled" then desired=false end
+            if object[record.property]~=desired then object[record.property]=desired end
         end
     end
 end
 local function clear()
     if model then model:Destroy() end
     model=nil;root=nil;parts=nil;follow=nil;nativeAnchor=nil
-    velocity=Vector3.new();motionMode="none"
+    velocity=Vector3.new();motionMode="none";raycastParams=nil;groundY=nil;groundAt=-math.huge
     restoreNative()
 end
 local function spawnModel()
+    if os.clock()<nextSpawnAttempt then return false end
+    nextSpawnAttempt=os.clock()+3
     local source=originals.GetPet(selected)
     if not source then lastError="Original pet template unavailable";return false end
     model=source:Clone();model.Name="VisualsV2_ClientPet"
@@ -11579,7 +11600,7 @@ local function spawnModel()
     for _,part in ipairs(model:GetDescendants()) do
         if part:IsA("BasePart") then
             part.Anchored=true;part.CanCollide=false;part.CanTouch=false;part.CanQuery=false
-            part.Massless=true;part.LocalTransparencyModifier=0
+            part.Massless=true;part.LocalTransparencyModifier=0;part.CastShadow=false
             local relative=origin:ToObjectSpace(part.CFrame)
             parts[#parts+1]={part=part,relative=relative}
             bottom=math.min(bottom,relative.Position.Y-part.Size.Y*.5)
@@ -11609,14 +11630,18 @@ local function springGoal(body,floating,dt)
     local position=body.Position or body.CFrame.Position
     local target=position+offset+Vector3.new(0,floating and 1.1+math.sin(os.clock()*2.5)*.25 or -2,0)
     if not floating then
-        pcall(function()
-            local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
-            local filters={character,model}
-            local pet=nativePet();if pet then filters[#filters+1]=pet end
-            params.FilterDescendantsInstances=filters
-            local hit=workspace:Raycast(target+Vector3.new(0,8,0),Vector3.new(0,-30,0),params)
-            if hit then target=Vector3.new(target.X,hit.Position.Y+petHalfHeight,target.Z) end
-        end)
+        if os.clock()-groundAt>=0.1 then
+            groundAt=os.clock();groundY=nil
+            pcall(function()
+                if not raycastParams then
+                    raycastParams=RaycastParams.new();raycastParams.FilterType=Enum.RaycastFilterType.Exclude
+                    raycastParams.FilterDescendantsInstances={character,model}
+                end
+                local hit=workspace:Raycast(target+Vector3.new(0,8,0),Vector3.new(0,-30,0),raycastParams)
+                if hit then groundY=hit.Position.Y+petHalfHeight end
+            end)
+        end
+        if groundY then target=Vector3.new(target.X,groundY,target.Z) end
     end
     local current=follow and follow.Position or target
     local distance=(target-current).Magnitude
@@ -11665,7 +11690,7 @@ local function update(dt)
 end
 local function refresh()
     if heartbeat then heartbeat:Disconnect();heartbeat=nil end
-    clear();character=LocalPlayer.Character
+    clear();character=LocalPlayer.Character;nextSpawnAttempt=0
     if not alive or not runtimeAlive or not enabled or selected=="None" then return end
     update(0)
     heartbeat=RunService.Heartbeat:Connect(function(dt) if alive and runtimeAlive then update(dt) end end)
@@ -12685,8 +12710,10 @@ local ownedCache={}
 local inventoryModule=nil
 local profile=nil
 local controls={}
-local stats={filterRuns=0,builds=0,cardsCreated=0,cardsRemoved=0,uiPolls=0,discoveries=0,publishYields=0,imagesLoaded=0}
+local stats={filterRuns=0,builds=0,cardsCreated=0,cardsRemoved=0,uiPolls=0,discoveries=0,publishYields=0,
+    imagesLoaded=0,liveCards=0,peakLiveCards=0,viewsCreated=0,viewsReused=0}
 local loadVisibleImages
+local unmountCard,mountCard
 local definitions={
     Gun={label=mmv and "Matrixscope / Voidscope" or "Guns",key=mmv and "clientScopeEnabled" or "clientGunEnabled",entries=skins.Catalog.Gun},
     Knife={label="Knives",key="clientKnifeEnabled",entries=skins.Catalog.Knife},
@@ -13168,10 +13195,62 @@ local function releaseCanvas(record,canvas)
     if canvas.target.Parent and canvas.target.CanvasSize==canvas.applied then canvas.target.CanvasSize=canvas.native end
 end
 
+local function destroyView(view)
+    if view.connection then view.connection:Disconnect() end
+    view.frame:Destroy()
+end
+unmountCard=function(record,card)
+    local view=card.view
+    if not view then return end
+    card.view=nil;view.card=nil;view.frame.Parent=nil
+    record.activeCards[card]=nil
+    stats.liveCards=math.max(0,stats.liveCards-1)
+    local pool=record.viewPools[card.kind]
+    if not pool then pool={};record.viewPools[card.kind]=pool end
+    if #pool<96 then pool[#pool+1]=view else destroyView(view) end
+end
+mountCard=function(record,card)
+    if card.view then return true end
+    if stats.liveCards>=96 then return false end
+    local pool=record.viewPools[card.kind]
+    local view=pool and table.remove(pool)
+    if view then stats.viewsReused=stats.viewsReused+1
+    else
+        local frame=cloneFrame(record.templates[card.kind])
+        local button=child(child(frame,"Container"),"ActionButton")
+        if not frame or not button or not button:IsA("GuiButton") then
+            if frame then frame:Destroy() end
+            return false
+        end
+        frame.Name="VisualsV2_CardContents"
+        frame.Size=UDim2.fromScale(1,1);frame.Position=UDim2.new();frame.AnchorPoint=Vector2.new()
+        view={frame=frame}
+        view.connection=button.Activated:Connect(function()
+            local item=view.card
+            if not item or not alive or not runtimeAlive or not enabled(item.kind) or inTrade()
+                or item.frame.Parent~=item.target or excludedInventory(item.frame) then return end
+            if selectItem(item.kind,item.id) then
+                for _,other in pairs(records) do other.filterDirty=true end
+                if schedule then schedule() end
+                pcall(shared.Notify,item.data.ItemName.." selected",2)
+            end
+        end)
+        stats.viewsCreated=stats.viewsCreated+1
+    end
+    fill(view.frame,card.data,false)
+    view.frame.Visible=true;view.card=card;card.view=view
+    record.activeCards[card]=true
+    view.frame.Parent=card.frame
+    stats.liveCards=stats.liveCards+1;stats.peakLiveCards=math.max(stats.peakLiveCards,stats.liveCards)
+    stats.imagesLoaded=stats.imagesLoaded+1
+    return true
+end
+
 local function removeCard(record,key)
     local card=record.cards[key]
     if not card then return end
     record.cards[key]=nil
+    unmountCard(record,card)
     stats.cardsRemoved=stats.cardsRemoved+1
     disconnect(card.connections)
     pcall(function() card.frame:Destroy() end)
@@ -13180,6 +13259,7 @@ end
 
 local function release(record)
     record.generation=record.generation+1
+    record.renderToken=(record.renderToken or 0)+1
     record.building=false
     restoreNativeOrders(record)
     for kind in pairs(record.previews) do removePreview(record,kind) end
@@ -13260,24 +13340,53 @@ local function categoryOpen(record,kind)
 end
 
 loadVisibleImages=function(record)
-    if not record.open then return end
+    record.renderToken=(record.renderToken or 0)+1
+    local token=record.renderToken
+    if not record.open or record.paused or inTrade() then
+        for card in pairs(record.activeCards) do unmountCard(record,card) end
+        return
+    end
+    local openKinds={}
+    for kind in pairs(definitions) do openKinds[kind]=enabled(kind) and categoryOpen(record,kind) end
+    local openTargets={}
+    local desired={}
+    local pending={}
     for _,card in pairs(record.cards) do
-        if not card.imageLoaded and card.frame.Parent==card.target and card.frame.Visible and categoryOpen(record,card.kind) then
-            local viewport=card.viewport
+        if openTargets[card.target]==nil then openTargets[card.target]=visible(card.target) end
+        if openKinds[card.kind] and openTargets[card.target] and card.frame.Parent==card.target and card.frame.Visible then
+            local viewport=card.viewport or record.main
             local within=true
             if viewport then
                 local p,size=card.frame.AbsolutePosition,card.frame.AbsoluteSize
                 local origin,bounds=viewport.AbsolutePosition,viewport.AbsoluteSize
                 local margin=math.max(size.Y,64)
-                within=size.Y>0 and p.Y+size.Y>=origin.Y-margin and p.Y<=origin.Y+bounds.Y+margin
+                within=size.Y>0 and bounds.Y>0 and p.Y+size.Y>=origin.Y-margin and p.Y<=origin.Y+bounds.Y+margin
                     and p.X+size.X>=origin.X-margin and p.X<=origin.X+bounds.X+margin
             end
-            if within and card.icon then
-                card.icon.Image=image(card.data.Image)
-                card.imageLoaded=true;stats.imagesLoaded=stats.imagesLoaded+1
+            if within then
+                desired[card]=true
+                if not card.view then pending[#pending+1]=card end
             end
         end
     end
+    for card in pairs(record.activeCards) do if not desired[card] then unmountCard(record,card) end end
+    table.sort(pending,function(a,b) return a.frame.LayoutOrder<b.frame.LayoutOrder end)
+    local index=1
+    local function populate()
+        if not alive or not runtimeAlive or records[record.main]~=record or record.renderToken~=token
+            or record.paused or not record.open then return end
+        local started=os.clock()
+        local count=0
+        while index<=#pending and count<8 and os.clock()-started<0.0015 do
+            if stats.liveCards>=96 then return end
+            local card=pending[index];index=index+1
+            if card.frame.Parent==card.target and card.frame.Visible and enabled(card.kind) then
+                mountCard(record,card);count=count+1
+            end
+        end
+        if index<=#pending then task.delay(0.02,populate) end
+    end
+    if #pending>0 then task.defer(populate) end
 end
 
 local function updatePreviews(record)
@@ -13291,7 +13400,7 @@ local function cacheFilters(record)
     record.filterConnections={}
     record.filterRefs={}
     local function changed()
-        record.filterDirty=true;record.dirty=true
+        record.filterDirty=true
         if schedule then schedule() end
     end
     for _,name in ipairs({"Weapons","Effects","Pets"}) do
@@ -13312,7 +13421,7 @@ local function cacheFilters(record)
         end
         if category then
             record.filterConnections[#record.filterConnections+1]=category:GetPropertyChangedSignal("Visible"):Connect(function()
-                record.dirty=true
+                record.filterDirty=true
                 if schedule then schedule() end
             end)
         end
@@ -13369,26 +13478,20 @@ local function addCard(record,kind,entry)
         template=cloneFrame(templateFor(record.main,kind))
         record.templates[kind]=template
     end
-    local frame=cloneFrame(template)
-    if not frame then record.waiting[kind]="Item template unavailable";return end
+    if not template then record.waiting[kind]="Item template unavailable";return end
+    -- A cheap slot preserves native grid order and scrolling; detailed item UI
+    -- is pooled and exists only for the portion of the list on screen.
+    local frame=Instance.new("Frame")
+    frame.Size=template.Size;frame.BackgroundTransparency=1;frame.BorderSizePixel=0
+    frame:SetAttribute(MARKER,true)
     frame.Name="VisualsV2_"..kind.."_"..entry.id
     frame:SetAttribute("WeaponID",entry.id)
     frame:SetAttribute("VisualKind",kind)
-    fill(frame,data,true)
     frame.LayoutOrder=sortRanks[kind..":"..entry.id] or 100000
-    local button=child(child(frame,"Container"),"ActionButton")
-    if not button or not button:IsA("GuiButton") then frame:Destroy();record.waiting[kind]="Item button unavailable";return end
     local card={kind=kind,id=entry.id,frame=frame,data=data,target=target,connections={},canvas=watchCanvas(record,target),
-        viewport=watchImages(record,target),icon=child(child(frame,"Container"),"Icon")}
+        viewport=watchImages(record,target)}
     record.cards[key]=card
     stats.cardsCreated=stats.cardsCreated+1
-    card.connections[1]=button.Activated:Connect(function()
-        if not alive or not runtimeAlive or not enabled(kind) or inTrade() or excludedInventory(frame) then return end
-        if selectItem(kind,entry.id) then
-            for _,other in pairs(records) do updatePreviews(other) end
-            pcall(shared.Notify,data.ItemName.." selected",2)
-        end
-    end)
     applyCardFilter(record,card)
     frame.Parent=record.staging
 
@@ -13459,10 +13562,13 @@ local function nativeOwns(kind,id)
     return cached[id]==true
 end
 
-local function suspendRecord(record)
-    if record.trading then return end
-    record.trading=true;record.generation=record.generation+1
+local function pauseRecord(record,trading)
+    record.trading=trading==true
+    if record.paused then return end
+    record.paused=true;record.generation=record.generation+1
+    record.renderToken=(record.renderToken or 0)+1
     record.building=false;record.dirty=true
+    for card in pairs(record.activeCards) do unmountCard(record,card) end
     for kind in pairs(record.previews) do removePreview(record,kind) end
     for button,list in pairs(nativeButtons) do
         if button:IsDescendantOf(record.main) or excludedInventory(button) then
@@ -13474,29 +13580,38 @@ local function suspendRecord(record)
         if card.frame.Parent==card.target then card.frame.Parent=record.staging end
     end
 end
+local function suspendRecord(record) pauseRecord(record,true) end
 local function updateRecord(record)
+    if not (enabled("Gun") or enabled("Knife") or enabled("Effects") or enabled("Pets")) then pauseRecord(record,false);return end
     if inTrade() or excludedInventory(record.main) then suspendRecord(record);return end
-    if record.trading then record.trading=false;record.dirty=true;record.filterDirty=true end
+    if record.paused then record.paused=false;record.trading=false;record.dirty=true;record.filterDirty=true end
     local isOpen=visible(record.main)
     if record.open~=isOpen then record.filterDirty=true end
     record.open=isOpen
-    if record.dirty then
+    if record.dirty and not record.building then
         table.clear(ownedCache)
         for key,card in pairs(record.cards) do
-            if not enabled(card.kind) or not card.frame.Parent or not card.target.Parent
+            if not card.frame.Parent or not card.target.Parent
                 or nativeOwns(card.kind,card.id) then removeCard(record,key) end
+            if record.cards[key] and not enabled(card.kind) then
+                unmountCard(record,card)
+                if card.frame.Parent~=record.staging then card.frame.Parent=record.staging end
+            end
         end
         observeNativeButtons(record)
     end
     if record.filterDirty then filterCards(record) end
-    if isOpen then loadVisibleImages(record)
-    else for kind in pairs(record.previews) do removePreview(record,kind) end end
-    if record.building or not record.dirty then return end
+    if not isOpen then
+        loadVisibleImages(record)
+        for kind in pairs(record.previews) do removePreview(record,kind) end
+    end
+    if record.building or not record.dirty or (record.buildFailures or 0)>3 then return end
     prepareSort()
     record.dirty=false;record.building=true;record.waiting={}
     stats.builds=stats.builds+1
     local generation=record.generation
     task.spawn(function()
+        local ok,reason=pcall(function()
         local count=0
         local started=os.clock()
         for _,kind in ipairs({"Gun","Knife","Effects","Pets"}) do
@@ -13511,7 +13626,7 @@ local function updateRecord(record)
                     if not nativeOwns(kind,entry.id) and not record.cards[kind..":"..entry.id] then
                         addCard(record,kind,entry);count=count+1
                     end
-                    if count>=48 or os.clock()-started>=0.003 then
+                    if count>=24 or os.clock()-started>=0.002 then
                         count=0;task.wait();started=os.clock()
                     end
                 end
@@ -13523,17 +13638,31 @@ local function updateRecord(record)
         sortNativeCards(record)
         -- No yield while publishing: the first rendered list has its final order.
         for key,card in pairs(record.cards) do
-            if not enabled(card.kind) or not card.target.Parent or nativeOwns(card.kind,card.id) then removeCard(record,key)
-            elseif card.frame.Parent==record.staging then card.frame.Parent=card.target end
+            if not card.target.Parent or nativeOwns(card.kind,card.id) then removeCard(record,key)
+            elseif enabled(card.kind) and card.frame.Parent==record.staging then card.frame.Parent=card.target end
         end
+        end)
+        if generation~=record.generation or not alive or not runtimeAlive then return end
         record.building=false
-        loadVisibleImages(record)
+        if not ok then
+            stats.error=tostring(reason);record.dirty=true
+            record.buildFailures=(record.buildFailures or 0)+1
+            if record.buildFailures<=3 then task.delay(0.5,function() if schedule then schedule() end end) end
+            return
+        end
+        record.buildFailures=0
+        stats.error=nil
+        task.delay(0.04,function()
+            if alive and runtimeAlive and records[record.main]==record and generation==record.generation then loadVisibleImages(record) end
+        end)
         if record.dirty and schedule then schedule() end
     end)
 end
 
 local function forgetRecord(record)
     release(record)
+    for _,pool in pairs(record.viewPools) do for _,view in ipairs(pool) do destroyView(view) end end
+    table.clear(record.viewPools)
     if record.staging then record.staging:Destroy() end
     disconnect(record.filterConnections or {})
     disconnect(record.visibilityConnections or {})
@@ -13553,7 +13682,7 @@ local function discover()
             if object.Name=="Inventory" or object.Name=="Inventory2" then
                 local main=child(object,"Main")
                 if main and child(main,"Weapons") and not records[main] then
-                    local record={main=main,cards={},previews={},canvases={},templates={},waiting={},generation=0,
+                    local record={main=main,cards={},previews={},canvases={},templates={},waiting={},generation=0,activeCards={},viewPools={},
                         building=false,dirty=true,open=false,filterDirty=true,visibilityConnections={},imageWatches={},imageConnections={},
                         nativeOrders=setmetatable({}, {__mode="k"}),layouts=setmetatable({}, {__mode="k"}),contentConnections={}}
                     record.staging=Instance.new("Folder");record.staging.Name="VisualsV2_InventoryBuild"
@@ -13562,7 +13691,7 @@ local function discover()
                         if removed:GetAttribute(MARKER) and removed:GetAttribute("WeaponID") then
                             local key=tostring(removed:GetAttribute("VisualKind"))..":"..tostring(removed:GetAttribute("WeaponID"))
                             local card=record.cards[key]
-                            if card and card.frame==removed and not record.trading and not record.building then
+                            if card and card.frame==removed and not record.paused and not record.building then
                                 task.defer(function()
                                     if records[main]==record and card.frame.Parent~=record.staging
                                         and card.frame.Parent~=card.target then record.dirty=true;schedule() end
@@ -13582,6 +13711,9 @@ local function discover()
                     end
                     cacheFilters(record)
                 end
+                -- The inventory's content is already indexed through its module;
+                -- traversing every item below it only repeats the discovery work.
+                if main and records[main] then continue end
             end
             for _,child in ipairs(object:GetChildren()) do pending[#pending+1]=child end
         end
@@ -13591,10 +13723,11 @@ end
 refresh=function()
     if not alive or not runtimeAlive then return end
     local active=enabled("Gun") or enabled("Knife") or enabled("Effects") or enabled("Pets")
-    if active and discoveryDirty then discoveryDirty=false;discover() end
+    if active and (discoveryDirty or not next(records)) then discoveryDirty=false;discover() end
     for main,record in pairs(records) do
-        if not playerGui or not main:IsDescendantOf(playerGui) or not active then
+        if not playerGui or not main:IsDescendantOf(playerGui) then
             forgetRecord(record);records[main]=nil
+        elseif not active then pauseRecord(record,false)
         else updateRecord(record) end
     end
 end
@@ -13651,7 +13784,8 @@ for _,kind in ipairs({"Gun","Knife","Effects","Pets"}) do
     if not mmv or kind=="Gun" then
     controls[kind]=addToggle(section,definition.label,C(definition.key,false),function(value)
         if kind=="Effects" then effects.SetEnabled(value) elseif kind=="Pets" then pets.SetEnabled(value) else skins.SetEnabled(kind,value) end
-        for _,record in pairs(records) do record.dirty=true end
+        if value then discoveryDirty=true end
+        for _,record in pairs(records) do record.dirty=true;record.filterDirty=true;record.buildFailures=0 end
         refresh()
     end)
     end
@@ -13675,7 +13809,9 @@ connections[#connections+1]=RunService.Heartbeat:Connect(function(dt)
     stats.uiPolls=stats.uiPolls+1
     for main,record in pairs(records) do
         if playerGui and main:IsDescendantOf(playerGui) then
-            if record.dirty or record.filterDirty or record.trading or record.open~=visible(main) or inTrade() then updateRecord(record) end
+            if not record.paused or record.trading then
+                if record.dirty or record.filterDirty or record.trading or record.open~=visible(main) or inTrade() then updateRecord(record) end
+            end
         else schedule() end
     end
     for button,list in pairs(nativeButtons) do
@@ -13689,8 +13825,10 @@ env.VisualsV2Runtime.VisualWeaponInventory={
         for _,record in pairs(records) do
             local count=0
             for _ in pairs(record.cards) do count=count+1 end
+            local live=0;for _ in pairs(record.activeCards) do live=live+1 end
             report.inventories[#report.inventories+1]={name=record.main.Parent and record.main.Parent.Name,
-                open=record.open,cards=count,building=record.building,trading=record.trading==true,waiting=table.clone(record.waiting)}
+                open=record.open,cards=count,liveCards=live,paused=record.paused==true,
+                building=record.building,trading=record.trading==true,waiting=table.clone(record.waiting)}
         end
         return report
     end,
@@ -18254,10 +18392,20 @@ local hiddenSlots={}
 local hotbarKeysBound=false
 local toolSequence=0
 local refreshHotbar
+local nativeSlotFor
+local nativeBars={}
+local coreBackpackSaved,coreBackpackConnection
 local ACTION_PREFIX="VisualsV2_ExpandedTool_"
 local hotbarKeys={Enum.KeyCode.One,Enum.KeyCode.Two,Enum.KeyCode.Three,Enum.KeyCode.Four,Enum.KeyCode.Five,
     Enum.KeyCode.Six,Enum.KeyCode.Seven,Enum.KeyCode.Eight,Enum.KeyCode.Nine,Enum.KeyCode.Zero}
 local contextActions=game:GetService("ContextActionService")
+local starterGui=game:GetService("StarterGui")
+local function hideCoreBackpack()
+    local ok,value=pcall(function() return starterGui:GetCoreGuiEnabled(Enum.CoreGuiType.Backpack) end)
+    if not ok then return end
+    if coreBackpackSaved==nil then coreBackpackSaved=value end
+    if value then pcall(function() starterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack,false) end) end
+end
 local function restoreNativeSlots()
     for slot,record in pairs(hiddenSlots) do
         if record.connection then record.connection:Disconnect() end
@@ -18266,9 +18414,27 @@ local function restoreNativeSlots()
     table.clear(hiddenSlots)
 end
 local function hideNativeSlots()
-    for reference in pairs(slotReferences) do
-        local slot=reference.Parent
-        if slot and slot:IsA("GuiObject") then
+    hideCoreBackpack()
+    local targets={}
+    for reference,connection in pairs(slotReferences) do
+        if not reference.Parent then connection:Disconnect();slotReferences[reference]=nil
+        else
+            local slot=nativeSlotFor and nativeSlotFor(reference)
+            if slot then targets[slot]=true end
+        end
+    end
+    for bar in pairs(nativeBars) do
+        if bar.Parent then targets[bar]=true else nativeBars[bar]=nil end
+    end
+    for slot,record in pairs(hiddenSlots) do
+        if not targets[slot] then
+            if record.connection then record.connection:Disconnect() end
+            pcall(function() if not slot.Visible then slot.Visible=record.visible end end)
+            hiddenSlots[slot]=nil
+        end
+    end
+    for slot in pairs(targets) do
+        if slot.Parent then
             local record=hiddenSlots[slot]
             if not record then
                 record={visible=slot.Visible,writing=false};hiddenSlots[slot]=record
@@ -18301,6 +18467,11 @@ local function clearHotbar()
         hotbarKeysBound=false
     end
     restoreNativeSlots()
+    if coreBackpackConnection then coreBackpackConnection:Disconnect();coreBackpackConnection=nil end
+    if coreBackpackSaved~=nil then
+        local previous=coreBackpackSaved;coreBackpackSaved=nil
+        pcall(function() starterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack,previous) end)
+    end
     for _,record in pairs(toolRecords) do
         for _,connection in ipairs(record.connections) do connection:Disconnect() end
     end
@@ -18318,16 +18489,23 @@ local function ensureHotbar()
     hotbarGui.DisplayOrder=30;hotbarGui.IgnoreGuiInset=true
     hotbarList=Instance.new("ScrollingFrame")
     hotbarList.Name="ToolSlots";hotbarList.AnchorPoint=Vector2.new(0.5,1)
-    hotbarList.Position=UDim2.new(0.5,0,1,-8);hotbarList.Size=UDim2.new(1,-170,0,64)
+    hotbarList.Position=UDim2.new(0.5,0,1,-2);hotbarList.Size=UDim2.new(1,-170,0,64)
     hotbarList.BackgroundTransparency=1;hotbarList.BorderSizePixel=0
     hotbarList.ScrollingDirection=Enum.ScrollingDirection.X
-    hotbarList.ScrollBarThickness=3;hotbarList.AutomaticCanvasSize=Enum.AutomaticSize.X
+    hotbarList.ScrollBarThickness=0;hotbarList.AutomaticCanvasSize=Enum.AutomaticSize.X
     hotbarList.CanvasSize=UDim2.new();hotbarList.Parent=hotbarGui
     local layout=Instance.new("UIListLayout")
     layout.FillDirection=Enum.FillDirection.Horizontal;layout.SortOrder=Enum.SortOrder.LayoutOrder
     layout.VerticalAlignment=Enum.VerticalAlignment.Center;layout.Padding=UDim.new(0,5);layout.Parent=hotbarList
     local padding=Instance.new("UIPadding");padding.PaddingLeft=UDim.new(0,3);padding.PaddingRight=UDim.new(0,3);padding.Parent=hotbarList
     hotbarGui.Parent=gui
+    pcall(function()
+        coreBackpackConnection=starterGui.CoreGuiChangedSignal:Connect(function(kind,value)
+            if inventoryEnabled and value and (kind==Enum.CoreGuiType.Backpack or kind==Enum.CoreGuiType.All) then
+                coreBackpackSaved=true;hideCoreBackpack()
+            end
+        end)
+    end)
     for index,key in ipairs(hotbarKeys) do
         contextActions:BindActionAtPriority(ACTION_PREFIX..index,function(_,state)
             if not inventoryEnabled or not hotbarGui or not hotbarGui.Enabled or UserInputService:GetFocusedTextBox() then
@@ -18382,18 +18560,16 @@ local function makeHotbarCell(index)
     button.Name="VisualsV2_ToolSlot_"..index;button.Size=UDim2.fromOffset(57,57)
     button.BackgroundColor3=Color3.fromRGB(20,20,24);button.BackgroundTransparency=0.3
     button.BorderSizePixel=0;button.Image="";button.LayoutOrder=index
-    local corner=Instance.new("UICorner");corner.CornerRadius=UDim.new(0,4);corner.Parent=button
-    local outline=Instance.new("UIStroke");outline.Thickness=2;outline.Color=Color3.fromRGB(95,95,100);outline.Parent=button
-    local icon=Instance.new("ImageLabel");icon.Name="Icon";icon.BackgroundTransparency=1
+    local icon=Instance.new("ImageLabel");icon.Name="Icon";icon.BackgroundTransparency=1;icon.BorderSizePixel=0
     icon.Position=UDim2.fromOffset(3,3);icon.Size=UDim2.new(1,-6,1,-6);icon.ScaleType=Enum.ScaleType.Fit;icon.Parent=button
-    local key=Instance.new("TextLabel");key.Name="Key";key.BackgroundTransparency=1
+    local key=Instance.new("TextLabel");key.Name="Key";key.BackgroundTransparency=1;key.BorderSizePixel=0
     key.Position=UDim2.fromOffset(3,0);key.Size=UDim2.fromOffset(16,18);key.Font=Enum.Font.SourceSansBold
     key.Text=tostring(index%10);key.TextSize=14;key.TextColor3=Color3.new(1,1,1);key.TextStrokeTransparency=0.3;key.ZIndex=3;key.Parent=button
-    local name=Instance.new("TextLabel");name.Name="ToolName";name.BackgroundTransparency=1
+    local name=Instance.new("TextLabel");name.Name="ToolName";name.BackgroundTransparency=1;name.BorderSizePixel=0
     name.Position=UDim2.new(0,2,1,-20);name.Size=UDim2.new(1,-4,0,18);name.Font=Enum.Font.SourceSansBold
     name.TextScaled=true;name.TextColor3=Color3.new(1,1,1);name.TextStrokeTransparency=0.2;name.ZIndex=2;name.Parent=button
     local sizeLimit=Instance.new("UITextSizeConstraint");sizeLimit.MaxTextSize=14;sizeLimit.MinTextSize=8;sizeLimit.Parent=name
-    local cell={frame=button,icon=icon,name=name,outline=outline}
+    local cell={frame=button,icon=icon,name=name}
     button.Activated:Connect(function() chooseTool(cell.tool) end)
     button.Parent=hotbarList;hotbarCells[index]=cell
     return cell
@@ -18417,7 +18593,7 @@ refreshHotbar=function()
         local cell=hotbarCells[index] or makeHotbarCell(index)
         cell.tool=tool;cell.frame.Visible=true;cell.frame.Size=UDim2.fromOffset(size,size)
         cell.icon.Image=tool.TextureId;cell.name.Text=tool.Name;cell.name.Visible=tool.TextureId==""
-        cell.outline.Color=tool.Parent==character and Color3.fromRGB(90,145,255) or Color3.fromRGB(95,95,100)
+        cell.frame.BackgroundColor3=tool.Parent==character and Color3.fromRGB(55,85,125) or Color3.fromRGB(20,20,24)
     end
     for index=count+1,#hotbarCells do local cell=hotbarCells[index];cell.frame.Visible=false;cell.tool=nil end
     perf.mode="backpack hotbar";perf.tools=#tools;perf.visibleSlots=count;perf.capacity=inventoryLimit;perf.error=nil
@@ -18461,10 +18637,10 @@ local function toyRemote()
     if remote and remote:IsA("RemoteFunction") then return remote end
 end
 
-local function isNativeSlot(reference)
-    local slot=reference.Parent
-    if not slot or not slot:IsA("GuiObject") or not slot.Parent then return false end
-    local current=slot
+local nativeBarNames={hotbar=true,toolbar=true,toolslots=true,toolinventory=true,toolbarframe=true,
+    backpack=true,backpackframe=true,itembar=true,toybar=true}
+local function nativeHudContext(object)
+    local current=object
     while current and current~=observedGui do
         local name=current.Name:lower()
         if name:find("trade",1,true) or name:find("trading",1,true) then return false end
@@ -18475,11 +18651,36 @@ local function isNativeSlot(reference)
         end
         current=current.Parent
     end
+    return current==observedGui
+end
+local function cacheNativeBar(object)
+    if not object:IsA("GuiObject") or object:IsA("GuiButton") then return end
+    local name=object.Name:lower():gsub("[^%w]","")
+    if nativeBarNames[name] and nativeHudContext(object) then nativeBars[object]=true end
+end
+nativeSlotFor=function(reference)
+    if not reference:IsA("ObjectValue") or not nativeHudContext(reference) then return nil end
     local value=reference.Value
     local name=reference.Name:lower():gsub("[^%w]","")
     local toolReference=value and value:IsA("Tool") or (not value and (name=="tool" or name=="toolref" or name=="toolvalue"))
-    return current==observedGui and toolReference and (slot.Parent:FindFirstChildOfClass("UIListLayout")~=nil
-        or slot.Parent:FindFirstChildOfClass("UIGridLayout")~=nil)
+    if not toolReference then return nil end
+    local current=reference.Parent
+    local fallback
+    while current and current~=observedGui do
+        if current:IsA("GuiObject") then
+            local parent=current.Parent
+            if parent and (parent:FindFirstChildOfClass("UIListLayout") or parent:FindFirstChildOfClass("UIGridLayout")) then return current end
+            local slotName=current.Name:lower()
+            if not fallback and (current:IsA("GuiButton") or slotName:match("^%d+$") or slotName:find("slot",1,true)
+                or slotName:match("^item%d+$")) then fallback=current end
+            if nativeBars[current] then return fallback or current end
+        end
+        current=current.Parent
+    end
+    return fallback
+end
+local function isNativeSlot(reference)
+    return nativeSlotFor(reference)~=nil
 end
 local function cacheReference(reference)
     if slotReferences[reference] or not reference:IsA("ObjectValue") or not isNativeSlot(reference) then return end
@@ -18493,6 +18694,7 @@ local function clearReferences()
     restoreNativeSlots()
     for _,connection in pairs(slotReferences) do connection:Disconnect() end
     table.clear(slotReferences)
+    table.clear(nativeBars)
 end
 local function scanSlotReferences(gui)
     perf.guiScans=perf.guiScans+1
@@ -18508,6 +18710,7 @@ local function scanSlotReferences(gui)
             skip=main:FindFirstChild("Weapons") or main:FindFirstChild("Effects") or main:FindFirstChild("Pets")
         end
         if not skip then
+            cacheNativeBar(object)
             cacheReference(object)
             for _,child in ipairs(object:GetChildren()) do pending[#pending+1]=child end
         end
@@ -18532,7 +18735,7 @@ local function orderSelectedTools(char,backpack,token)
         if not reference.Parent or not isNativeSlot(reference) then
             connection:Disconnect();slotReferences[reference]=nil
         else
-            local slot=reference.Parent
+            local slot=nativeSlotFor(reference)
             local index=order[reference.Value]
             if index then
                 if originalSlotOrders[slot]==nil then originalSlotOrders[slot]=slot.LayoutOrder end
@@ -18722,10 +18925,11 @@ local function watchPlayerGui(gui)
         if child.Name=="MainGUI" then queueGuiRecovery(true) end
     end)
     guiConnections[#guiConnections+1]=gui.DescendantAdded:Connect(function(child)
+        cacheNativeBar(child)
         if child:IsA("ObjectValue") then cacheReference(child)
-        elseif child:IsA("UIListLayout") and child.Parent then
+        elseif (child:IsA("UIListLayout") or child:IsA("UIGridLayout")) and child.Parent then
             for _,slot in ipairs(child.Parent:GetChildren()) do
-                for _,reference in ipairs(slot:GetChildren()) do cacheReference(reference) end
+                for _,reference in ipairs(slot:GetDescendants()) do cacheReference(reference) end
             end
         elseif child.Name=="EquipButton" or child.Name=="TouchBinding" then queueGuiRecovery(false) end
     end)
