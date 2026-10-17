@@ -352,7 +352,7 @@ end
 
 loadConfig()
 
-env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-17-fixes-5"}
+env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-17-fixes-6"}
 -- Time-budgeted work queue. Big GUI changes (boot, opening the inventory, trading)
 -- push their objects here and they are handled a slice at a time instead of all at once.
 env.VisualsV2Runtime.MakeBatcher = function(handler, budget)
@@ -5295,12 +5295,28 @@ local function activateButton(target)
     if touch and tapButton(target,"mouse") then return true end
     return false
 end
-env.VisualsV2Runtime.ODHShootMurderer=function()
+-- Searching ODH's menus for the button takes a moment, so the clutch follow-up looks it
+-- up right after the jump and the press itself reuses that (for up to 3 seconds).
+local cachedCandidates,cachedAt=nil,-math.huge
+local function currentCandidates(refresh)
+    if not refresh and cachedCandidates and #cachedCandidates>0 and os.clock()-cachedAt<3 then
+        local valid=true
+        for _,item in ipairs(cachedCandidates) do
+            if not item.Parent then valid=false;break end
+        end
+        if valid then return cachedCandidates end
+    end
     local candidates=shootCandidates()
     if #candidates==0 then
         local legacy=button and button.Parent and button or findButton()
         if legacy then candidates[1]=legacy end
     end
+    cachedCandidates,cachedAt=candidates,os.clock()
+    return candidates
+end
+env.VisualsV2Runtime.ODHShootPrepare=function() currentCandidates(true) end
+env.VisualsV2Runtime.ODHShootMurderer=function()
+    local candidates=currentCandidates(false)
     if #candidates==0 then return false,"Could not find ODH's shoot button (enable it in ODH first)" end
     local inspect=getconnections or env.getconnections
     local fire=firesignal or env.firesignal
@@ -8651,13 +8667,19 @@ local function create(record,id,category)
     local grip=weapon and weaponGrip(category,id,record) or record.grip
     if grip then model:SetAttribute("VisualsV2_CapturedGrip",decode(grip)) end
     for _,node in ipairs(record.nodes) do
+        -- a SurfaceAppearance only works on a real MeshPart; its colour map is already
+        -- carried over to the mesh below, so weapons don't need it
         local unnecessary=weapon and (node.class=="Sound" or node.class=="EqualizerSoundEffect"
-            or node.class=="Animation" or node.class=="BillboardGui" or node.class=="ImageLabel")
+            or node.class=="Animation" or node.class=="BillboardGui" or node.class=="ImageLabel"
+            or node.class=="SurfaceAppearance")
         if allowed[node.class] and not unnecessary then
-            local object=Instance.new(node.class=="MeshPart" and "Part" or node.class=="Tool" and "Folder" or node.class)
-            object.Name=node.name
-            objects[node.nodeId]=object
-            object.Parent=model
+            -- one object the game won't let a script create must not cost the whole weapon
+            local made,object=pcall(Instance.new,node.class=="MeshPart" and "Part" or node.class=="Tool" and "Folder" or node.class)
+            if made and object then
+                object.Name=node.name
+                objects[node.nodeId]=object
+                object.Parent=model
+            end
         end
     end
     for _,node in ipairs(record.nodes) do
@@ -10186,23 +10208,13 @@ local function buildTemplate(entry)
             if matches then grip=known.grip;useToolGrip=true end
         end
     end
-    if entry.kind=="Knife" and not useToolGrip then
-        -- Every scythe is held the way the real Batwing is: hand on the shaft 29% of the
-        -- model's height below its centre, upright. The shaft sits where the belt
-        -- attachment is when the model has one, otherwise 19% toward the back like the
-        -- Batwing. The plain Gingerscythes are drawn from a default-size brick, so they use
-        -- the measured size of the other Gingerscythes.
+    if entry.kind=="Knife" then
+        -- Every scythe (Batwing, Nik's Scythe, Elderwood Scythe, Hallowscythe, Icewing and
+        -- all Gingerscythes) uses the real Batwing's held grip exactly as MM2 records it,
+        -- so they all sit in the hand the same way the Batwing does.
         local key=compact(entry.id)..compact(entry.name)
         if key:find("scythe",1,true) or compact(entry.id)=="icewing" then
-            local size=root.Size
-            if key:find("gingerscythe",1,true) and size.X>3 and size.Y<1.5 then
-                size=Vector3.new(0.2018069,3.4817379,0.8913928)
-            end
-            local x,z=0,0.194002*size.Z
-            if attachment and attachment.Name=="CustomAttachment" then
-                x,z=attachment.Position.X,attachment.Position.Z
-            end
-            grip=CFrame.new(x,-0.293643*size.Y,z);useToolGrip=true
+            grip=KNOWN_GRIPS["305826272"].grip;useToolGrip=true
         end
     end
     if entry.kind=="Gun" and not useToolGrip and attachment and attachment.Name=="CustomAttachment" and attachmentGrip then
@@ -10340,6 +10352,8 @@ local function templateFor(entry)
                 warned[key]=true
                 notify(failure.reason..". Save the weapon diagnostic report if this continues.")
             end
+            -- the previous visual was kept while this one loaded; put the real weapon back
+            task.defer(refreshTools)
         end
     end)
     return cache[key]
@@ -10857,6 +10871,14 @@ local function apply(tool,state)
     end
     local template=templateFor(entry)
     if not template then
+        -- keep showing the current visual while the next one loads instead of flashing
+        -- back to the real weapon; only a load that failed shows the real weapon
+        if loading[cacheKey(entry)] and state.model and state.handle==handle then
+            state.blocked="Loading "..entry.name
+            if state.model.Parent~=player.Character then state.model.Parent=player.Character;state.nativeDirty=true end
+            hideOriginals(tool,state)
+            return
+        end
         state.blocked="Waiting for the original model"
         if state.model then restoreVisuals(state) end
         return
@@ -11006,13 +11028,18 @@ local function refreshHolsters()
             local state=holsters[kind]
             local nativeMount=nativeHolsterGrip(original)
             local signature=cacheKey(entry)..":"..entry.revision
-            if state and state.character==character and state.body==body and state.original==original
-                and state.applied==signature and state.nativeMount==nativeMount and state.model and state.model.Parent==character then
+            local placed=state and state.character==character and state.body==body and state.original==original
+                and state.model and state.model.Parent==character
+            local current=placed and state.applied==signature and state.nativeMount==nativeMount
+            local template=not current and templateFor(entry) or nil
+            if current then
                 hideHolsterOriginal(state)
                 updateChroma(state)
+            elseif placed and not template and loading[cacheKey(entry)] then
+                -- the next visual is still loading: keep the current one on the belt meanwhile
+                hideHolsterOriginal(state)
             else
                 clearHolster(kind)
-                local template=templateFor(entry)
                 local model=template and cloneObject(template.model)
                 local root=model and (model.PrimaryPart or visualRoot(model))
                 if model and not root then model:Destroy();model=nil end
@@ -11237,7 +11264,7 @@ env.VisualsV2Runtime.ClientWeaponSkins={
     end,
     GetNativeHolster=function(kind) return nativeHolster(player.Character,kind) end,
     GetDiagnostics=function()
-        local report={build="2026-10-17-fixes-5",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
+        local report={build="2026-10-17-fixes-6",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
         for kind,settings in pairs(kinds) do
             local entry=catalog[kind][settings.selected]
             local key=entry and cacheKey(entry)
@@ -13896,9 +13923,42 @@ local function trading()
     return (tradeState and tradeState.active) or inTrade()
 end
 local nativeOwnedImages,nativeOwnedSource=nil,nil
+local function plainName(value)
+    return type(value)=="string" and (value:lower():gsub("[^%w]","")) or nil
+end
+-- Which catalogue weapon a game item card (a weapon you own) shows: its ID when the game
+-- gives one, otherwise its picture plus its name (and the Chroma tag, since a chroma
+-- weapon shares its picture with the normal one). Nil when it can't be told apart.
+local function nativeEntryId(frame,kind,hint)
+    local entries=definitions[kind] and definitions[kind].entries
+    if not entries or typeof(frame)~="Instance" then return nil end
+    for _,value in ipairs({hint or false,frame:GetAttribute("ItemID") or false,frame:GetAttribute("WeaponID") or false,frame.Name}) do
+        if value and entries[tostring(value)] then return tostring(value) end
+    end
+    prepareSort()
+    local icon=child(child(frame,"Container"),"Icon")
+    if not icon then return nil end
+    local title=child(frame,"ItemName")
+    local label=child(title,"Label") or child(title,"ColoredName")
+    local text=label and label:IsA("TextLabel") and plainName(label.Text) or nil
+    if text=="" then text=nil end
+    local tag=child(child(frame,"Tags"),"Chroma")
+    local chroma=nil
+    if tag and tag:IsA("GuiObject") then chroma=tag.Visible end
+    local found=nil
+    for _,item in ipairs(iconEntries[imageKey(icon.Image)] or {}) do
+        local name=plainName(item.data.ItemName)
+        local named=not text or text==name or text==plainName(item.entry.name) or text=="chroma"..tostring(name)
+        if item.kind==kind and named and (chroma==nil or (item.data.Chroma==true)==chroma) then
+            if found and found~=item.entry.id then return nil end
+            found=item.entry.id
+        end
+    end
+    return found
+end
 local function observeNativeButtons(record)
     if trading() then return end
-    local function bind(frame,kind)
+    local function bind(frame,kind,hint)
         local button=child(child(frame,"Container"),"ActionButton")
         if not button or nativeButtons[button] or not definitions[kind] or own(button)
             or not button:IsDescendantOf(record.main) then return end
@@ -13907,7 +13967,18 @@ local function observeNativeButtons(record)
             if not alive or not runtimeAlive or trading() or excludedInventory(button) then return end
             if os.clock()-lastClick<0.2 then return end
             lastClick=os.clock()
-            selectItem(kind,"None");task.defer(refresh)
+            -- The game only swaps the weapon in your hand at the next round, so picking one
+            -- of your own weapons mid-round used to drop the visual and leave the weapon you
+            -- started the round with. Show the picked weapon as the visual instead (it is
+            -- the same weapon, so nothing changes once the game catches up). Anything the
+            -- add-on has no model for (the default knife/gun) goes back to the real one.
+            local id=(kind=="Gun" or kind=="Knife") and enabled(kind) and nativeEntryId(frame,kind,hint) or nil
+            if id and selectItem(kind,id) then
+                for _,other in pairs(records) do updatePreviews(other) end
+            else
+                selectItem(kind,"None")
+            end
+            task.defer(refresh)
         end
         local list={button.Activated:Connect(nativeSelected)}
         list[#list+1]=button.MouseButton1Click:Connect(nativeSelected)
@@ -13918,8 +13989,11 @@ local function observeNativeButtons(record)
         for _,group in ipairs({"Weapons","Effects","Pets"}) do
             for _,tab in pairs(data[group] or {}) do
                 if type(tab)=="table" then
-                    for _,entry in pairs(tab) do
-                        if type(entry)=="table" and entry.Frame then bind(entry.Frame,(group=="Effects" or group=="Pets") and group or entry.ItemType) end
+                    for key,entry in pairs(tab) do
+                        if type(entry)=="table" and entry.Frame then
+                            local id=entry.ItemID or entry.ID or entry.Id or entry.ItemId or key
+                            bind(entry.Frame,(group=="Effects" or group=="Pets") and group or entry.ItemType,id)
+                        end
                     end
                 end
             end
@@ -16133,14 +16207,41 @@ local function reportFailure(reason)
     stats.error=reason
     pcall(function() shared.Notify("Shoot after clutch: "..tostring(reason),3) end)
 end
-runtime.JumpGunFollowup={Queue=function(key,character,options,delayTime)
-    local token={};pending[key]=token
-    -- Bomb jumps must keep the bomb equipped until the server has processed it,
-    -- so wait roughly one round trip before swapping to the gun.
-    if not delayTime and tostring(key):find("BombJump",1,true) then
-        delayTime=math.clamp(networkPing()*1.5+0.1,0.18,0.6)
+local shootDelays={}
+local function delayGroup(key)
+    key=tostring(key)
+    return key:find("BombJump",1,true) and "BombJump" or key
+end
+local function findGun(character)
+    local backpack=LocalPlayer:FindFirstChildOfClass("Backpack")
+    for _,container in pairs({character,backpack}) do
+        if container then
+            for _,tool in ipairs(container:GetChildren()) do
+                if tool:IsA("Tool") and runtime.ClientWeaponSkins.GetKind(tool)=="Gun" then return tool end
+            end
+        end
     end
-    task.delay(delayTime or 0.06,function()
+end
+-- The gun goes in hand as early as it safely can and ODH's shoot button is pressed the
+-- moment it is there, so the shot leaves near the top of the clutch instead of on the
+-- way down (the game still needs a moment to fire it after the press). A Fake Bomb only
+-- stays in hand until its jump has reached the server: half a round trip plus a margin,
+-- never more than 0.2 s. The optional delay sliders hold the press until that many
+-- seconds after the jump.
+runtime.JumpGunFollowup={Queue=function(key,character,options,equipDelay)
+    local token={};pending[key]=token
+    local jumpedAt=os.clock()
+    local group=delayGroup(key)
+    if not equipDelay then
+        equipDelay=group=="BombJump" and math.clamp(networkPing()+0.05,0.1,0.2) or 0.04
+    end
+    local timing={key=tostring(key)}
+    stats.last=timing
+    -- look ODH's shoot button up now, so pressing it later is instant
+    task.defer(function()
+        if pending[key]==token and runtime.ODHShootPrepare then pcall(runtime.ODHShootPrepare) end
+    end)
+    task.delay(equipDelay,function()
         local function current()
             return runtimeAlive and pending[key]==token and LocalPlayer.Character==character
         end
@@ -16148,47 +16249,44 @@ runtime.JumpGunFollowup={Queue=function(key,character,options,delayTime)
         local equip,shoot=options()
         if not equip and not shoot then return end
         local humanoid=character and character:FindFirstChildOfClass("Humanoid")
-        local backpack=LocalPlayer:FindFirstChildOfClass("Backpack")
         if not humanoid or humanoid.Health<=0 then return end
-        local gun
-        for _,container in pairs({character,backpack}) do
-            if container then
-                for _,tool in ipairs(container:GetChildren()) do
-                    if tool:IsA("Tool") and runtime.ClientWeaponSkins.GetKind(tool)=="Gun" then gun=tool;break end
-                end
-            end
-            if gun then break end
-        end
+        local gun=findGun(character)
         if not gun then stats.error="No gun in your character or backpack";return end
         if gun.Parent~=character then
             local ok=pcall(function() humanoid:EquipTool(gun) end)
             if not ok then stats.error="The gun could not be equipped";return end
         end
+        timing.equip=os.clock()-jumpedAt
         stats.equips=stats.equips+1
         if not shoot then stats.error=nil;return end
-        -- wait for the gun to actually be in hand, then fire ODH's shoot button;
-        -- retry a few times because ODH ignores presses while the gun is still settling
-        local waited=0
-        while gun.Parent~=character and waited<0.6 do
-            task.wait(0.03);waited=waited+0.03
+        local deadline=os.clock()+0.6
+        while gun.Parent~=character and os.clock()<deadline do
+            task.wait()
             if not current() or humanoid.Health<=0 then return end
         end
         if gun.Parent~=character then reportFailure("the gun never reached your hand");return end
-        -- give the gun a couple of frames to settle, then press straight away
-        task.wait(0.05)
+        timing.inHand=os.clock()-jumpedAt
+        -- one frame for the gun to settle (ODH ignores a press before that), then shoot
+        task.wait()
+        local hold=(shootDelays[group] or 0)-(os.clock()-jumpedAt)
+        if hold>0 then task.wait(hold) end
         local lastReason
-        for attempt=1,5 do
+        for _=1,5 do
             if not current() or humanoid.Health<=0 or gun.Parent~=character then return end
             local _,stillShoot=options()
             if not stillShoot then return end
+            local pressedAt=os.clock()-jumpedAt
             local fired,reason=runtime.ODHShootMurderer()
-            if fired then stats.shots=stats.shots+1;stats.error=nil;return end
+            if fired then timing.pressed=pressedAt;stats.shots=stats.shots+1;stats.error=nil;return end
             lastReason=reason
-            task.wait(0.08)
+            task.wait(0.05)
         end
         reportFailure(lastReason or "ODH's shoot button did not respond")
     end)
-end,GetDiagnostics=function() return table.clone(stats) end}
+end,SetShootDelay=function(group,seconds)
+    shootDelays[group]=math.clamp(tonumber(seconds) or 0,0,1)
+end,GetLastTiming=function() return stats.last end,
+GetDiagnostics=function() return table.clone(stats) end}
 runtime.RegisterReset(function() table.clear(pending) end)
 end)()
 
@@ -18806,16 +18904,21 @@ if tonumber(C("autoToySelectionVersion",0))<1 then
 end
 local getgc=getgc or env.getgc
 local getupvalues=(debug and debug.getupvalues) or getupvalues or env.getupvalues
-local getupvalue=(debug and debug.getupvalue) or getupvalue or env.getupvalue
 local setupvalue=(debug and debug.setupvalue) or setupvalue or env.setupvalue
 local getinfo=(debug and debug.getinfo) or getinfo or env.getinfo
 local getconstants=(debug and debug.getconstants) or getconstants or env.getconstants
-local setconstant=(debug and debug.setconstant) or setconstant or env.setconstant
-local getprotos=(debug and debug.getprotos) or getprotos or env.getprotos
+local iscclosure=iscclosure or env.iscclosure
 local getfenv=getfenv or env.getfenv
 local debugInfo=debug and debug.info
+-- the add-on's own functions mention the hotbar's names too; never treat them as the hotbar
+local selfSource=nil
+if type(debugInfo)=="function" then
+    -- level 1 must be a function of this script (through pcall directly it would be pcall)
+    local ok,value=pcall(function() return debugInfo(1,"s") end)
+    if ok and type(value)=="string" and value~="[C]" then selfSource=value end
+end
 local targetFunctions={}
-local targetDetails=setmetatable({}, {__mode="k"})
+local nameOnlyScans=false
 local targetsScanned=false
 local scanningTargets=false
 local targetEpoch=0
@@ -18866,10 +18969,63 @@ local function targetsStale()
     return true
 end
 
-local function discoverTargets(force)
-    if scanningTargets or (targetsScanned and not force) or os.clock()-lastTargetScan<2 then return end
-    if type(getgc)~="function" or not ((type(getupvalues)=="function" and type(setupvalue)=="function")
-        or (type(getconstants)=="function" and type(setconstant)=="function")) then
+-- The hotbar keeps its size as a plain number: 3 on phones, 10 on computers. Every one
+-- of those numbers held by the hotbar functions is set to the chosen limit (3-10), the
+-- same way Better ODH does it, and each one remembers its original so turning the
+-- feature off puts it back.
+local originalLimits=setmetatable({}, {__mode="k"})
+local function patchTargets()
+    if not inventoryEnabled then return 0 end
+    local patched=0
+    for _,f in ipairs(targetFunctions) do
+        local ok,upvalues=pcall(getupvalues,f)
+        if ok and type(upvalues)=="table" then
+            for index,value in pairs(upvalues) do
+                if type(index)=="number" and type(value)=="number" then
+                    local records=originalLimits[f]
+                    local record=records and records[index]
+                    if value==3 or value==10 or (record and value==record.applied) then
+                        if not record then
+                            if not records then records={};originalLimits[f]=records end
+                            record={original=value};records[index]=record
+                        end
+                        if value==inventoryLimit or pcall(setupvalue,f,index,inventoryLimit) then
+                            local verified,current=pcall(function() return getupvalues(f)[index] end)
+                            if verified and current==inventoryLimit then record.applied=inventoryLimit;patched=patched+1 end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    perf.patchedLimits=patched
+    targetsScanned=patched>0
+    perf.error=patched==0 and (#targetFunctions>0 and "The hotbar was found but its size could not be changed"
+        or "The hotbar has not been found yet") or nil
+    return patched
+end
+local function restoreInventoryLimits()
+    for f,records in pairs(originalLimits) do
+        for index,record in pairs(records) do
+            local ok,upvalues=pcall(getupvalues,f)
+            if ok and type(upvalues)=="table" and record.applied~=nil and upvalues[index]==record.applied
+                and record.applied~=record.original then
+                pcall(setupvalue,f,index,record.original)
+            end
+        end
+    end
+    table.clear(originalLimits)
+end
+
+-- Finds MM2's hotbar the way Better ODH does (that check finds it every time): a function
+-- called updateItemFrame or onItemEquipped, or one that works with both the TouchBinding
+-- and the EquipButton of a hotbar slot. Every Lua function in memory is checked; the old
+-- scan skipped most functions by name and by script (the hotbar's module included), which
+-- is why the extra slots only showed up some of the time. The scan is spread over frames
+-- so it never freezes the game.
+local function discoverTargets()
+    if scanningTargets or os.clock()-lastTargetScan<2 then return end
+    if type(getgc)~="function" or type(getupvalues)~="function" or type(setupvalue)~="function" then
         perf.error="This executor does not expose inventory inspection";return
     end
     scanningTargets=true
@@ -18879,77 +19035,44 @@ local function discoverTargets(force)
     local okGc,objects=pcall(getgc)
     if not okGc or type(objects)~="table" then scanningTargets=false;return end
     local found={}
-    local seen={}
-    local names={updateitemframe=true,onitemequipped=true,updatehotbar=true,updatetools=true,
-        addtool=true,onbackpackchildadded=true,updatebackpack=true}
-    -- The scan used to look up the owning script (getfenv + GetFullName) and read the
-    -- constants of almost every function in memory, which took many seconds on phones, so
-    -- the extra slots often weren't ready when the round started. A function's source
-    -- already names its script, so those lookups are now only made where they can matter.
-    -- item frames in menus, trades and shops are drawn by shared code that must never be
-    -- patched (its numbers mean something else there)
-    local function foreign(source)
-        return source:find("trade",1,true) or source:find("trading",1,true)
-            or source:find("itemservice",1,true) or source:find("clientservices",1,true)
-            or source:find("inventorymodule",1,true) or source:find("shop",1,true)
-            or source:find("craft",1,true)
-    end
-    local function gameSource(source)
-        return source:find("playergui",1,true) or source:find("playerscripts",1,true)
-            or source:find("startergui",1,true) or source:find("starterplayer",1,true)
-            or source:find("replicatedstorage",1,true) or source:find("replicatedfirst",1,true)
-            or source:find("players.",1,true)
-    end
-    local function inspect(f,inherited)
-        if seen[f] or type(f)~="function" then return end
-        seen[f]=true
-        local name,source="",""
-        if type(getinfo)=="function" then
+    local byName,byConstants=0,0
+    local useConstants=not nameOnlyScans and type(getconstants)=="function"
+    local function inspect(f)
+        if type(iscclosure)=="function" then
+            local ok,native=pcall(iscclosure,f)
+            if ok and native then return end
+        end
+        local name,source=nil,nil
+        if type(debugInfo)=="function" then
+            local ok,s,n=pcall(debugInfo,f,"sn")
+            if ok then source,name=s,n end
+        elseif type(getinfo)=="function" then
             local ok,info=pcall(getinfo,f)
-            if ok and type(info)=="table" then name=tostring(info.name or ""):lower();source=tostring(info.source or info.short_src or ""):lower() end
+            if ok and type(info)=="table" then source,name=info.source,info.name end
         end
-        if name=="" and type(debugInfo)=="function" then
-            local ok,value=pcall(debugInfo,f,"n")
-            if ok then name=tostring(value or ""):lower() end
+        if source=="[C]" or (selfSource and source==selfSource) then return end
+        -- Roblox's own menus (CoreGui / CorePackages) are never the game's hotbar
+        if type(source)=="string" and (source:sub(1,12)=="CorePackages" or source:sub(1,7)=="CoreGui") then return end
+        if type(name)=="string" then
+            local lowered=name:lower()
+            if lowered=="updateitemframe" or lowered=="onitemequipped" then found[#found+1]=f;byName=byName+1;return end
         end
-        if foreign(source) then return end
-        local contextual=inherited or source:find("backpack",1,true) or source:find("hotbar",1,true)
-        local knownSource=#source>2 and source:find(".",1,true)~=nil
-        if not contextual and not knownSource and type(getfenv)=="function" then
-            local ok,context=pcall(getfenv,f)
-            local script=ok and type(context)=="table" and rawget(context,"script")
-            if typeof(script)=="Instance" then
-                local path=script:GetFullName():lower()
-                if foreign(path) then return end
-                contextual=path:find("backpack",1,true) or path:find("hotbar",1,true)
-                source=path;knownSource=true
-            end
-        end
-        local candidate=names[name] or contextual or (name=="" and (not knownSource or gameSource(source)))
-        local constants
-        if type(getconstants)=="function" and candidate then
-            local ok,result=pcall(getconstants,f)
-            if ok and type(result)=="table" then constants=result end
-        end
+        if not useConstants then return end
+        local ok,constants=pcall(getconstants,f)
+        if not ok or type(constants)~="table" then return end
         local touch,equip=false,false
-        for _,value in pairs(constants or {}) do
+        for _,value in pairs(constants) do
             if value=="TouchBinding" then touch=true elseif value=="EquipButton" then equip=true end
         end
-        local strong=(name=="updateitemframe" or name=="onitemequipped" or touch and equip)
-        if strong or contextual and names[name] then
-            found[#found+1]=f
-            targetDetails[f]={strong=strong,constants=constants}
-            if type(getprotos)=="function" then
-                local ok,protos=pcall(getprotos,f)
-                if ok and type(protos)=="table" then for _,child in pairs(protos) do inspect(child,true) end end
-            end
-        end
+        if touch and equip then found[#found+1]=f;byConstants=byConstants+1 end
     end
     local slice=os.clock()
-    for index,f in ipairs(objects) do
+    local checked=0
+    for _,f in pairs(objects) do
         if not alive or not runtimeAlive or targetEpoch~=epoch or not inventoryEnabled then scanningTargets=false;return end
-        if type(f)=="function" then inspect(f,false) end
-        if os.clock()-slice>=0.004 then
+        if type(f)=="function" then inspect(f) end
+        checked=checked+1
+        if checked%16==0 and os.clock()-slice>=0.004 then
             perf.scanYields=perf.scanYields+1
             local log=env.VisualsV2Runtime.Perf
             if log then log.Add("Increase Inventory scan",os.clock()-slice) end
@@ -18957,113 +19080,29 @@ local function discoverTargets(force)
             slice=os.clock()
         end
     end
+    -- When every hotbar function was found by its name, the next scans (one per life) only
+    -- look at names, which is far quicker on phones; a scan that then misses goes back to
+    -- the full check.
+    if useConstants then nameOnlyScans=byName>0 and byConstants==0
+    elseif #found==0 then nameOnlyScans=false end
     targetFunctions=found
     perf.targets=#found
-    targetsScanned=#targetFunctions>0
+    perf.scansDone=(perf.scansDone or 0)+1
+    perf.nameOnlyScans=nameOnlyScans
     scanningTargets=false
+    patchTargets()
 end
-
-local limitNames={maxitems=true,maxslots=true,maxtools=true,inventorylimit=true,
-    inventorymaxitems=true,hotbarlimit=true,touchbindinglimit=true,maxitemcount=true,
-    maxinventory=true,maxinventoryitems=true,maxtoolslots=true,hotbarsize=true,
-    inventorysize=true,maxinventoryslots=true,maximumitems=true}
-local originalLimits={}
-local originalConstants=setmetatable({}, {__mode="k"})
-local function isLimitName(name)
-    return type(name)=="string" and limitNames[name:lower():gsub("[^%w]","")]==true
-end
-local function setLimit(identity,key,readValue,writeValue)
-    local ok,value=pcall(readValue)
-    if not ok or type(value)~="number" or value<2 or value>10 then return false end
-    local originals=originalLimits[identity]
-    if not originals then originals={};originalLimits[identity]=originals end
-    local record=originals[key]
-    if not record then record={original=value,read=readValue,write=writeValue};originals[key]=record end
-    if pcall(writeValue,inventoryLimit) then
-        local success,current=pcall(readValue)
-        if success and current==inventoryLimit then record.applied=inventoryLimit;return true end
-    end
-    return false
-end
-local function restoreInventoryLimits()
-    for _,records in pairs(originalLimits) do
-        for _,record in pairs(records) do
-            local ok,current=pcall(record.read)
-            if ok and current==record.applied then pcall(record.write,record.original) end
-        end
-    end
-    table.clear(originalLimits)
-    for f,records in pairs(originalConstants) do
-        local ok,constants=pcall(getconstants,f)
-        if ok and type(constants)=="table" then
-            for index,record in pairs(records) do
-                if constants[index]==record.applied then pcall(setconstant,f,index,record.original) end
-            end
-        end
-    end
-    table.clear(originalConstants)
-end
+-- The scan runs on its own so a long one never holds up the toy requests. Returns false
+-- when a requested scan has to wait (one ran less than 2 seconds ago), so it is retried.
 local function applyInventoryLimit(force)
-    if not inventoryEnabled then return end
-    discoverTargets(force)
-    local patched=0
-    for _,f in ipairs(targetFunctions) do
-        local ok,upvalues=pcall(function() return type(getupvalues)=="function" and getupvalues(f) or {} end)
-        if ok and type(upvalues)=="table" then
-            for index,value in pairs(upvalues) do
-                if type(index)=="number" and type(value)=="number" then
-                    local hasName,name,namedValue=false,nil,nil
-                    if type(getupvalue)=="function" then
-                        local ok,label,current=pcall(getupvalue,f,index)
-                        local anonymous=type(label)=="string" and (label=="" or label=="?" or label=="_"
-                            or label:match("^v_?u?_?%d+$") or label:lower():match("^upvalue_?%d*$"))
-                        hasName=ok and type(label)=="string" and current==value and not anonymous
-                        if hasName then name,namedValue=label,current end
-                    end
-                    local originals=originalLimits[f]
-                    local previous=originals and originals[index]
-
-                    local legacyLimit=(not hasName or targetDetails[f] and targetDetails[f].strong) and (value==3
-                        or (previous and previous.original==3 and value==previous.applied))
-                    if (hasName and isLimitName(name) and namedValue==value) or legacyLimit then
-                        if type(setupvalue)=="function" and setLimit(f,index,function() return getupvalues(f)[index] end,
-                            function(limit) setupvalue(f,index,limit) end) then patched=patched+1 end
-                    end
-                elseif type(value)=="table" then
-                    for key,capacity in pairs(value) do
-                        if isLimitName(key) and type(capacity)=="number" then
-                            if setLimit(value,key,function() return value[key] end,function(limit) value[key]=limit end) then
-                                patched=patched+1
-                            end
-                        end
-                    end
-                end
-            end
-        end
-        -- Some MM2 hotbars compile their capacity as a constant, not an upvalue.
-        local detail=targetDetails[f]
-        if detail and detail.strong and type(getconstants)=="function" and type(setconstant)=="function" then
-            local ok,constants=pcall(getconstants,f)
-            if ok and type(constants)=="table" then
-                local records=originalConstants[f]
-                for index,value in pairs(constants) do
-                    local previous=records and records[index]
-                    if type(index)=="number" and (value==3 or previous and value==previous.applied) then
-                        if not records then records={};originalConstants[f]=records end
-                        local record=previous or {original=value}
-                        local changed=pcall(setconstant,f,index,inventoryLimit)
-                        local verified,current=pcall(getconstants,f)
-                        if changed and verified and current[index]==inventoryLimit then
-                            record.applied=inventoryLimit;records[index]=record;patched=patched+1
-                        end
-                    end
-                end
-            end
-        end
+    if not inventoryEnabled then return true end
+    local started=true
+    if force or not targetsScanned then
+        if not scanningTargets and os.clock()-lastTargetScan>=2 then task.spawn(discoverTargets)
+        elseif force and not scanningTargets then started=false end
     end
-    perf.patchedLimits=patched
-    targetsScanned=#targetFunctions>0 and patched>0
-    perf.error=patched==0 and "The native inventory capacity has not been found yet" or nil
+    if #targetFunctions>0 then patchTargets() end
+    return started
 end
 local function getBackpack()
     if observedBackpack and observedBackpack.Parent==player then return observedBackpack end
@@ -19240,7 +19279,8 @@ local function hotbarCounts(char)
     return shown,owned
 end
 local TOY_MAX_ATTEMPTS=8
-local TOY_RETRY={0.4,0.6,0.9,1.3,2,2.5,3,3}
+local TOY_RETRY={0.5,0.6,0.9,1.3,2,2.5,3,3}
+local TOY_INTERVAL=0.5
 local function isCurrentRecovery(token,char)
     return alive and runtimeAlive and token==recoveryToken
         and player.Character==char and char~=removingCharacter
@@ -19273,6 +19313,7 @@ requestRecovery=function(forceScan)
         local shortChecks=0
         local shortNudges=0
         local lastCapacityRescan=-math.huge
+        local spawnScanned=false
         while isCurrentRecovery(token,char) and os.clock()<recoveryDeadline do
             local now=os.clock()
             -- keep maintaining the limit for as long as Increase Inventory is on, not
@@ -19285,6 +19326,12 @@ requestRecovery=function(forceScan)
                     force=force or not targetsScanned
                     repeat scanIndex=scanIndex+1
                     until not scanTimes[scanIndex] or now-startedAt<scanTimes[scanIndex]
+                end
+                -- the game builds a fresh hotbar for every life, so look for it again a
+                -- second after spawning (what Better ODH does) instead of trusting the old one
+                if inventoryEnabled and not spawnScanned and now-startedAt>=1 then
+                    if lastTargetScan>=startedAt+1 then spawnScanned=true
+                    elseif not scanningTargets and os.clock()-lastTargetScan>=2 then spawnScanned=true;force=true end
                 end
                 if inventoryEnabled then
                     if targetsScanned and now>=nextStaleCheck then
@@ -19326,9 +19373,9 @@ requestRecovery=function(forceScan)
                 local deferScan=force and trade and trade.active
                 if deferScan then force=false end
                 if inventoryEnabled and (force or (targetsScanned and now>=nextInventoryApply)) then
-                    applyInventoryLimit(force)
+                    if not applyInventoryLimit(force) then deferScan=true end
                     nextInventoryApply=now+(now-startedAt>20 and 3 or 1)
-                    local key=targetEpoch..":"..inventoryLimit
+                    local key=targetEpoch..":"..(perf.scansDone or 0)..":"..inventoryLimit
                     if perf.patchedLimits>0 and (nudgedEpoch~=key or nudgedCharacter~=char) then
                         nudgedEpoch=key;nudgedCharacter=char
                         task.defer(nudgeHotbar)
@@ -19342,16 +19389,14 @@ requestRecovery=function(forceScan)
                         toyOrderDirty=false
                     end
                 end
-                -- Every missing toy is requested straight away (a few hundredths of a second
-                -- apart) instead of one at a time with long waits, and a toy that still
-                -- hasn't arrived is asked for again quickly.
-                if autoGetTools and now>=nextToyRequest then
+                -- Missing toys are asked for one at a time, in slot order, with half a
+                -- second between one toy arriving and the next request (retries included).
+                if autoGetTools and not activeToyRequest and now>=nextToyRequest then
                     local backpack=getBackpack()
                     local folder=findToyFolder()
                     local remote=toyRemote()
                     if backpack and folder and remote then
                         local seen={}
-                        local queuedNow=0
                         for slot=1,4 do
                             local name=selectedToys[slot]
                             if name and name~="None" and not seen[name] then
@@ -19360,7 +19405,7 @@ requestRecovery=function(forceScan)
                                     -- got it; if the game takes it away later, start over
                                     local done=toyAttempts[name]
                                     if done and not done.inFlight then toyAttempts[name]=nil end
-                                else
+                                elseif not activeToyRequest then
                                     local attempt=toyAttempts[name]
                                     if not attempt then
                                         attempt={count=0,nextAt=0,inFlight=false}
@@ -19369,24 +19414,26 @@ requestRecovery=function(forceScan)
                                     if folder:FindFirstChild(name) and not attempt.inFlight and attempt.count<TOY_MAX_ATTEMPTS and now>=attempt.nextAt then
                                         attempt.count=attempt.count+1
                                         attempt.inFlight=true
-                                        local delayTime=queuedNow*0.08
-                                        queuedNow=queuedNow+1
+                                        local request={name=name}
+                                        activeToyRequest=request
                                         attempt.thread=task.spawn(function()
-                                            if delayTime>0 then task.wait(delayTime) end
+                                            local sent=false
                                             if isCurrentRecovery(token,char) and autoGetTools
                                                 and not hasSelectedTool(name,char,getBackpack()) then
+                                                sent=true
                                                 pcall(function() remote:InvokeServer(name) end)
                                             end
                                             attempt.inFlight=false
                                             attempt.thread=nil
                                             attempt.nextAt=os.clock()+(TOY_RETRY[attempt.count] or 3)
+                                            if activeToyRequest==request then activeToyRequest=nil end
+                                            if sent then nextToyRequest=os.clock()+TOY_INTERVAL end
                                             if isCurrentRecovery(token,char) and autoGetTools then requestRecovery(false) end
                                         end)
                                     end
                                 end
                             end
                         end
-                        if queuedNow>0 then nextToyRequest=now+0.05 end
                     end
                 end
             end
@@ -19468,16 +19515,22 @@ local function watchCharacter(char)
     characterConnections[2]=char.ChildRemoved:Connect(changed)
 end
 
+local guiForceScan=false
 local function queueGuiRecovery(invalidate)
     if invalidate then
         targetEpoch=targetEpoch+1
         targetsScanned=false
         lastTargetScan=-math.huge
+        guiForceScan=true
     end
     guiRefreshToken=guiRefreshToken+1
     local token=guiRefreshToken
     task.delay(0.35,function()
-        if alive and token==guiRefreshToken then requestRecovery(false) end
+        if alive and token==guiRefreshToken then
+            local force=guiForceScan
+            guiForceScan=false
+            requestRecovery(force)
+        end
     end)
 end
 
