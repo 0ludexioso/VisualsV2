@@ -200,6 +200,31 @@ local function SetCfg(key, value)
     end)
 end
 
+-- Saved controls used to be re-applied all in the same frame, so with every feature on
+-- the game froze for several seconds after executing. Restores now run in order with a
+-- small per-frame time budget.
+local restoreQueue={}
+local restoreRunning=false
+local function queueRestore(callback)
+    restoreQueue[#restoreQueue+1]=callback
+    if restoreRunning then return end
+    restoreRunning=true
+    task.defer(function()
+        local index=1
+        local started=os.clock()
+        while restoreQueue[index] do
+            if not runtimeAlive then break end
+            local item=restoreQueue[index]
+            restoreQueue[index]=false
+            index=index+1
+            pcall(item)
+            if os.clock()-started>=0.006 then task.wait();started=os.clock() end
+        end
+        table.clear(restoreQueue)
+        restoreRunning=false
+    end)
+end
+
 local function addToggle(section, name, defaultValue, callback)
     local state = false
     local rawToggle
@@ -227,7 +252,7 @@ local function addToggle(section, name, defaultValue, callback)
         return state
     end
 
-    task.defer(function()
+    queueRestore(function()
         if runtimeAlive then controller:Set(defaultValue==true) end
     end)
     return controller
@@ -287,11 +312,11 @@ local function addDropdown(section, name, items, defaultValue, callback, notific
         end
     end
     if defaultValue~=nil then
-        task.defer(function()
+        queueRestore(function()
             if not runtimeAlive or configResetting or revision~=0 then return end
             silent=silent+1
             if type(controller.Select)=="function" then pcall(controller.Select,defaultValue) end
-            changed(defaultValue)
+            pcall(changed,defaultValue)
             silent=silent-1
         end)
     end
@@ -313,7 +338,42 @@ end
 
 loadConfig()
 
-env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-17-fixes-1"}
+env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-17-fixes-4"}
+-- Time-budgeted work queue. Big GUI changes (boot, opening the inventory, trading)
+-- push their objects here and they are handled a slice at a time instead of all at once.
+env.VisualsV2Runtime.MakeBatcher = function(handler, budget)
+    local queue, head, tail, running = {}, 1, 0, false
+    local queued = setmetatable({}, {__mode = "k"})
+    local batcher = {}
+    local function drain()
+        while head <= tail and runtimeAlive do
+            local started = os.clock()
+            while head <= tail and os.clock() - started < (budget or 0.002) do
+                local item = queue[head]
+                queue[head] = nil
+                head = head + 1
+                if item ~= nil then
+                    queued[item] = nil
+                    pcall(handler, item)
+                end
+            end
+            if head <= tail then task.wait() end
+        end
+        head, tail, running = 1, 0, false
+    end
+    function batcher.Push(item)
+        if item == nil or queued[item] then return end
+        queued[item] = true
+        tail = tail + 1
+        queue[tail] = item
+        if not running then running = true; task.defer(drain) end
+    end
+    function batcher.Clear()
+        table.clear(queue); table.clear(queued); head, tail = 1, 0
+    end
+    function batcher.Pending() return tail - head + 1 end
+    return batcher
+end
 env.VisualsV2Runtime.RegisterReset = function(callback)
     if type(callback) == "function" then table.insert(env.VisualsV2Runtime.Resetters, callback) end
 end
@@ -4681,15 +4741,20 @@ local function onScreen(item)
     return item.AbsoluteSize.Magnitude>0
 end
 local function isTarget(item)
-    if not item or not item:IsA("TextButton") or inMenuList(item) then return false end
-    local text=normalize(item.Text)
-    if text:find("shootmurderer",1,true) and not ownControlText(text) then return true end
-    local label=item:FindFirstChildWhichIsA("TextLabel",true)
-    if label then
-        local labelText=normalize(label.Text)
-        if labelText:find("shootmurderer",1,true) and not ownControlText(labelText) then return true end
+    if not item or not item:IsA("TextButton") then return false end
+    local matched=item:GetAttribute("ShootMurderButton")==true
+    if not matched then
+        local text=normalize(item.Text)
+        matched=text:find("shootmurderer",1,true)~=nil and not ownControlText(text)
     end
-    return item:GetAttribute("ShootMurderButton")==true
+    if not matched then
+        local label=item:FindFirstChildWhichIsA("TextLabel",true)
+        if label then
+            local labelText=normalize(label.Text)
+            matched=labelText:find("shootmurderer",1,true)~=nil and not ownControlText(labelText)
+        end
+    end
+    return matched and not inMenuList(item)
 end
 local function findButton()
     for _,root in ipairs(roots()) do
@@ -4867,6 +4932,20 @@ local function buttonRank(item)
     if not rank and item:GetAttribute("ShootMurderButton")==true then rank=1 end
     return rank
 end
+-- The pressable object for a matching label: its button, else an input-handling frame.
+local function pressTarget(label)
+    local current=label
+    while current and current:IsA("GuiObject") do
+        if current:IsA("GuiButton") then return current end
+        current=current.Parent
+    end
+    current=label
+    while current and current:IsA("GuiObject") do
+        if current.Active then return current end
+        current=current.Parent
+    end
+    return label
+end
 local function isShootButton(item) return buttonRank(item)~=nil end
 local function getOdhGui()
     local cached=odhShootAnchor
@@ -4900,6 +4979,7 @@ local function getOdhGui()
 end
 local function shootCandidates()
     local found,seen={},{}
+    local labelRanks={}
     local function scan(root)
         if typeof(root)~="Instance" then return end
         local ok,descendants=pcall(function() return root:GetDescendants() end)
@@ -4908,6 +4988,13 @@ local function shootCandidates()
             if not seen[item] and isShootButton(item) then
                 seen[item]=true
                 found[#found+1]=item
+            elseif item:IsA("TextLabel") and shootRank(item.Text) and not inMenuList(item) then
+                local target=pressTarget(item)
+                if not seen[target] then
+                    seen[target]=true
+                    found[#found+1]=target
+                    labelRanks[target]=shootRank(item.Text)
+                end
             end
         end
     end
@@ -4918,26 +5005,75 @@ local function shootCandidates()
     end
     local ranks={}
     for _,item in ipairs(found) do
-        ranks[item]=(buttonRank(item) or 9)+(onScreen(item) and 0 or 10)
+        ranks[item]=(buttonRank(item) or labelRanks[item] or 9)+(onScreen(item) and 0 or 10)
     end
     table.sort(found,function(a,b) return ranks[a]<ranks[b] end)
     return found
 end
+-- ODH's on-screen buttons are draggable, so they react to the press itself (InputBegan/
+-- InputEnded) rather than to a click event; calling their click connections did nothing.
+-- The most reliable way is a real tap at the button's centre, confirmed by watching the
+-- button receive it. Click connections and firesignal remain as fallbacks.
+local virtualInput
+pcall(function() virtualInput=game:GetService("VirtualInputManager") end)
+local guiService=game:GetService("GuiService")
+local function tapButton(target)
+    if not virtualInput or not onScreen(target) then return false end
+    local layer=target:FindFirstAncestorWhichIsA("LayerCollector")
+    local inset=Vector2.zero
+    if layer and layer:IsA("ScreenGui") and not layer.IgnoreGuiInset then
+        local ok,value=pcall(function() return guiService:GetGuiInset() end)
+        if ok and typeof(value)=="Vector2" then inset=value end
+    end
+    local center=target.AbsolutePosition+target.AbsoluteSize/2+inset
+    local camera=workspace.CurrentCamera
+    local viewport=camera and camera.ViewportSize or Vector2.new(1e5,1e5)
+    if center.X<0 or center.Y<0 or center.X>viewport.X or center.Y>viewport.Y then return false end
+    local arrived=false
+    local watch=target.InputBegan:Connect(function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+            arrived=true
+        end
+    end)
+    -- a mouse press swallowed by the GUI during our tap also counts (some buttons only
+    -- listen through UserInputService)
+    local globalWatch=UserInputService.InputBegan:Connect(function(input,processed)
+        if processed and input.UserInputType==Enum.UserInputType.MouseButton1 then arrived=true end
+    end)
+    local sent=pcall(function()
+        virtualInput:SendMouseButtonEvent(center.X,center.Y,0,true,game,1)
+        task.wait(0.04)
+        virtualInput:SendMouseButtonEvent(center.X,center.Y,0,false,game,1)
+    end)
+    task.wait(0.03)
+    watch:Disconnect()
+    globalWatch:Disconnect()
+    return sent and arrived
+end
 local function activateButton(target)
+    if tapButton(target) then return true end
     local inspect=getconnections or env.getconnections
     if type(inspect)=="function" then
-        for _,signal in ipairs({target.MouseButton1Click,target.Activated,target.MouseButton1Down,target.MouseButton1Up}) do
+        local center=target.AbsolutePosition+target.AbsoluteSize/2
+        local signals={
+            {target.MouseButton1Click,{}},
+            {target.Activated,{{UserInputType=Enum.UserInputType.MouseButton1,UserInputState=Enum.UserInputState.End,
+                Position=Vector3.new(center.X,center.Y,0),KeyCode=Enum.KeyCode.Unknown},1}},
+            {target.MouseButton1Down,{center.X,center.Y}},
+            {target.MouseButton1Up,{center.X,center.Y}},
+        }
+        for _,pair in ipairs(signals) do
             local fired=false
-            local ok,callbacks=pcall(inspect,signal)
+            local ok,callbacks=pcall(inspect,pair[1])
             if ok and type(callbacks)=="table" then
                 for _,connection in ipairs(callbacks) do
                     local readable,callback,enabled=pcall(function() return connection.Function,connection.Enabled end)
                     if readable and enabled~=false and not (type(callback)=="function" and ourClickCallbacks[callback]) then
                         if type(callback)=="function" then
-                            task.spawn(callback)
+                            task.spawn(callback,table.unpack(pair[2]))
                             fired=true
                         elseif type(connection.Fire)=="function" then
-                            fired=pcall(connection.Fire,connection) or fired
+                            fired=pcall(connection.Fire,connection,table.unpack(pair[2])) or fired
                         end
                     end
                 end
@@ -4946,7 +5082,7 @@ local function activateButton(target)
         end
     end
     local fire=firesignal or env.firesignal
-    if type(fire)=="function" then
+    if type(fire)=="function" and type(inspect)~="function" then
         for _,signal in ipairs({target.MouseButton1Click,target.Activated}) do
             if pcall(fire,signal) then return true end
         end
@@ -4962,7 +5098,7 @@ env.VisualsV2Runtime.ODHShootMurderer=function()
     if #candidates==0 then return false,"Could not find ODH's shoot button (enable it in ODH first)" end
     local inspect=getconnections or env.getconnections
     local fire=firesignal or env.firesignal
-    if type(inspect)~="function" and type(fire)~="function" then
+    if not virtualInput and type(inspect)~="function" and type(fire)~="function" then
         return false,"This executor cannot activate ODH's shoot button"
     end
     for _,target in ipairs(candidates) do
@@ -8304,27 +8440,11 @@ local function create(record,id,category)
     local weapon=category=="Gun" or category=="Knife"
     local grip=weapon and weaponGrip(category,id,record) or record.grip
     if grip then model:SetAttribute("VisualsV2_CapturedGrip",decode(grip)) end
-    local realMeshes={}
-    local assetService=game:GetService("AssetService")
     for _,node in ipairs(record.nodes) do
         local unnecessary=weapon and (node.class=="Sound" or node.class=="EqualizerSoundEffect"
             or node.class=="Animation" or node.class=="BillboardGui" or node.class=="ImageLabel")
         if allowed[node.class] and not unnecessary then
-            local object
-            if weapon and node.class=="MeshPart" and node.properties and node.properties.MeshId
-                and tostring(node.properties.MeshId)~="" then
-                -- A real MeshPart keeps the pivot (bounding-box centre) every captured
-                -- CFrame/attachment was recorded against and supports SurfaceAppearance.
-                local okMesh,meshPart=pcall(function()
-                    return assetService:CreateMeshPartAsync(node.properties.MeshId)
-                end)
-                if okMesh and typeof(meshPart)=="Instance" and meshPart:IsA("MeshPart") then
-                    object=meshPart;realMeshes[node.nodeId]=true
-                end
-            end
-            if not object then
-                object=Instance.new(node.class=="MeshPart" and "Part" or node.class=="Tool" and "Folder" or node.class)
-            end
+            local object=Instance.new(node.class=="MeshPart" and "Part" or node.class=="Tool" and "Folder" or node.class)
             object.Name=node.name
             objects[node.nodeId]=object
             object.Parent=model
@@ -8340,25 +8460,11 @@ local function create(record,id,category)
                     pcall(function() object[key]=decode(value,objects) end)
                 end
             end
-            if node.class=="MeshPart" and realMeshes[node.nodeId] then
-                local textureId=node.properties.TextureID
-                if type(textureId)~="string" or textureId=="" then
-                    -- SurfaceAppearance maps can't always be written from a client, so also
-                    -- give the part its colour map as a plain texture
-                    for _,candidate in ipairs(record.nodes) do
-                        if candidate.class=="SurfaceAppearance" and candidate.parentId==node.nodeId
-                            and candidate.properties and type(candidate.properties.ColorMap)=="string" then
-                            textureId=candidate.properties.ColorMap;break
-                        end
-                    end
-                end
-                if type(textureId)=="string" and textureId~="" then pcall(function() object.TextureID=textureId end) end
-            end
             for key,value in pairs(node.attributes or {}) do pcall(function() object:SetAttribute(key,decode(value,objects)) end) end
             if node.class=="Tool" and node.properties.Grip then
                 model:SetAttribute("VisualsV2_CapturedGrip",decode(node.properties.Grip))
             end
-            if node.class=="MeshPart" and not realMeshes[node.nodeId] then
+            if node.class=="MeshPart" then
                 local mesh=Instance.new("SpecialMesh")
                 mesh.Name="VisualsV2_CapturedMesh"
                 mesh.MeshType=Enum.MeshType.FileMesh
@@ -9607,11 +9713,24 @@ local GRIP_GROUPS={
     {rel=CFrame.new(0,0,0,1,0,0,0,0,-1,0,1,0),offset=Vector3.new(-0.1500,-0.2443,0.1668)}, -- RedLuger
     {rel=CFrame.new(0,0,0,1,-8.11207e-06,-1.15843e-05,-8.11207e-06,0.173612,-0.984819,1.15843e-05,0.984819,0.173612),offset=Vector3.new(-0.1000,-0.3337,0.4030)}, -- ElderwoodGun
 }
--- Exact held grips recorded in MM2, keyed by model mesh. The 2024-2026 event guns
--- (Floral, Aquarium, Duckies, ... 46 in total) all share mesh 6600918074.
+-- Exact held grips recorded in MM2, keyed by model mesh and only used when the model's
+-- size matches the recording (chroma versions of some knives use a rotated model).
+-- Guns: the 2024-2026 event guns (Floral, Aquarium, Duckies, ... 46 in total) share
+-- mesh 6600918074. Knives: Batwing and Nik's Scythe share the Batwing scythe model;
+-- the classic mesh is used by about 190 knives.
 local KNOWN_GRIPS={
-    ["6600918074"]={size=Vector3.new(1.83,0.95,0.325),
+    ["6600918074"]={kind="Gun",size=Vector3.new(1.83,0.95,0.325),
         grip=CFrame.new(0.6997261,-0.3059801,0.0010891,0,0,1,0,1,0,-1,0,0)},
+    ["305826272"]={kind="Knife",size=Vector3.new(0.25,2.9,1.6),
+        grip=CFrame.new(0,-0.8515663,0.3104025)},
+    ["77738838473091"]={kind="Knife",size=Vector3.new(0.4327235,3.3586948,1.9186603),
+        grip=CFrame.new(0,-0.8397148,0)},
+    ["92263601594064"]={kind="Knife",size=Vector3.new(0.3119834,3.6274931,1.9227760),
+        grip=CFrame.new(0,-0.6625369,0.2304325)},
+    ["88250692342609"]={kind="Knife",size=Vector3.new(0.4038950,3.4534402,1.0080675),
+        grip=CFrame.new(0,-1.0000004,-0.0851784)},
+    ["121944778"]={kind="Knife",size=Vector3.new(0.4,3,0.7),
+        grip=CFrame.new(0,-1,-0.1)},
 }
 local function snapAxis(v)
     local ax,ay,az=math.abs(v.X),math.abs(v.Y),math.abs(v.Z)
@@ -9827,7 +9946,7 @@ local function buildTemplate(entry)
         if ancestor:IsA("Tool") then grip=ancestor.Grip; break end
         ancestor=ancestor.Parent
     end
-    if entry.kind=="Gun" and not useToolGrip then
+    if not useToolGrip then
         local meshId
         if root:IsA("MeshPart") then meshId=assetId(root.MeshId)
         else
@@ -9835,10 +9954,31 @@ local function buildTemplate(entry)
             meshId=mesh and assetId(mesh.MeshId)
         end
         local known=meshId and KNOWN_GRIPS[meshId]
-        if known then
-            local scale=Vector3.new(root.Size.X/known.size.X,root.Size.Y/known.size.Y,root.Size.Z/known.size.Z)
-            grip=CFrame.new(known.grip.Position*scale)*known.grip.Rotation
-            useToolGrip=true
+        if known and known.kind==entry.kind then
+            local size=root.Size
+            local matches=math.abs(size.X-known.size.X)<=known.size.X*0.06+0.01
+                and math.abs(size.Y-known.size.Y)<=known.size.Y*0.06+0.01
+                and math.abs(size.Z-known.size.Z)<=known.size.Z*0.06+0.01
+            if matches then grip=known.grip;useToolGrip=true end
+        end
+    end
+    if entry.kind=="Knife" and not useToolGrip then
+        -- Every scythe is held the way the real Batwing is: hand on the shaft 29% of the
+        -- model's height below its centre, upright. The shaft sits where the belt
+        -- attachment is when the model has one, otherwise 19% toward the back like the
+        -- Batwing. The plain Gingerscythes are drawn from a default-size brick, so they use
+        -- the measured size of the other Gingerscythes.
+        local key=compact(entry.id)..compact(entry.name)
+        if key:find("scythe",1,true) or compact(entry.id)=="icewing" then
+            local size=root.Size
+            if key:find("gingerscythe",1,true) and size.X>3 and size.Y<1.5 then
+                size=Vector3.new(0.2018069,3.4817379,0.8913928)
+            end
+            local x,z=0,0.194002*size.Z
+            if attachment and attachment.Name=="CustomAttachment" then
+                x,z=attachment.Position.X,attachment.Position.Z
+            end
+            grip=CFrame.new(x,-0.293643*size.Y,z);useToolGrip=true
         end
     end
     if entry.kind=="Gun" and not useToolGrip and attachment and attachment.Name=="CustomAttachment" and attachmentGrip then
@@ -10353,38 +10493,12 @@ local function restoreVisuals(state)
     state.welds=nil
 end
 
-local function meshedParent(decal)
-    local parent=decal.Parent
-    if parent and parent:IsA("BasePart") and not parent:IsA("MeshPart") then
-        for _,child in ipairs(parent:GetChildren()) do
-            if child:IsA("SpecialMesh") and child.MeshType==Enum.MeshType.FileMesh then return parent,child end
-        end
-    end
-end
 local function chromaTargets(model,root)
     local targets={}
-    local seenParts={}
-    for _,decal in ipairs(model:GetDescendants()) do
-        -- A decal only paints the hidden brick, never the mesh, so it shows up as a flat slab
-        -- floating beside the hand. Hide it and tint the mesh itself instead.
-        if decal:IsA("Decal") then
-            local part=meshedParent(decal)
-            if part then
-                local name=compact(decal.Name)
-                if name=="chroma" or name=="glow" or decal:GetAttribute("Chroma")==true then
-                    decal.Transparency=1
-                    if name~="glow" and not seenParts[part] then
-                        seenParts[part]=true
-                        targets[#targets+1]=part
-                    end
-                end
-            end
-        end
-    end
     for _,part in ipairs(model:GetDescendants()) do
         if part:IsA("Decal") and (part:GetAttribute("Chroma")==true or compact(part.Name)=="chroma") then
-            if not meshedParent(part) then targets[#targets+1]=part end
-        elseif part:IsA("BasePart") and not seenParts[part] then
+            targets[#targets+1]=part
+        elseif part:IsA("BasePart") then
             local marked=part:GetAttribute("Chroma")==true or compact(part.Name):find("chroma",1,true)~=nil
             for _,child in ipairs(part:GetChildren()) do
                 if child:IsA("DataModelMesh") and compact(child.Name):find("chroma",1,true) then marked=true end
@@ -10899,7 +11013,7 @@ env.VisualsV2Runtime.ClientWeaponSkins={
     end,
     GetNativeHolster=function(kind) return nativeHolster(player.Character,kind) end,
     GetDiagnostics=function()
-        local report={build="2026-10-17-fixes-1",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
+        local report={build="2026-10-17-fixes-4",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
         for kind,settings in pairs(kinds) do
             local entry=catalog[kind][settings.selected]
             local key=entry and cacheKey(entry)
@@ -12588,10 +12702,24 @@ local function referenceKind(current)
     referenceMemo[current]={frame=referenceFrame,kind=candidate,ambiguous=ambiguous}
     return candidate,ambiguous
 end
+local excludedSet=setmetatable({}, {__mode="k"})
+local function excludedAncestor(object)
+    if excludedSet[object] then return true end
+    if object:GetAttribute("VisualsV2_InventoryVisual") then return true end
+    local name=compactName(object)
+    if excludedName(name) then excludedSet[object]=true;return true end
+    if name=="inventory" or name=="inventory2" then
+        local main=object:FindFirstChild("Main") or object
+        if main:FindFirstChild("Weapons") or main:FindFirstChild("Effects") or main:FindFirstChild("Pets") then
+            excludedSet[object]=true;return true
+        end
+    end
+    return false
+end
 local function context(object)
     local probe=object
     while probe and not hudRoots[probe] do
-        if excludedName(compactName(probe)) then return nil end
+        if excludedAncestor(probe) then return nil end
         probe=probe.Parent
     end
     if not probe then return nil end
@@ -12704,8 +12832,15 @@ schedule=function()
     task.defer(function() queued=false;if alive and runtimeAlive then refresh() end end)
 end
 
+local imageBatch=env.VisualsV2Runtime.MakeBatcher(function(object)
+    if alive and runtimeAlive and object.Parent then consider(object) end
+end,0.002)
+local function queueImage(object)
+    if object:IsA("ImageLabel") or object:IsA("ImageButton") then imageBatch.Push(object) end
+end
 local function bindGui()
     disconnect(guiConnections)
+    imageBatch.Clear()
     for object,record in pairs(images) do restoreImage(object,record);record.connection:Disconnect() end
     table.clear(images)
     table.clear(hudRoots)
@@ -12721,14 +12856,14 @@ local function bindGui()
         local ok,objects=pcall(function() return root:GetDescendants() end)
         if ok then
             stats.scans=stats.scans+1
-            for _,object in ipairs(objects) do pcall(consider,object) end
+            for _,object in ipairs(objects) do queueImage(object) end
             local connected,connection=pcall(function() return root.DescendantAdded:Connect(function(object)
-                pcall(consider,object)
+                queueImage(object)
                 if object:IsA("ObjectValue") and object.Parent then
                     referenceMemo[object.Parent]=nil
                     task.defer(function()
                         if not alive or not runtimeAlive or not object.Parent then return end
-                        for _,image in ipairs(object.Parent:GetDescendants()) do pcall(consider,image) end
+                        for _,image in ipairs(object.Parent:GetDescendants()) do queueImage(image) end
                         schedule()
                     end)
                 end
@@ -13594,8 +13729,17 @@ local function suspendRecord(record)
     end
 end
 local function updateRecord(record)
-    if inTrade() or excludedInventory(record.main) then suspendRecord(record);return end
-    if record.trading then record.trading=false;record.dirty=true;record.filterDirty=true end
+    if inTrade() or excludedInventory(record.main) then
+        record.tradeEndedAt=nil
+        suspendRecord(record);return
+    end
+    if record.trading then
+        local now=os.clock()
+        record.tradeEndedAt=record.tradeEndedAt or now
+        if now-record.tradeEndedAt<2 then return end
+        record.tradeEndedAt=nil
+        record.trading=false;record.dirty=true;record.filterDirty=true
+    end
     local isOpen=visible(record.main)
     if record.open~=isOpen then record.filterDirty=true end
     record.open=isOpen
@@ -13640,10 +13784,22 @@ local function updateRecord(record)
         if inTrade() then suspendRecord(record);return end
         filterCards(record)
         sortNativeCards(record)
-        -- No yield while publishing: the first rendered list has its final order.
+        -- While the inventory is open, publish in one go so the list appears in its
+        -- final order. While it's closed, publish in small chunks to avoid a freeze.
+        local chunked=not visible(record.main)
+        local moved=0
         for key,card in pairs(record.cards) do
+            if generation~=record.generation or not alive or not runtimeAlive then return end
             if not enabled(card.kind) or not card.target.Parent or nativeOwns(card.kind,card.id) then removeCard(record,key)
-            elseif card.frame.Parent==record.staging then card.frame.Parent=card.target end
+            elseif card.frame.Parent==record.staging then
+                card.frame.Parent=card.target
+                moved=moved+1
+                if chunked and moved%40==0 then
+                    task.wait()
+                    if inTrade() then suspendRecord(record);return end
+                    if visible(record.main) then chunked=false end
+                end
+            end
         end
         record.building=false
         loadVisibleImages(record)
@@ -13661,16 +13817,32 @@ local function forgetRecord(record)
     for kind,template in pairs(record.templates) do template:Destroy();record.templates[kind]=nil end
 end
 
+-- Walks the GUI top-down and stops at excluded menus and at each inventory it finds,
+-- so it never visits the thousands of item frames (the old walk checked every one of
+-- them against all of its ancestors, which froze the game on execute).
+local discovering=false
+local function inventorySkipped(object)
+    if object:GetAttribute(MARKER) then return true end
+    local name=inventoryName(object)
+    return name:find("trade",1,true)~=nil or name:find("trading",1,true)~=nil or name=="shop"
+        or name=="spectate" or name=="inspectinventory" or name=="viewinventory"
+end
 local function discover()
     if not playerGui then return end
+    if discovering then discoveryDirty=true;return end
+    discovering=true
     stats.discoveries=stats.discoveries+1
     local pending={playerGui}
+    local started=os.clock()
     while #pending>0 do
+        if not alive or not runtimeAlive then break end
         local object=table.remove(pending)
         if tradeRoot(object) then tradeRoots[object]=true end
-        if not own(object) and not excludedInventory(object) then
+        if object==playerGui or (object.Parent and not inventorySkipped(object)) then
+            local registered=false
             if object.Name=="Inventory" or object.Name=="Inventory2" then
                 local main=child(object,"Main")
+                if main and child(main,"Weapons") then registered=true end
                 if main and child(main,"Weapons") and not records[main] then
                     local record={main=main,cards={},previews={},canvases={},templates={},waiting={},generation=0,
                         building=false,dirty=true,open=false,filterDirty=true,visibilityConnections={},imageWatches={},imageConnections={},
@@ -13702,9 +13874,14 @@ local function discover()
                     cacheFilters(record)
                 end
             end
-            for _,child in ipairs(object:GetChildren()) do pending[#pending+1]=child end
+            if not registered then
+                for _,item in ipairs(object:GetChildren()) do pending[#pending+1]=item end
+            end
         end
+        if os.clock()-started>=0.002 then task.wait();started=os.clock() end
     end
+    discovering=false
+    if discoveryDirty and alive and runtimeAlive and schedule then schedule() end
 end
 
 refresh=function()
@@ -15487,6 +15664,12 @@ local function connectProperty(object,record,property,callback)
     local ok,connection=pcall(function()
         return object:GetPropertyChangedSignal(property):Connect(function()
             if alive and runtimeAlive and not resetting and record.writing==0 and records[object]==record then
+                -- If a game script keeps changing this back (text fitting, name labels), stop
+                -- fighting it for a moment instead of looping with it and freezing the game.
+                local now=os.clock()
+                if now-(record.burstAt or 0)>1 then record.burstAt=now;record.burst=0 end
+                record.burst=(record.burst or 0)+1
+                if record.burst>8 then return end
                 pcall(callback)
             end
         end)
@@ -15549,6 +15732,15 @@ end
 local function refreshObject(object)
     if inRoots(object) then pcall(process,object) else release(object) end
 end
+-- Text and image objects are handled a slice at a time; MM2 adds thousands of labels at
+-- once (inventory, trading) and handling them all in one frame froze the game.
+local function guiRelevant(object)
+    return object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")
+        or object:IsA("ImageLabel") or object:IsA("ImageButton")
+end
+local fontBatch=env.VisualsV2Runtime.MakeBatcher(function(object)
+    if alive and runtimeAlive and not resetting then refreshObject(object) end
+end,0.003)
 
 refresh=function()
     if resetting then return end
@@ -15570,17 +15762,24 @@ refresh=function()
         for _,root in ipairs(roots) do
             pcall(function()
                 rootConnections[#rootConnections+1]=root.DescendantAdded:Connect(function(object)
-                    refreshObject(object)
-                    task.defer(function() refreshObject(object) end)
+                    if guiRelevant(object) then fontBatch.Push(object) end
                 end)
                 rootConnections[#rootConnections+1]=root.DescendantRemoving:Connect(function(object)
-                    task.defer(function() if not inRoots(object) then release(object) end end)
+                    if records[object] then fontBatch.Push(object) end
                 end)
-                for _,object in ipairs(root:GetDescendants()) do pcall(process,object) end
+                for _,object in ipairs(root:GetDescendants()) do
+                    if guiRelevant(object) then fontBatch.Push(object) end
+                end
             end)
         end
     end
-    for object in pairs(records) do refreshObject(object) end
+    if #roots==0 or not runtimeAlive then
+        -- turning the feature off (or unloading) restores everything right away
+        fontBatch.Clear()
+        for object in pairs(records) do refreshObject(object) end
+    else
+        for object in pairs(records) do fontBatch.Push(object) end
+    end
 end
 
 local fontToggle=addToggle(fontSection,"Enable Custom Fonts",fontsEnabled,function(value)
@@ -16109,6 +16308,24 @@ local savedPositions = loadPositions()
 
 local BBSystem = {Buttons = {}, Connections = {}, Maids = {}}
 local BindableButtons
+-- Each run owns its own button containers. A container left over from the previous run
+-- (with a dead copy of the button sitting on top of the new one) is removed instead of
+-- reused; that dead copy is why the bind button stopped responding after re-executing.
+local STORAGE_TOKEN = tostring(os.clock()) .. ":" .. tostring(math.random(1, 1e9))
+local function ownedStorage(parent, name)
+    for _, root in ipairs({parent, getfserv("CoreGui"), __PLRS.LocalPlayer:FindFirstChildOfClass("PlayerGui")}) do
+        if typeof(root) == "Instance" then
+            for _, existing in ipairs(root:GetChildren()) do
+                if existing.Name == name and existing:GetAttribute("VV2StorageToken") ~= STORAGE_TOKEN then
+                    pcall(function() existing:Destroy() end)
+                end
+            end
+        end
+    end
+    local sg = parent:FindFirstChild(name)
+    if sg and sg:GetAttribute("VV2StorageToken") == STORAGE_TOKEN then return sg end
+    return nil
+end
 
 local function bb_safecallback(callback)
     if not callback then return end
@@ -16128,10 +16345,11 @@ local function BB_GetStorage()
         parent = __PLRS.LocalPlayer:WaitForChild("PlayerGui")
     end
 
-    local sg = parent:FindFirstChild("VV2_BombJump_BigStorage")
+    local sg = ownedStorage(parent, "VV2_BombJump_BigStorage")
     if not sg then
         sg = Instance.new("ScreenGui")
         sg.Name = "VV2_BombJump_BigStorage"
+        sg:SetAttribute("VV2StorageToken", STORAGE_TOKEN)
         sg.ResetOnSpawn = false
         sg.IgnoreGuiInset = true
         pcall(function() sg.ScreenInsets = Enum.ScreenInsets.None end)
@@ -16344,10 +16562,11 @@ local function Bind_GetStorage()
         parent = __PLRS.LocalPlayer:WaitForChild("PlayerGui")
     end
 
-    local sg = parent:FindFirstChild("VV2_BombJump_BindStorage")
+    local sg = ownedStorage(parent, "VV2_BombJump_BindStorage")
     if not sg then
         sg = Instance.new("ScreenGui")
         sg.Name = "VV2_BombJump_BindStorage"
+        sg:SetAttribute("VV2StorageToken", STORAGE_TOKEN)
         sg.ResetOnSpawn = false
         sg.IgnoreGuiInset = true
         pcall(function() sg.ScreenInsets = Enum.ScreenInsets.None end)
@@ -17345,10 +17564,11 @@ vv2Features.Close=function()
         if record.thread and type(task.cancel)=="function" then pcall(task.cancel,record.thread) end
         pending[record]=nil
     end
-    for _,controller in ipairs(vv2Controls) do controller:Set(false) end
-    for id in pairs(BBSystem.Buttons) do DeleteBigButton(id) end
-    for id in pairs(BindableButtons.Buttons) do BindableButtons.DeleteBButton(id) end
-    RootMaid:Destroy()
+    -- every step is protected so one failing control can't leave old buttons behind
+    for _,controller in ipairs(vv2Controls) do pcall(function() controller:Set(false) end) end
+    for id in pairs(BBSystem.Buttons) do pcall(DeleteBigButton,id) end
+    for id in pairs(BindableButtons.Buttons) do pcall(BindableButtons.DeleteBButton,id) end
+    pcall(function() RootMaid:Destroy() end)
 end
 env.VisualsV2Runtime.VV2BombJump=vv2Features
 env.VisualsV2Runtime.RegisterReset(vv2Features.Close)
@@ -18339,7 +18559,7 @@ local function discoverTargets(force)
     for index,f in ipairs(objects) do
         if not alive or not runtimeAlive or targetEpoch~=epoch or not inventoryEnabled then scanningTargets=false;return end
         if type(f)=="function" then inspect(f,false) end
-        if index%64==0 or os.clock()-slice>=0.002 then
+        if os.clock()-slice>=0.004 then
             perf.scanYields=perf.scanYields+1
             task.wait()
             slice=os.clock()
@@ -18524,6 +18744,7 @@ local function scanSlotReferences(gui)
     perf.guiScans=perf.guiScans+1
     local pending={gui}
     local count=0
+    local sliceStart=os.clock()
     while #pending>0 and alive and runtimeAlive and observedGui==gui do
         local object=table.remove(pending)
         local skip=object~=gui and (object.Name:sub(1,10)=="VisualsV2_" or object:GetAttribute("VisualsV2_InventoryVisual"))
@@ -18536,7 +18757,7 @@ local function scanSlotReferences(gui)
             for _,child in ipairs(object:GetChildren()) do pending[#pending+1]=child end
         end
         count=count+1
-        if count%96==0 then task.wait() end
+        if count%64==0 and os.clock()-sliceStart>=0.003 then task.wait();sliceStart=os.clock() end
     end
 end
 local function orderSelectedTools(char,backpack,token)
@@ -18606,6 +18827,28 @@ local function cancelRecovery()
     cancelToyRequests()
 end
 
+-- How many tools the hotbar is actually showing versus how many the player has.
+local function hotbarCounts(char)
+    local backpack=getBackpack()
+    local shownTools={}
+    for reference in pairs(slotReferences) do
+        local ok,value=pcall(function() return reference.Value end)
+        if ok and typeof(value)=="Instance" and value:IsA("Tool") and (value.Parent==char or value.Parent==backpack)
+            and reference.Parent and reference.Parent:IsA("GuiObject") and reference.Parent.Visible then
+            shownTools[value]=true
+        end
+    end
+    local shown,owned=0,0
+    for _ in pairs(shownTools) do shown=shown+1 end
+    for _,container in ipairs({char,backpack}) do
+        if container then
+            for _,item in ipairs(container:GetChildren()) do if item:IsA("Tool") then owned=owned+1 end end
+        end
+    end
+    return shown,owned
+end
+local TOY_MAX_ATTEMPTS=8
+local TOY_RETRY={0.4,0.6,0.9,1.3,2,2.5,3,3}
 local function isCurrentRecovery(token,char)
     return alive and runtimeAlive and token==recoveryToken
         and player.Character==char and char~=removingCharacter
@@ -18634,6 +18877,9 @@ requestRecovery=function(forceScan)
         local nextStaleCheck=0
         local lastRetryScan=startedAt
         local retryScans=0
+        local nextCapacityCheck=startedAt+2
+        local shortChecks=0
+        local lastCapacityRescan=-math.huge
         while isCurrentRecovery(token,char) and os.clock()<recoveryDeadline do
             local now=os.clock()
             -- keep maintaining the limit for as long as Increase Inventory is on, not
@@ -18661,6 +18907,22 @@ requestRecovery=function(forceScan)
                         force=true
                     end
                 end
+                if inventoryEnabled and targetsScanned and now>=nextCapacityCheck then
+                    nextCapacityCheck=now+1
+                    local shown,owned=hotbarCounts(char)
+                    if shown>=1 and owned>3 and shown<=3 and shown<math.min(owned,inventoryLimit) then
+                        shortChecks=shortChecks+1
+                    else
+                        shortChecks=0
+                    end
+                    if shortChecks>=2 and now-lastCapacityRescan>=12 then
+                        shortChecks=0;lastCapacityRescan=now
+                        targetEpoch=targetEpoch+1
+                        targetsScanned=false
+                        lastTargetScan=-math.huge
+                        force=true
+                    end
+                end
                 if inventoryEnabled and (force or (targetsScanned and now>=nextInventoryApply)) then
                     applyInventoryLimit(force)
                     nextInventoryApply=now+(now-startedAt>20 and 3 or 1)
@@ -18678,48 +18940,55 @@ requestRecovery=function(forceScan)
                         toyOrderDirty=false
                     end
                 end
-                if autoGetTools and not activeToyRequest and now>=nextToyRequest then
+                -- Every missing toy is requested straight away (a few hundredths of a second
+                -- apart) instead of one at a time with long waits, and a toy that still
+                -- hasn't arrived is asked for again quickly.
+                if autoGetTools and now>=nextToyRequest then
                     local backpack=getBackpack()
                     local folder=findToyFolder()
                     local remote=toyRemote()
                     if backpack and folder and remote then
                         local seen={}
+                        local queuedNow=0
                         for slot=1,4 do
                             local name=selectedToys[slot]
                             if name and name~="None" and not seen[name] then
                                 seen[name]=true
-                                if not hasSelectedTool(name,char,backpack) then
+                                if hasSelectedTool(name,char,backpack) then
+                                    -- got it; if the game takes it away later, start over
+                                    local done=toyAttempts[name]
+                                    if done and not done.inFlight then toyAttempts[name]=nil end
+                                else
                                     local attempt=toyAttempts[name]
                                     if not attempt then
                                         attempt={count=0,nextAt=0,inFlight=false}
                                         toyAttempts[name]=attempt
                                     end
-                                    if folder:FindFirstChild(name) and not attempt.inFlight and attempt.count<6 and now>=attempt.nextAt then
+                                    if folder:FindFirstChild(name) and not attempt.inFlight and attempt.count<TOY_MAX_ATTEMPTS and now>=attempt.nextAt then
                                         attempt.count=attempt.count+1
-                                        attempt.nextAt=now+math.min(3,0.75+attempt.count*0.5)
                                         attempt.inFlight=true
-                                        activeToyRequest=attempt
-                                        nextToyRequest=now+0.25
+                                        local delayTime=queuedNow*0.08
+                                        queuedNow=queuedNow+1
                                         attempt.thread=task.spawn(function()
-                                            if isCurrentRecovery(token,char) and autoGetTools then
+                                            if delayTime>0 then task.wait(delayTime) end
+                                            if isCurrentRecovery(token,char) and autoGetTools
+                                                and not hasSelectedTool(name,char,getBackpack()) then
                                                 pcall(function() remote:InvokeServer(name) end)
                                             end
                                             attempt.inFlight=false
                                             attempt.thread=nil
-                                            attempt.nextAt=math.max(attempt.nextAt,os.clock()+math.min(3,0.75+attempt.count*0.5))
-                                            if activeToyRequest==attempt then activeToyRequest=nil end
+                                            attempt.nextAt=os.clock()+(TOY_RETRY[attempt.count] or 3)
                                             if isCurrentRecovery(token,char) and autoGetTools then requestRecovery(false) end
                                         end)
                                     end
-
-                                    break
                                 end
                             end
                         end
+                        if queuedNow>0 then nextToyRequest=now+0.05 end
                     end
                 end
             end
-            task.wait(0.2)
+            task.wait(os.clock()-startedAt<8 and 0.1 or 0.2)
         end
         if token==recoveryToken then recoveryRunning=false end
     end)
@@ -18892,7 +19161,7 @@ lifecycleConnections[#lifecycleConnections+1]=player.CharacterAdded:Connect(func
     removingCharacter=nil
     watchCharacter(char)
     watchBackpack(player:FindFirstChildOfClass("Backpack"))
-    requestRecovery(inventoryEnabled)
+    requestRecovery(false)
 end)
 lifecycleConnections[#lifecycleConnections+1]=player.ChildAdded:Connect(function(child)
     if child:IsA("Backpack") then
@@ -19319,17 +19588,38 @@ local state={
 }
 local originalShadows=Lighting.GlobalShadows
 local function isPlayer(o) for _,p in ipairs(P:GetPlayers()) do if p.Character and o:IsDescendantOf(p.Character) then return true end end return false end
+-- Whole-map passes run a few milliseconds per frame instead of all at once; with several
+-- of these on, the old single pass froze the game for seconds after executing.
+local passTokens={}
+local function mapPass(key,fn)
+    local token={}
+    passTokens[key]=token
+    task.spawn(function()
+        local list=workspace:GetDescendants()
+        local started=os.clock()
+        for _,o in ipairs(list) do
+            if passTokens[key]~=token or not runtimeAlive then return end
+            pcall(fn,o)
+            if os.clock()-started>=0.003 then task.wait();started=os.clock() end
+        end
+        if passTokens[key]==token then passTokens[key]=nil end
+    end)
+end
+local function stopPass(key) passTokens[key]=nil end
+local function smoothOne(o) if o:IsA("BasePart") and not isPlayer(o) then if originalMat[o]==nil then originalMat[o]=o.Material end; o.Material=Enum.Material.SmoothPlastic end end
 local function setSmooth(on)
     if conns.s then conns.s:Disconnect(); conns.s=nil end
+    stopPass("s")
     if on then
-        for _,o in ipairs(workspace:GetDescendants()) do if o:IsA("BasePart") and not isPlayer(o) then if originalMat[o]==nil then originalMat[o]=o.Material end; o.Material=Enum.Material.SmoothPlastic end end
-        conns.s=workspace.DescendantAdded:Connect(function(o) if o:IsA("BasePart") and not isPlayer(o) then if originalMat[o]==nil then originalMat[o]=o.Material end; o.Material=Enum.Material.SmoothPlastic end end)
+        mapPass("s",smoothOne)
+        conns.s=workspace.DescendantAdded:Connect(smoothOne)
     else for o,v in pairs(originalMat) do if o and o.Parent then pcall(function() o.Material=v end) end end; originalMat={} end
 end
 local function setParticles(on)
     if conns.p then conns.p:Disconnect(); conns.p=nil end
     local function one(o) if o:IsA("ParticleEmitter") or o:IsA("Trail") then if originalPart[o]==nil then originalPart[o]=o.Enabled end; o.Enabled=false end end
-    if on then for _,o in ipairs(workspace:GetDescendants()) do one(o) end; conns.p=workspace.DescendantAdded:Connect(one)
+    stopPass("p")
+    if on then mapPass("p",one); conns.p=workspace.DescendantAdded:Connect(one)
     else for o,v in pairs(originalPart) do if o and o.Parent then pcall(function() o.Enabled=v end) end end; originalPart={} end
 end
 local function setMeshes(on)
@@ -19339,13 +19629,15 @@ local function setMeshes(on)
         local p=(o:IsA("MeshPart") and o) or ((o:IsA("SpecialMesh") or o:IsA("BlockMesh") or o:IsA("CylinderMesh")) and o.Parent)
         if p and p:IsA("BasePart") and not isPlayer(p) then if originalPart[p]==nil then originalPart[p]=p.Transparency end; p.Transparency=1 end
     end
-    if on then for _,o in ipairs(workspace:GetDescendants()) do one(o) end; conns.m=workspace.DescendantAdded:Connect(one)
+    stopPass("m")
+    if on then mapPass("m",one); conns.m=workspace.DescendantAdded:Connect(one)
     else for o,v in pairs(originalPart) do if o and o.Parent and o:IsA("BasePart") then pcall(function() o.Transparency=v end) end end end
 end
 local function setTextures(on)
     if conns.t then conns.t:Disconnect(); conns.t=nil end
     local function one(o) if o:IsA("Decal") or o:IsA("Texture") then if originalTex[o]==nil then originalTex[o]=o.Texture end; o.Texture="" end end
-    if on then for _,o in ipairs(workspace:GetDescendants()) do one(o) end; conns.t=workspace.DescendantAdded:Connect(one)
+    stopPass("t")
+    if on then mapPass("t",one); conns.t=workspace.DescendantAdded:Connect(one)
     else for o,v in pairs(originalTex) do if o and o.Parent then pcall(function() o.Texture=v end) end end; originalTex={} end
 end
 local function setAccessories(on)
@@ -19364,6 +19656,7 @@ local function setGray(on)
 end
 local function setFrame(on)
     if frameConn then frameConn:Disconnect(); frameConn=nil end
+    stopPass("f")
     local function degrade(o)
         if o:IsA("BasePart") then o.CastShadow=false; pcall(function() o.RenderFidelity=Enum.RenderFidelity.Disabled end)
         elseif o:IsA("ParticleEmitter") or o:IsA("Trail") or o:IsA("Smoke") or o:IsA("Fire") or o:IsA("Sparkles") or o:IsA("PointLight") or o:IsA("SpotLight") or o:IsA("SurfaceLight") then o.Enabled=false end
@@ -19372,7 +19665,7 @@ local function setFrame(on)
         Lighting.GlobalShadows=false; Lighting.Brightness=1; Lighting.ClockTime=14
         pcall(function() settings().Rendering.QualityLevel=Enum.QualityLevel.Level01; settings().Rendering.MeshPartDetailLevel=Enum.MeshPartDetailLevel.Disabled end)
         pcall(function() workspace.Terrain.Decoration=false end)
-        for _,o in ipairs(workspace:GetDescendants()) do degrade(o) end; frameConn=workspace.DescendantAdded:Connect(degrade)
+        mapPass("f",degrade); frameConn=workspace.DescendantAdded:Connect(degrade)
     else
         pcall(function() settings().Rendering.QualityLevel=Enum.QualityLevel.Automatic; settings().Rendering.MeshPartDetailLevel=Enum.MeshPartDetailLevel.Full end)
         pcall(function() workspace.Terrain.Decoration=true end)
@@ -19442,6 +19735,14 @@ local function setWeaponDisplays(on)
         end
     end)
     removeWeaponDisplays()
+    -- Keep checking while it's on: after re-executing, the game (or the previous copy of
+    -- the add-on shutting down) can put the displays back after this first pass.
+    task.spawn(function()
+        while runtimeAlive and state.weaponDisplays and weaponDisplayRevision==revision do
+            task.wait(1)
+            if runtimeAlive and state.weaponDisplays and weaponDisplayRevision==revision then removeWeaponDisplays() end
+        end
+    end)
 end
 
 section:AddButton("VV2 Remove Weapon Displays",removeWeaponDisplays)
@@ -19587,4 +19888,7 @@ end)()
 saveConfig()
 
 -- Initial control restoration finishes before enabling UI click feedback.
-task.defer(function() task.defer(function() controlsReady=true end) end)
+task.defer(function()
+    while restoreRunning and runtimeAlive do task.wait() end
+    task.defer(function() controlsReady=true end)
+end)
