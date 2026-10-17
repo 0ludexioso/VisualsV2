@@ -217,7 +217,12 @@ local function queueRestore(callback)
             local item=restoreQueue[index]
             restoreQueue[index]=false
             index=index+1
-            pcall(item)
+            -- each restore runs in its own thread, so one that waits on the network
+            -- (loading an aura, applying a character change) can't hold up the rest
+            local itemStarted=os.clock()
+            task.spawn(function() pcall(item) end)
+            local perf=env.VisualsV2Runtime and env.VisualsV2Runtime.Perf
+            if perf then perf.Add("Restoring settings",os.clock()-itemStarted) end
             if os.clock()-started>=0.006 then task.wait();started=os.clock() end
         end
         table.clear(restoreQueue)
@@ -226,30 +231,39 @@ local function queueRestore(callback)
 end
 
 local function addToggle(section, name, defaultValue, callback)
-    local state = false
+    -- uiState is what the hub's toggle shows, applied is what our callback last ran with.
+    -- They are tracked apart because the hub can report a state while the toggle is still
+    -- being built; counting that as "already on" left restored features showing as on
+    -- without ever starting, until they were switched off and on again.
+    local uiState = false
+    local applied = false
     local rawToggle
     local constructing=true
 
+    local function apply(newState)
+        if applied == newState then return end
+        applied = newState
+        callback(newState)
+    end
+
     rawToggle = section:AddToggle(name, function(newState)
-        state = not not newState
-        if not constructing and (runtimeAlive or not state) then callback(state) end
+        uiState = not not newState
+        if constructing then return end
+        if runtimeAlive or not uiState then apply(uiState) end
     end)
     constructing=false
 
     local controller = {}
     function controller:Set(newState)
         newState = not not newState
-        if newState == state then return end
-
-        silentControl(rawToggle)
-        if state ~= newState then silentControl(rawToggle) end
-        if state ~= newState then
-            state = newState
-            callback(newState)
+        if uiState ~= newState then
+            silentControl(rawToggle)
+            if uiState ~= newState then silentControl(rawToggle) end
         end
+        if applied ~= newState and (runtimeAlive or not newState) then apply(newState) end
     end
     function controller:Get()
-        return state
+        return applied
     end
 
     queueRestore(function()
@@ -338,7 +352,7 @@ end
 
 loadConfig()
 
-env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-17-fixes-4"}
+env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-17-fixes-5"}
 -- Time-budgeted work queue. Big GUI changes (boot, opening the inventory, trading)
 -- push their objects here and they are handled a slice at a time instead of all at once.
 env.VisualsV2Runtime.MakeBatcher = function(handler, budget)
@@ -403,6 +417,150 @@ end
 bridge.Parent=LocalPlayer
 runtime.RegisterReset(function()
     if not runtimeAlive then bridge:Destroy() end
+end)
+end)()
+
+-- Shared trade-window state. When a trade is open the game builds (and rebuilds, every
+-- time an item is added) a huge list of item frames; the GUI watchers below check this
+-- flag first and skip that flood entirely instead of inspecting every new frame.
+;(function()
+local runtime=env.VisualsV2Runtime
+local trade={active=false,roots={},listeners={}}
+runtime.Trade=trade
+local exact={trade=true,trading=true,tradegui=true,tradinggui=true,tradeframe=true,tradewindow=true,tradescreen=true}
+local function isRoot(object)
+    local ok,result=pcall(function()
+        local name=object.Name:lower():gsub("[^%w]","")
+        if object:IsA("ScreenGui") then
+            return exact[name]==true or name:sub(1,8)=="tradegui" or name:sub(1,10)=="tradinggui"
+        end
+        return object:IsA("GuiObject") and not object:IsA("GuiButton") and exact[name]==true
+    end)
+    return ok and result==true
+end
+local function shown(object,gui)
+    local current=object
+    while current and current~=gui do
+        if current:IsA("GuiObject") and not current.Visible then return false end
+        if current:IsA("LayerCollector") and not current.Enabled then return false end
+        current=current.Parent
+    end
+    return current==gui
+end
+local gui
+local function scan()
+    gui=LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    table.clear(trade.roots)
+    if not gui then return end
+    -- trade windows sit near the top of PlayerGui, so a shallow walk finds them cheaply
+    local pending={{gui,0}}
+    local inspected=0
+    while #pending>0 and inspected<4000 do
+        local entry=table.remove(pending)
+        for _,child in ipairs(entry[1]:GetChildren()) do
+            inspected=inspected+1
+            if isRoot(child) then trade.roots[#trade.roots+1]=child
+            elseif entry[2]<3 and (child:IsA("LayerCollector") or child:IsA("GuiObject") or child:IsA("Folder"))
+                and not child:IsA("ScrollingFrame") then
+                pending[#pending+1]={child,entry[2]+1}
+            end
+        end
+    end
+end
+-- A trade window only counts as open when something big in it is showing, so a trade
+-- ScreenGui the game keeps enabled with its window hidden can't leave the flag stuck on.
+local function windowOpen(root)
+    if not root.Parent or not shown(root,gui) then return false end
+    local camera=workspace.CurrentCamera
+    local viewport=camera and camera.ViewportSize
+    local area=viewport and viewport.X*viewport.Y or 0
+    local function big(object)
+        local size=object.AbsoluteSize
+        return area<=0 or size.X*size.Y>=area*0.2
+    end
+    if root:IsA("GuiObject") then return big(root) end
+    for _,child in ipairs(root:GetChildren()) do
+        if child:IsA("GuiObject") and child.Visible and big(child) then return true end
+    end
+    return false
+end
+local function update()
+    local active=false
+    for _,root in ipairs(trade.roots) do
+        if windowOpen(root) then active=true;break end
+    end
+    if active==trade.active then return end
+    trade.active=active
+    for _,listener in ipairs(trade.listeners) do task.spawn(function() pcall(listener,active) end) end
+end
+function trade.OnChanged(listener) trade.listeners[#trade.listeners+1]=listener end
+function trade.IsActive() return trade.active end
+local nextScan,elapsed=0,0
+local connection
+connection=RunService.Heartbeat:Connect(function(dt)
+    if not runtimeAlive then connection:Disconnect();trade.active=false;return end
+    elapsed=elapsed+dt
+    if elapsed<0.15 then return end
+    elapsed=0
+    local now=os.clock()
+    if now>=nextScan then nextScan=now+2;pcall(scan) end
+    pcall(update)
+end)
+pcall(scan)
+end)()
+
+-- Small performance log: how much time the add-on's GUI work took in the last 30 seconds
+-- and the longest frame in that time, so a freeze can be told apart from the game's own lag.
+;(function()
+local runtime=env.VisualsV2Runtime
+local BUCKET=10
+local buckets={}
+local perf={}
+runtime.Perf=perf
+local function bucket()
+    local index=math.floor(os.clock()/BUCKET)
+    local current=buckets[index]
+    if not current then
+        current={work={},maxFrame=0}
+        buckets[index]=current
+        buckets[index-4]=nil
+    end
+    return current
+end
+function perf.Add(name,seconds)
+    local work=bucket().work
+    work[name]=(work[name] or 0)+seconds
+end
+function perf.Wrap(name,callback)
+    return function(...)
+        local started=os.clock()
+        callback(...)
+        local work=bucket().work
+        work[name]=(work[name] or 0)+(os.clock()-started)
+    end
+end
+function perf.Report()
+    local index=math.floor(os.clock()/BUCKET)
+    local totals,longest,traded={},0,false
+    for offset=0,2 do
+        local entry=buckets[index-offset]
+        if entry then
+            for name,seconds in pairs(entry.work) do totals[name]=(totals[name] or 0)+seconds end
+            if entry.maxFrame>longest then longest=entry.maxFrame end
+            traded=traded or entry.trade==true
+        end
+    end
+    local list,sum={},0
+    for name,seconds in pairs(totals) do list[#list+1]={name,seconds};sum=sum+seconds end
+    table.sort(list,function(a,b) return a[2]>b[2] end)
+    return {total=sum,top=list,longestFrame=longest,trade=traded}
+end
+local connection
+connection=RunService.Heartbeat:Connect(function(dt)
+    if not runtimeAlive then connection:Disconnect();return end
+    local current=bucket()
+    if dt>current.maxFrame then current.maxFrame=dt end
+    if runtime.Trade and runtime.Trade.active then current.trade=true end
 end)
 end)()
 
@@ -4237,7 +4395,9 @@ local function shiftLockActive()
     return UserInputService.MouseBehavior==Enum.MouseBehavior.LockCenter
 end
 
-RunService.Heartbeat:Connect(function()
+local speedLoop
+speedLoop=RunService.Heartbeat:Connect(function()
+    if not runtimeAlive then speedLoop:Disconnect();return end
     local char=player.Character
     local humanoid=char and char:FindFirstChildOfClass("Humanoid")
     local hrp=char and char:FindFirstChild("HumanoidRootPart")
@@ -4635,7 +4795,9 @@ addDropdown(espSection, "Position", {"Top", "Middle", "Bottom"}, distancePositio
     for _, gui in pairs(distanceObjects) do if gui and gui.Parent then gui.StudsOffset = distanceOffset() end end
 end)
 
-RunService.RenderStepped:Connect(function()
+local distanceLoop
+distanceLoop=RunService.RenderStepped:Connect(function()
+    if not runtimeAlive then distanceLoop:Disconnect();return end
     if not distanceEspEnabled then return end
     local myChar = player.Character
     local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
@@ -5017,7 +5179,34 @@ end
 local virtualInput
 pcall(function() virtualInput=game:GetService("VirtualInputManager") end)
 local guiService=game:GetService("GuiService")
-local function tapButton(target)
+-- On phones and tablets a synthetic *mouse* click makes the game switch its controls to
+-- keyboard mode: the thumbstick and jump button stop working and the character looks
+-- frozen after the clutch. Touch devices are therefore tapped with a touch, and if a mouse
+-- click ever has to be used, the touch controls are switched straight back on.
+local function touchDevice()
+    if not UserInputService.TouchEnabled then return false end
+    if not UserInputService.KeyboardEnabled and not UserInputService.MouseEnabled then return true end
+    local ok,last=pcall(function() return UserInputService:GetLastInputType() end)
+    return ok and last==Enum.UserInputType.Touch
+end
+local function restoreTouchControls()
+    if not UserInputService.TouchEnabled then return end
+    task.spawn(function()
+        pcall(function()
+            local scripts=LocalPlayer:FindFirstChild("PlayerScripts")
+            local module=scripts and scripts:FindFirstChild("PlayerModule")
+            if not module or not module:IsA("ModuleScript") then return end
+            local playerModule=require(module)
+            if type(playerModule)~="table" or type(playerModule.GetControls)~="function" then return end
+            local controls=playerModule:GetControls()
+            if type(controls)=="table" and type(controls.OnLastInputTypeChanged)=="function" then
+                controls:OnLastInputTypeChanged(Enum.UserInputType.Touch)
+            end
+        end)
+    end)
+end
+local touchTapId=0
+local function tapButton(target,mode)
     if not virtualInput or not onScreen(target) then return false end
     local layer=target:FindFirstAncestorWhichIsA("LayerCollector")
     local inset=Vector2.zero
@@ -5029,29 +5218,44 @@ local function tapButton(target)
     local camera=workspace.CurrentCamera
     local viewport=camera and camera.ViewportSize or Vector2.new(1e5,1e5)
     if center.X<0 or center.Y<0 or center.X>viewport.X or center.Y>viewport.Y then return false end
+    local wasTouch=touchDevice()
     local arrived=false
     local watch=target.InputBegan:Connect(function(input)
         if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
             arrived=true
         end
     end)
-    -- a mouse press swallowed by the GUI during our tap also counts (some buttons only
+    -- a press swallowed by the GUI during our tap also counts (some buttons only
     -- listen through UserInputService)
     local globalWatch=UserInputService.InputBegan:Connect(function(input,processed)
-        if processed and input.UserInputType==Enum.UserInputType.MouseButton1 then arrived=true end
+        if processed and (input.UserInputType==Enum.UserInputType.MouseButton1
+            or input.UserInputType==Enum.UserInputType.Touch) then arrived=true end
     end)
-    local sent=pcall(function()
-        virtualInput:SendMouseButtonEvent(center.X,center.Y,0,true,game,1)
-        task.wait(0.04)
-        virtualInput:SendMouseButtonEvent(center.X,center.Y,0,false,game,1)
-    end)
-    task.wait(0.03)
+    local sent
+    if mode=="touch" then
+        touchTapId=touchTapId%30+1
+        local id=7000+touchTapId
+        sent=pcall(function()
+            virtualInput:SendTouchEvent(id,0,center.X,center.Y)
+            task.wait(0.03)
+            virtualInput:SendTouchEvent(id,2,center.X,center.Y)
+        end)
+    else
+        sent=pcall(function()
+            virtualInput:SendMouseButtonEvent(center.X,center.Y,0,true,game,1)
+            task.wait(0.03)
+            virtualInput:SendMouseButtonEvent(center.X,center.Y,0,false,game,1)
+        end)
+        if wasTouch then restoreTouchControls() end
+    end
+    task.wait(0.02)
     watch:Disconnect()
     globalWatch:Disconnect()
     return sent and arrived
 end
 local function activateButton(target)
-    if tapButton(target) then return true end
+    local touch=touchDevice()
+    if tapButton(target,touch and "touch" or "mouse") then return true end
     local inspect=getconnections or env.getconnections
     if type(inspect)=="function" then
         local center=target.AbsolutePosition+target.AbsoluteSize/2
@@ -5087,6 +5291,8 @@ local function activateButton(target)
             if pcall(fire,signal) then return true end
         end
     end
+    -- last resort on touch devices: a mouse click (the touch controls are switched back after)
+    if touch and tapButton(target,"mouse") then return true end
     return false
 end
 env.VisualsV2Runtime.ODHShootMurderer=function()
@@ -5127,7 +5333,11 @@ task.defer(function()
     local found=findButton(); if found then bind(found) end
     for _,root in ipairs(roots()) do
         pcall(function()
-            root.DescendantAdded:Connect(function(item) if isTarget(item) then task.defer(function() bind(item) end) end end)
+            root.DescendantAdded:Connect(function(item)
+                local trade=env.VisualsV2Runtime.Trade
+                if trade and trade.active then return end
+                if isTarget(item) then task.defer(function() bind(item) end) end
+            end)
         end)
     end
 end)
@@ -8470,18 +8680,21 @@ local function create(record,id,category)
                 mesh.MeshType=Enum.MeshType.FileMesh
                 mesh.MeshId=node.properties.MeshId or ""
                 local textureId=node.properties.TextureID or ""
-                if textureId=="" then
-                    -- SurfaceAppearance only works on real MeshParts, so carry its colour map over
-                    for _,candidate in ipairs(record.nodes) do
-                        if candidate.class=="SurfaceAppearance" and candidate.parentId==node.nodeId
-                            and candidate.properties and type(candidate.properties.ColorMap)=="string" then
-                            textureId=candidate.properties.ColorMap;break
-                        end
+                -- In game a SurfaceAppearance replaces the MeshPart's TextureID, so its colour
+                -- map is the real texture. SurfaceAppearance only works on real MeshParts, so it
+                -- is carried over to the mesh. (Celestial, Constellation and Sweet keep a
+                -- leftover placeholder in TextureID, which is what made them look wrong.)
+                for _,candidate in ipairs(record.nodes) do
+                    if candidate.class=="SurfaceAppearance" and candidate.parentId==node.nodeId
+                        and candidate.properties and type(candidate.properties.ColorMap)=="string"
+                        and candidate.properties.ColorMap~="" then
+                        textureId=candidate.properties.ColorMap;break
                     end
                 end
                 mesh.TextureId=textureId
                 local size=node.properties.Size and decode(node.properties.Size) or Vector3.new(1,1,1)
                 local bounds=node.properties.MeshSize and decode(node.properties.MeshSize) or size
+                if bounds.X<=0 or bounds.Y<=0 or bounds.Z<=0 then bounds=size end
                 mesh.Scale=Vector3.new(size.X/math.max(bounds.X,0.000001),size.Y/math.max(bounds.Y,0.000001),size.Z/math.max(bounds.Z,0.000001))
                 mesh.Parent=object
             end
@@ -9721,16 +9934,23 @@ local GRIP_GROUPS={
 local KNOWN_GRIPS={
     ["6600918074"]={kind="Gun",size=Vector3.new(1.83,0.95,0.325),
         grip=CFrame.new(0.6997261,-0.3059801,0.0010891,0,0,1,0,1,0,-1,0,0)},
-    ["305826272"]={kind="Knife",size=Vector3.new(0.25,2.9,1.6),
+    ["305826272"]={kind="Knife",size=Vector3.new(0.25,2.9,1.6),meshSize=Vector3.new(0.25,2.9,1.6),
         grip=CFrame.new(0,-0.8515663,0.3104025)},
     ["77738838473091"]={kind="Knife",size=Vector3.new(0.4327235,3.3586948,1.9186603),
+        meshSize=Vector3.new(5.53668928,42.97441483,24.54920006),
         grip=CFrame.new(0,-0.8397148,0)},
     ["92263601594064"]={kind="Knife",size=Vector3.new(0.3119834,3.6274931,1.9227760),
+        meshSize=Vector3.new(4.30026054,50,26.50281334),
         grip=CFrame.new(0,-0.6625369,0.2304325)},
     ["88250692342609"]={kind="Knife",size=Vector3.new(0.4038950,3.4534402,1.0080675),
+        meshSize=Vector3.new(5.84771681,50,14.59511662),
         grip=CFrame.new(0,-1.0000004,-0.0851784)},
-    ["121944778"]={kind="Knife",size=Vector3.new(0.4,3,0.7),
+    ["121944778"]={kind="Knife",size=Vector3.new(0.4,3,0.7),meshSize=Vector3.new(0.4,3,0.7),
         grip=CFrame.new(0,-1,-0.1)},
+    -- Celestial (all five versions share this model): native held grip from the MMV capture
+    ["109711282082830"]={kind="Knife",size=Vector3.new(0.3976223,2.6648693,2.3640010),
+        meshSize=Vector3.new(7.4604459,50,44.3549271),
+        grip=CFrame.new(0,-0.0444214,0.2383194)},
 }
 local function snapAxis(v)
     local ax,ay,az=math.abs(v.X),math.abs(v.Y),math.abs(v.Z)
@@ -9947,15 +10167,19 @@ local function buildTemplate(entry)
         ancestor=ancestor.Parent
     end
     if not useToolGrip then
-        local meshId
+        local meshId,mesh
         if root:IsA("MeshPart") then meshId=assetId(root.MeshId)
         else
-            local mesh=root:FindFirstChildWhichIsA("SpecialMesh")
+            mesh=root:FindFirstChildWhichIsA("SpecialMesh")
             meshId=mesh and assetId(mesh.MeshId)
         end
         local known=meshId and KNOWN_GRIPS[meshId]
         if known and known.kind==entry.kind then
+            -- a mesh's size on screen comes from its scale, not from the part's box: chroma
+            -- displays (Chroma Sweet, Chroma Heart Wand) and Ice Hammer/Reaver use a different
+            -- box for the very same mesh and were left out of the matching hold
             local size=root.Size
+            if mesh and known.meshSize then size=mesh.Scale*known.meshSize end
             local matches=math.abs(size.X-known.size.X)<=known.size.X*0.06+0.01
                 and math.abs(size.Y-known.size.Y)<=known.size.Y*0.06+0.01
                 and math.abs(size.Z-known.size.Z)<=known.size.Z*0.06+0.01
@@ -11013,7 +11237,7 @@ env.VisualsV2Runtime.ClientWeaponSkins={
     end,
     GetNativeHolster=function(kind) return nativeHolster(player.Character,kind) end,
     GetDiagnostics=function()
-        local report={build="2026-10-17-fixes-4",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
+        local report={build="2026-10-17-fixes-5",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
         for kind,settings in pairs(kinds) do
             local entry=catalog[kind][settings.selected]
             local key=entry and cacheKey(entry)
@@ -12832,11 +13056,21 @@ schedule=function()
     task.defer(function() queued=false;if alive and runtimeAlive then refresh() end end)
 end
 
-local imageBatch=env.VisualsV2Runtime.MakeBatcher(function(object)
+local hudWrap=env.VisualsV2Runtime.Perf and env.VisualsV2Runtime.Perf.Wrap or function(_,callback) return callback end
+local imageBatch=env.VisualsV2Runtime.MakeBatcher(hudWrap("Weapon icons",function(object)
     if alive and runtimeAlive and object.Parent then consider(object) end
-end,0.002)
+end),0.002)
+local tradeState=env.VisualsV2Runtime.Trade
 local function queueImage(object)
     if object:IsA("ImageLabel") or object:IsA("ImageButton") then imageBatch.Push(object) end
+end
+if tradeState then
+    tradeState.OnChanged(function(active)
+        if active or not alive or not runtimeAlive or not playerGui then return end
+        local ok,objects=pcall(function() return playerGui:GetDescendants() end)
+        if ok then for _,object in ipairs(objects) do queueImage(object) end end
+        if schedule then schedule() end
+    end)
 end
 local function bindGui()
     disconnect(guiConnections)
@@ -12858,6 +13092,7 @@ local function bindGui()
             stats.scans=stats.scans+1
             for _,object in ipairs(objects) do queueImage(object) end
             local connected,connection=pcall(function() return root.DescendantAdded:Connect(function(object)
+                if tradeState and tradeState.active then return end
                 queueImage(object)
                 if object:IsA("ObjectValue") and object.Parent then
                     referenceMemo[object.Parent]=nil
@@ -13068,7 +13303,7 @@ local function readNativeData()
         local event=inventory and inventory:FindFirstChild(name)
         if event and event:IsA("BindableEvent") then
             connections[#connections+1]=event.Event:Connect(function()
-                for _,record in pairs(records) do record.dirty=true end
+                for _,record in pairs(records) do record.dirty=true;record.dirtyOwned=true end
                 if schedule then schedule() end
             end)
         end
@@ -13655,13 +13890,24 @@ local function addCard(record,kind,entry)
 
 end
 
+local tradeState=env.VisualsV2Runtime.Trade
+local perfWrap=env.VisualsV2Runtime.Perf and env.VisualsV2Runtime.Perf.Wrap or function(_,callback) return callback end
+local function trading()
+    return (tradeState and tradeState.active) or inTrade()
+end
+local nativeOwnedImages,nativeOwnedSource=nil,nil
 local function observeNativeButtons(record)
+    if trading() then return end
     local function bind(frame,kind)
         local button=child(child(frame,"Container"),"ActionButton")
-        if not definitions[kind] or not button or own(button) or nativeButtons[button]
+        if not button or nativeButtons[button] or not definitions[kind] or own(button)
             or not button:IsDescendantOf(record.main) then return end
+        local lastClick=0
         local function nativeSelected()
-            if alive and runtimeAlive then selectItem(kind,"None");task.defer(refresh) end
+            if not alive or not runtimeAlive or trading() or excludedInventory(button) then return end
+            if os.clock()-lastClick<0.2 then return end
+            lastClick=os.clock()
+            selectItem(kind,"None");task.defer(refresh)
         end
         local list={button.Activated:Connect(nativeSelected)}
         list[#list+1]=button.MouseButton1Click:Connect(nativeSelected)
@@ -13679,16 +13925,21 @@ local function observeNativeButtons(record)
             end
         end
     end
-    local byImage={}
     local owned=profile and profile.Weapons and profile.Weapons.Owned or {}
-    for key,value in pairs(owned) do
-        local id=type(key)=="string" and key or value
-        local metadata=nativeData.Weapons[id]
-        if type(metadata)=="table" and (metadata.ItemType=="Gun" or metadata.ItemType=="Knife") then
-            local image=imageKey(metadata.Image or metadata.Icon or metadata.ItemID)
-            if byImage[image] and byImage[image]~=metadata.ItemType then byImage[image]=false
-            elseif byImage[image]~=false then byImage[image]=metadata.ItemType end
+    local byImage=nativeOwnedSource==owned and nativeOwnedImages or nil
+    if not byImage or record.dirtyOwned then
+        byImage={}
+        for key,value in pairs(owned) do
+            local id=type(key)=="string" and key or value
+            local metadata=nativeData.Weapons[id]
+            if type(metadata)=="table" and (metadata.ItemType=="Gun" or metadata.ItemType=="Knife") then
+                local image=imageKey(metadata.Image or metadata.Icon or metadata.ItemID)
+                if byImage[image] and byImage[image]~=metadata.ItemType then byImage[image]=false
+                elseif byImage[image]~=false then byImage[image]=metadata.ItemType end
+            end
         end
+        nativeOwnedImages,nativeOwnedSource=byImage,owned
+        record.dirtyOwned=false
     end
     for _,group in ipairs({"Weapons","Effects","Pets"}) do
         local items=child(child(record.main,group),"Items")
@@ -13729,7 +13980,7 @@ local function suspendRecord(record)
     end
 end
 local function updateRecord(record)
-    if inTrade() or excludedInventory(record.main) then
+    if trading() or excludedInventory(record.main) then
         record.tradeEndedAt=nil
         suspendRecord(record);return
     end
@@ -13898,7 +14149,15 @@ end
 schedule=function()
     if queued or not alive or not runtimeAlive then return end
     queued=true
-    task.defer(function() queued=false;if alive and runtimeAlive then refresh() end end)
+    task.defer(function()
+        queued=false
+        if alive and runtimeAlive then
+            local started=os.clock()
+            refresh()
+            local perf=env.VisualsV2Runtime.Perf
+            if perf then perf.Add("Inventory visuals",os.clock()-started) end
+        end
+    end)
 end
 
 local function bindGui()
@@ -13917,7 +14176,8 @@ local function bindGui()
             end)
         end
         for _,object in ipairs(playerGui:GetDescendants()) do watchTrade(object) end
-        guiConnections[#guiConnections+1]=playerGui.DescendantAdded:Connect(function(object)
+        guiConnections[#guiConnections+1]=playerGui.DescendantAdded:Connect(perfWrap("Inventory visuals",function(object)
+            if tradeState and tradeState.active and not object:GetAttribute(MARKER) then return end
             watchTrade(object)
             if tradeRoot(object) and visible(object) then
                 for _,record in pairs(records) do suspendRecord(record) end
@@ -13938,7 +14198,7 @@ local function bindGui()
                 for _,record in pairs(records) do record.dirty=true end
                 schedule()
             end
-        end)
+        end))
     end
     schedule()
 end
@@ -14341,6 +14601,23 @@ local function nativeCrosshair()
     return crosshair,true
 end
 
+-- Shift-lock flag values are looked up once every few seconds and remembered; searching
+-- the whole player (every GUI in PlayerGui) for them on every frame cost a lot of FPS.
+local lockFlags,lockFlagsAt,lockFlagsCharacter={},-math.huge,nil
+local LOCK_KEYS={"ShiftLocked","ShiftLock","IsShiftLocked","MouseLocked"}
+local function shiftLockFlags()
+    local character=player.Character
+    if os.clock()-lockFlagsAt<3 and lockFlagsCharacter==character then return lockFlags end
+    lockFlagsAt=os.clock();lockFlagsCharacter=character
+    lockFlags={}
+    for _,object in pairs({player,character,player:FindFirstChildOfClass("PlayerGui")}) do
+        for _,key in ipairs(LOCK_KEYS) do
+            local flag=object:FindFirstChild(key,true)
+            if flag and flag:IsA("BoolValue") then lockFlags[#lockFlags+1]=flag end
+        end
+    end
+    return lockFlags
+end
 local function nativeLocked()
 
     local crosshair,visible=nativeCrosshair()
@@ -14355,11 +14632,12 @@ local function nativeLocked()
         end
     end
     for _,object in pairs({player,player.Character,player:FindFirstChildOfClass("PlayerGui")}) do
-        for _,key in ipairs({"ShiftLocked","ShiftLock","IsShiftLocked","MouseLocked"}) do
+        for _,key in ipairs(LOCK_KEYS) do
             if object:GetAttribute(key)==true then return true end
-            local flag=object:FindFirstChild(key,true)
-            if flag and flag:IsA("BoolValue") and flag.Value then return true end
         end
+    end
+    for _,flag in ipairs(shiftLockFlags()) do
+        if flag.Parent and flag.Value then return true end
     end
     return UserInputService.MouseBehavior==Enum.MouseBehavior.LockCenter
 end
@@ -14414,13 +14692,14 @@ local function centreAim(cam,character,tool)
 end
 
 local function sampleAim()
-    if not alive or not runtimeAlive or not aimEnabled or not nativeLocked() then return nil end
+    if not alive or not runtimeAlive or not aimEnabled then return nil end
     local character=player.Character
+    -- cheapest check first: nothing to aim unless a throwable is in hand
+    local tool=equippedThrowable(character)
+    if not tool or not nativeLocked() then return nil end
     local humanoid=character and character:FindFirstChildOfClass("Humanoid")
     local cam=workspace.CurrentCamera
     if not allowedCamera(character,humanoid,cam) then return nil end
-    local tool=equippedThrowable(character)
-    if not tool then return nil end
     return centreAim(cam,character,tool)
 end
 
@@ -14569,9 +14848,9 @@ local function rewriteArguments(remote,args,aim)
 end
 
 local bridge=env.VisualsV2ThrowableAimBridge
-if type(bridge)~="table" or bridge.version~=2 then
+if type(bridge)~="table" or bridge.version~=3 then
     if type(bridge)=="table" then bridge.handler=nil end
-    bridge={version=2,dispatchers=setmetatable({}, {__mode="k"})}
+    bridge={version=3,dispatchers=setmetatable({}, {__mode="k"})}
     env.VisualsV2ThrowableAimBridge=bridge
 end
 local handler={}
@@ -14665,14 +14944,17 @@ local function installHooks()
 
     if not bridge.namecallReady then
         local previous
+        -- This runs for every method call in the game, so anything that isn't a remote call
+        -- is passed straight through; doing the full check for every call (FindFirstChild,
+        -- Clone, ...) slowed big menus such as the trade window down to a freeze.
         local wrapper=function(object,...)
             local current=bridge.handler
+            if not current then return previous(object,...) end
+            local method=namecallMethod()
+            if method~="FireServer" and method~="InvokeServer" then return previous(object,...) end
             local thread=coroutine.running() or bridge
-            if current and current.Enabled() and not bridge.dispatchers[thread] then
-                local method=namecallMethod()
-                if method=="FireServer" or method=="InvokeServer" then
-                    bridge.namecallRequests=(bridge.namecallRequests or 0)+1
-                end
+            if current.Enabled() and not bridge.dispatchers[thread] then
+                bridge.namecallRequests=(bridge.namecallRequests or 0)+1
                 bridge.dispatchers[thread]=true
                 local ok,action,value=pcall(current.Namecall,object,method,table.pack(...))
                 bridge.dispatchers[thread]=nil
@@ -15738,9 +16020,10 @@ local function guiRelevant(object)
     return object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")
         or object:IsA("ImageLabel") or object:IsA("ImageButton")
 end
-local fontBatch=env.VisualsV2Runtime.MakeBatcher(function(object)
+local fontWrap=env.VisualsV2Runtime.Perf and env.VisualsV2Runtime.Perf.Wrap or function(_,callback) return callback end
+local fontBatch=env.VisualsV2Runtime.MakeBatcher(fontWrap("Fonts & privacy",function(object)
     if alive and runtimeAlive and not resetting then refreshObject(object) end
-end,0.003)
+end),0.003)
 
 refresh=function()
     if resetting then return end
@@ -15891,16 +16174,17 @@ runtime.JumpGunFollowup={Queue=function(key,character,options,delayTime)
             if not current() or humanoid.Health<=0 then return end
         end
         if gun.Parent~=character then reportFailure("the gun never reached your hand");return end
-        task.wait(0.1)
+        -- give the gun a couple of frames to settle, then press straight away
+        task.wait(0.05)
         local lastReason
-        for attempt=1,4 do
+        for attempt=1,5 do
             if not current() or humanoid.Health<=0 or gun.Parent~=character then return end
             local _,stillShoot=options()
             if not stillShoot then return end
             local fired,reason=runtime.ODHShootMurderer()
             if fired then stats.shots=stats.shots+1;stats.error=nil;return end
             lastReason=reason
-            task.wait(0.12)
+            task.wait(0.08)
         end
         reportFailure(lastReason or "ODH's shoot button did not respond")
     end)
@@ -15921,7 +16205,9 @@ local hideControls=C("vv2HideTouchControls",false)
 local blur=Lighting:FindFirstChild("VisualsV2_MotionBlur") or Instance.new("BlurEffect")
 blur.Name="VisualsV2_MotionBlur"; blur.Parent=Lighting; if not motion then blur.Size=0 end
 local lastCFrame=(workspace.CurrentCamera and workspace.CurrentCamera.CFrame) or CFrame.new()
-RunService.RenderStepped:Connect(function(dt)
+local blurLoop
+blurLoop=RunService.RenderStepped:Connect(function(dt)
+    if not runtimeAlive then blurLoop:Disconnect();return end
     local cam=workspace.CurrentCamera; if not cam then return end
     if not motion then blur.Size=0; lastCFrame=cam.CFrame; return end
     local c=cam.CFrame
@@ -15949,7 +16235,11 @@ local function applyJump()
     local size=math.clamp(jumpSize,50,maxSize)
     jb.Size=UDim2.new(0,size,0,size); jb.Position=UDim2.new(1,-size-20,1,-size-20)
 end
-RunService.RenderStepped:Connect(applyJump)
+local jumpLoop
+jumpLoop=RunService.RenderStepped:Connect(function()
+    if not runtimeAlive then jumpLoop:Disconnect();return end
+    applyJump()
+end)
 local jumpToggle=addToggle(section,"VV2 Jump Button Size Changer (Mobile & Tablet)",jumpResize,function(v) jumpResize=v; SetCfg("vv2JumpResize",v) end)
 section:AddSlider("VV2 Jump Button Size",50,125,jumpSize,function(v) jumpSize=v; SetCfg("vv2JumpSize",v); applyJump() end)
 
@@ -16184,6 +16474,8 @@ end)()
 local alive=true
 local pending={}
 local vv2Features={}
+local runtime=env.VisualsV2Runtime
+local resetHooks={}
 local function vv2Spawn(callback)
     local record={}
     pending[record]=true
@@ -16234,7 +16526,7 @@ function Maid:DoCleaning()
     if self._destroyed then return end
     self._destroyed = true
     for _, task in ipairs(self._tasks) do
-        self:_cleanupTask(task)
+        pcall(function() self:_cleanupTask(task) end)
     end
     self._tasks = {}
 end
@@ -16253,7 +16545,6 @@ local Services = {
     RunService = game:GetService("RunService"),
     UserInputService = game:GetService("UserInputService"),
     StarterGui = game:GetService("StarterGui"),
-    CoreGui = game:GetService("CoreGui"),
     Workspace = game:GetService("Workspace"),
     TweenService = game:GetService("TweenService"),
     SoundService = game:GetService("SoundService")
@@ -16277,7 +16568,6 @@ end
 
 local __RS   = getfserv("RunService")
 local __UIS  = getfserv("UserInputService")
-local __PLRS = getfserv("Players")
 local __TS   = getfserv("TweenService")
 
 local POSITIONS_KEY="vv2BombJumpButtonPositions"
@@ -16307,56 +16597,74 @@ end
 local savedPositions = loadPositions()
 
 local BBSystem = {Buttons = {}, Connections = {}, Maids = {}}
-local BindableButtons
--- Each run owns its own button containers. A container left over from the previous run
--- (with a dead copy of the button sitting on top of the new one) is removed instead of
--- reused; that dead copy is why the bind button stopped responding after re-executing.
-local STORAGE_TOKEN = tostring(os.clock()) .. ":" .. tostring(math.random(1, 1e9))
-local function ownedStorage(parent, name)
-    for _, root in ipairs({parent, getfserv("CoreGui"), __PLRS.LocalPlayer:FindFirstChildOfClass("PlayerGui")}) do
-        if typeof(root) == "Instance" then
-            for _, existing in ipairs(root:GetChildren()) do
-                if existing.Name == name and existing:GetAttribute("VV2StorageToken") ~= STORAGE_TOKEN then
-                    pcall(function() existing:Destroy() end)
+local BindableButtons = {Buttons = {}, Maids = {}, Count = 0}
+
+-- Buttons live in the same shared containers ODH's add-on templates use ("@BBStorage" and
+-- "@bindstorage", in gethui -> CoreGui -> PlayerGui), exactly like the original Bomb Jump+.
+-- The containers are shared with other add-ons, so only our own buttons are ever removed.
+local BIG_STORAGE = "@BBStorage"
+local BIND_STORAGE = "@bindstorage"
+local LEGACY_STORAGES = {VV2_BombJump_BigStorage = true, VV2_BombJump_BindStorage = true, VV2_BombJump_HiddenGui = true}
+
+local function guiRoots()
+    local roots = {}
+    local function add(root)
+        if typeof(root) ~= "Instance" then return end
+        for _, existing in ipairs(roots) do if existing == root then return end end
+        roots[#roots + 1] = root
+    end
+    if type(gethui) == "function" then
+        local ok, result = pcall(gethui)
+        if ok then add(result) end
+    end
+    pcall(function() add(getfserv("CoreGui")) end)
+    add(LocalPlayer:FindFirstChildOfClass("PlayerGui"))
+    return roots
+end
+
+local function getStorage(name)
+    local roots = guiRoots()
+    local parent = roots[1]
+    if parent then
+        local ok, existing = pcall(function() return parent:FindFirstChild(name) end)
+        if ok and typeof(existing) == "Instance" and existing:IsA("LayerCollector") then return existing end
+    end
+    local sg = Instance.new("ScreenGui")
+    sg.Name = name
+    sg.ResetOnSpawn = false
+    sg.IgnoreGuiInset = true
+    pcall(function() sg.ScreenInsets = Enum.ScreenInsets.None end)
+    local placed = parent and pcall(function() sg.Parent = parent end) and sg.Parent ~= nil
+    if not placed then
+        sg.Parent = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui")
+    end
+    return sg
+end
+
+-- Removes copies of one of our buttons left behind by an earlier run (a dead copy on top of
+-- the live button swallows every press), plus the containers older versions of Visuals V2 made.
+local function removeStaleCopies(id, keep)
+    for _, root in ipairs(guiRoots()) do
+        pcall(function()
+            for _, container in ipairs(root:GetChildren()) do
+                local name = container.Name
+                if name == BIG_STORAGE or name == BIND_STORAGE or LEGACY_STORAGES[name] then
+                    for _, child in ipairs(container:GetChildren()) do
+                        if child.Name == id and child ~= keep then pcall(function() child:Destroy() end) end
+                    end
+                    if LEGACY_STORAGES[name] and #container:GetChildren() == 0 then
+                        pcall(function() container:Destroy() end)
+                    end
                 end
             end
-        end
+        end)
     end
-    local sg = parent:FindFirstChild(name)
-    if sg and sg:GetAttribute("VV2StorageToken") == STORAGE_TOKEN then return sg end
-    return nil
 end
 
 local function bb_safecallback(callback)
     if not callback then return end
     local ok, err = xpcall(callback, function(e) return debug.traceback(e) end)
     if not ok then warn("[BB ERROR] " .. tostring(err)) end
-end
-
-local function BB_GetStorage()
-    local parent = gethui and gethui()
-    if not parent or typeof(parent) ~= "Instance" then
-        parent = getfserv("CoreGui")
-    end
-    if not parent or typeof(parent) ~= "Instance" then
-        parent = __PLRS.LocalPlayer:WaitForChild("PlayerGui", 5)
-    end
-    if typeof(parent) ~= "Instance" then
-        parent = __PLRS.LocalPlayer:WaitForChild("PlayerGui")
-    end
-
-    local sg = ownedStorage(parent, "VV2_BombJump_BigStorage")
-    if not sg then
-        sg = Instance.new("ScreenGui")
-        sg.Name = "VV2_BombJump_BigStorage"
-        sg:SetAttribute("VV2StorageToken", STORAGE_TOKEN)
-        sg.ResetOnSpawn = false
-        sg.IgnoreGuiInset = true
-        pcall(function() sg.ScreenInsets = Enum.ScreenInsets.None end)
-        sg.Parent = parent
-        RootMaid:GiveTask(sg)
-    end
-    return sg
 end
 
 local __BB_GRAD_SEQ = ColorSequence.new({
@@ -16373,7 +16681,6 @@ local function BB_MakeDraggable(gui, maid, func, ripple, sound)
 
     maid:GiveTask(gui.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            if not alive or not runtimeAlive then return end
             normalSize,normalTxtSize=gui.Size,gui.TextSize
             bigSize=__UD2(normalSize.X.Scale*1.1,normalSize.X.Offset*1.1,
                 normalSize.Y.Scale*1.1,normalSize.Y.Offset*1.1)
@@ -16397,18 +16704,17 @@ local function BB_MakeDraggable(gui, maid, func, ripple, sound)
             rel = maid:GiveTask(__UIS.InputEnded:Connect(function(endInput)
                 if endInput.UserInputType == input.UserInputType then
                     dragging = false
+                    rel:Disconnect()
                     __TS:Create(gui, tInfo, {Size = normalSize, TextSize = normalTxtSize}):Play()
                     if not hasMoved then bb_safecallback(func) end
 
-                    if not lockBigButtonPos then
+                    if hasMoved and not lockBigButtonPos then
                         savedPositions[gui.Name] = {
                             xs = gui.Position.X.Scale, xo = gui.Position.X.Offset,
                             ys = gui.Position.Y.Scale, yo = gui.Position.Y.Offset
                         }
                         savePositions(savedPositions)
                     end
-
-                    rel:Disconnect()
                 end
             end))
         end
@@ -16429,16 +16735,16 @@ local function BB_MakeDraggable(gui, maid, func, ripple, sound)
 end
 
 local function AddBigButton(id, text, func, isGold)
-    if BBSystem.Buttons[id] then return end
-    local storage = BB_GetStorage()
+    if BBSystem.Buttons[id] then return BBSystem.Buttons[id] end
+    local storage = getStorage(BIG_STORAGE)
     local buttonMaid=Maid.new()
-    BBSystem.Maids[id]=buttonMaid
     local bb = Instance.new("TextButton")
     bb.Name = id
     bb.Size = __UD2(0, 200, 0, 75)
 
     local sp = savedPositions[id]
-    if sp then
+    local function finite(value) return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge end
+    if type(sp) == "table" and finite(sp.xs) and finite(sp.xo) and finite(sp.ys) and finite(sp.yo) then
         bb.Position = __UD2(sp.xs, sp.xo, sp.ys, sp.yo)
     else
         bb.Position = __UD2(0.5, 0, 0.5, 0)
@@ -16456,7 +16762,6 @@ local function AddBigButton(id, text, func, isGold)
     bb.ClipsDescendants = true
     bb.AutoButtonColor = false
     bb.ZIndex = 5
-    bb.Parent = storage
 
     Instance.new("UICorner", bb).CornerRadius = __UD(0, 5)
     local stroke = Instance.new("UIStroke")
@@ -16498,22 +16803,21 @@ local function AddBigButton(id, text, func, isGold)
     BBSystem.Connections[id] = buttonMaid:GiveTask(__RS.RenderStepped:Connect(function()
         gradient.Rotation = (gradient.Rotation + 1) % 360
     end))
+    bb.Parent = storage
+    BBSystem.Maids[id]=buttonMaid
     BBSystem.Buttons[id] = bb
     return bb
 end
 
 local function DeleteBigButton(id)
-    if BBSystem.Buttons[id] then
-        if BBSystem.Connections[id] then
-            BBSystem.Connections[id]:Disconnect()
-            BBSystem.Connections[id] = nil
-        end
-        if BBSystem.Maids[id] then BBSystem.Maids[id]:Destroy();BBSystem.Maids[id]=nil end
-        BBSystem.Buttons[id] = nil
+    if BBSystem.Connections[id] then
+        pcall(function() BBSystem.Connections[id]:Disconnect() end)
+        BBSystem.Connections[id] = nil
     end
+    if BBSystem.Maids[id] then BBSystem.Maids[id]:Destroy();BBSystem.Maids[id]=nil end
+    if BBSystem.Buttons[id] then pcall(function() BBSystem.Buttons[id]:Destroy() end) end
+    BBSystem.Buttons[id] = nil
 end
-
-BindableButtons = {Buttons = {}, Maids = {}, Count = 0}
 
 local __SHAPES = {
     [0] = "rbxassetid://86221076925479",
@@ -16553,38 +16857,12 @@ local function bind_safecallback(callback)
     if not ok then warn("[BIND ERROR] " .. tostring(err)) end
 end
 
-local function Bind_GetStorage()
-    local parent = gethui and gethui()
-    if not parent or typeof(parent) ~= "Instance" then
-        parent = __PLRS.LocalPlayer:WaitForChild("PlayerGui", 5)
-    end
-    if typeof(parent) ~= "Instance" then
-        parent = __PLRS.LocalPlayer:WaitForChild("PlayerGui")
-    end
-
-    local sg = ownedStorage(parent, "VV2_BombJump_BindStorage")
-    if not sg then
-        sg = Instance.new("ScreenGui")
-        sg.Name = "VV2_BombJump_BindStorage"
-        sg:SetAttribute("VV2StorageToken", STORAGE_TOKEN)
-        sg.ResetOnSpawn = false
-        sg.IgnoreGuiInset = true
-        pcall(function() sg.ScreenInsets = Enum.ScreenInsets.None end)
-        sg.Parent = parent
-        RootMaid:GiveTask(sg)
-    end
-    sg.Enabled = true
-    sg.DisplayOrder = 50
-    return sg
-end
-
 local function Bind_MakeDraggable(gui, maid, ripple, sound, clickFunc)
     local dragging, dragInput, dragStart, startPos
     local hasMoved = false
 
     maid:GiveTask(gui.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            if not alive or not runtimeAlive then return end
             dragging, dragStart, startPos = true, input.Position, gui.Position
             hasMoved = false
             sound:Play()
@@ -16602,21 +16880,20 @@ local function Bind_MakeDraggable(gui, maid, ripple, sound, clickFunc)
             rel = maid:GiveTask(__UIS.InputEnded:Connect(function(endInput)
                 if endInput.UserInputType == input.UserInputType then
                     dragging = false
+                    rel:Disconnect()
                     if not hasMoved then
                         bind_safecallback(clickFunc)
                     end
 
                     local px, py = gui.Position.X.Scale, gui.Position.Y.Scale
                     local sane = px == px and py == py and math.abs(px) < 10 and math.abs(py) < 10
-                    if not lockBindButtonPos and sane then
+                    if hasMoved and not lockBindButtonPos and sane then
                         savedPositions[gui.Name] = {
                             xs = px, xo = gui.Position.X.Offset,
                             ys = py, yo = gui.Position.Y.Offset
                         }
                         savePositions(savedPositions)
                     end
-
-                    rel:Disconnect()
                 end
             end))
         end
@@ -16633,19 +16910,20 @@ local function Bind_MakeDraggable(gui, maid, ripple, sound, clickFunc)
             if lockBindButtonPos then return end
             local delta = input.Position - dragStart
             if delta.Magnitude > 7 then hasMoved = true end
-            local screen = gui.Parent.AbsoluteSize
-            if screen.X <= 1 or screen.Y <= 1 then return end
+            local screen = gui.Parent and gui.Parent:IsA("GuiBase2d") and gui.Parent.AbsoluteSize
+            if not screen or screen.X <= 1 or screen.Y <= 1 then return end
             gui.Position = __UD2(startPos.X.Scale + (delta.X / screen.X), 0, startPos.Y.Scale + (delta.Y / screen.Y), 0)
         end
     end))
 end
 
 function BindableButtons.AddBButton(id, text, clickFunc, isGold)
-    if BindableButtons.Buttons[id] then return end
+    if BindableButtons.Buttons[id] then return BindableButtons.Buttons[id] end
 
+    local storage = getStorage(BIND_STORAGE)
     local buttonMaid = Maid.new()
     local camera = workspace.CurrentCamera
-    local screen = camera.ViewportSize
+    local screen = camera and camera.ViewportSize or __V2(1920, 1080)
     if screen.X <= 1 or screen.Y <= 1 then screen = __V2(1920, 1080) end
     local buttonSizeY = 0.11
     local widthScale = buttonSizeY * (screen.Y / screen.X)
@@ -16653,7 +16931,7 @@ function BindableButtons.AddBButton(id, text, clickFunc, isGold)
     local sp = savedPositions[id]
     local function finite(value) return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge end
     local xPos, yPos
-    if sp and finite(sp.xs) and finite(sp.ys) then
+    if type(sp) == "table" and finite(sp.xs) and finite(sp.ys) then
         xPos = math.clamp(sp.xs, 0.03, 0.97)
         yPos = math.clamp(sp.ys, 0.03, 0.97)
     else
@@ -16671,7 +16949,6 @@ function BindableButtons.AddBButton(id, text, clickFunc, isGold)
     ImageButton.BorderSizePixel = 0
     ImageButton.ClipsDescendants = false
     ImageButton.AutoButtonColor = false
-    ImageButton.Parent = Bind_GetStorage()
     buttonMaid:GiveTask(ImageButton)
 
     local TextLabel = Instance.new("TextLabel", ImageButton)
@@ -16720,6 +16997,7 @@ function BindableButtons.AddBButton(id, text, clickFunc, isGold)
         Stroke.Rotation = (Stroke.Rotation + 1) % 360
     end))
 
+    ImageButton.Parent = storage
     BindableButtons.Buttons[id] = ImageButton
     BindableButtons.Maids[id] = buttonMaid
     BindableButtons.Count = BindableButtons.Count + 1
@@ -16730,8 +17008,9 @@ function BindableButtons.DeleteBButton(id)
     if BindableButtons.Maids[id] then
         BindableButtons.Maids[id]:Destroy()
         BindableButtons.Maids[id] = nil
-        BindableButtons.Buttons[id] = nil
     end
+    if BindableButtons.Buttons[id] then pcall(function() BindableButtons.Buttons[id]:Destroy() end) end
+    BindableButtons.Buttons[id] = nil
 end
 
 function BindableButtons.UpdateBButtonText(id, text, isWaiting, isGold)
@@ -16753,27 +17032,76 @@ function BindableButtons.UpdateBButtonText(id, text, isWaiting, isGold)
     end
 end
 
-local function GetSafeGuiRoot()
-    local success, result = pcall(function()
-        return gethui()
-    end)
-    if success and result and typeof(result) == "Instance" then
-        return result
-    end
-    return Services.CoreGui
+-- Buttons are kept in step with their toggles by one small check: a wanted button that is
+-- missing (deleted, its container cleared by the hub, a previous run's leftovers) is rebuilt,
+-- and an unwanted one is removed. Buttons no longer depend on the toggle callback alone.
+local buttonSpecs = {}
+local function currentButton(id)
+    local spec = buttonSpecs[id]
+    if not spec then return nil end
+    if spec.kind == "bind" then return BindableButtons.Buttons[id] end
+    return BBSystem.Buttons[id]
 end
-
-local hiddenGui = Instance.new("ScreenGui")
-hiddenGui.Name = "VV2_BombJump_HiddenGui"
-hiddenGui.ResetOnSpawn = false
-hiddenGui.IgnoreGuiInset = true
-hiddenGui.Parent = GetSafeGuiRoot()
-RootMaid:GiveTask(hiddenGui)
+local function liveButton(id)
+    local button = currentButton(id)
+    if not button then return nil end
+    local ok, live = pcall(function()
+        local storage = button.Parent
+        return storage ~= nil and storage.Parent ~= nil
+    end)
+    if ok and live then return button end
+    return nil
+end
+local function removeButton(id)
+    local spec = buttonSpecs[id]
+    if spec and spec.kind == "bind" then BindableButtons.DeleteBButton(id) else DeleteBigButton(id) end
+end
+local function ensureButton(id)
+    local spec = buttonSpecs[id]
+    if not spec then return end
+    if not (alive and runtimeAlive and spec.wanted) then
+        if currentButton(id) then removeButton(id) end
+        return
+    end
+    local button = liveButton(id)
+    if not button then
+        removeButton(id)
+        local ok, result = pcall(function()
+            if spec.kind == "bind" then
+                return BindableButtons.AddBButton(id, spec.text, spec.click, spec.gold)
+            end
+            return AddBigButton(id, spec.text, spec.click, spec.gold)
+        end)
+        if not ok or typeof(result) ~= "Instance" then
+            spec.error = tostring(result)
+            return
+        end
+        button = result
+        spec.error = nil
+        spec.built = (spec.built or 0) + 1
+        removeStaleCopies(id, button)
+    end
+    if spec.style then pcall(spec.style, button) end
+end
+local function setButtonWanted(id, wanted)
+    local spec = buttonSpecs[id]
+    if not spec then return end
+    spec.wanted = wanted == true
+    ensureButton(id)
+end
+local function styleButton(id)
+    local button = currentButton(id)
+    local spec = buttonSpecs[id]
+    if button and spec and spec.style then pcall(spec.style, button) end
+end
 
 local section=mainTab:AddSection("Bomb Jump Clutch","Utilities")
 local vv2Controls={}
 local function settingKey(label)
     return "vv2BombJump_"..label:gsub("[^%w]","")
+end
+local function savedToggle(label,legacyLabel)
+    return C(settingKey(legacyLabel or label),false)==true
 end
 local function controlLabel(label)
     if label:sub(1,4)=="VV2 " then return label end
@@ -16829,6 +17157,15 @@ end}
 local _game = game.GameId==10413186812 and "Murder Mystery Modded"
     or game.GameId==66654135 and "Murder Mystery 2" or shared.game_name
 
+local lastFailure, lastJumpAt, lastNotice = nil, nil, 0
+local function failure(reason, notify)
+    lastFailure = reason
+    if notify and os.clock() - lastNotice > 3 then
+        lastNotice = os.clock()
+        pcall(function() shared.Notify("Bomb Jump: " .. tostring(reason), 3) end)
+    end
+end
+
 if _game == "Murder Mystery 2" or _game == "Murder Mystery Modded" then
 
 local section = BombJump:AddSection("Bomb Jump Clutch", "MM2/MMV")
@@ -16841,18 +17178,19 @@ local CONFIG = {
     DefaultSize = 90
 }
 
-local equipGunAfterJump=false
-local shootAfterJump=false
-local bombJumpEnabled = false
-local onCooldown = false
-local debounce = false
-local autoGetBomb = false
-local justRespawned = false
+-- Saved choices are applied straight away instead of waiting for the toggles to be
+-- restored, so Bomb Jump is ready (and its buttons are back) right after executing.
+local equipGunAfterJump=savedToggle("Equip Gun After Bomb Jump")
+local shootAfterJump=savedToggle("Shoot Murderer After Bomb Jump","Shoot Murderer After Bomb Jump (ODH)")
+local bombJumpEnabled = savedToggle("Enable Auto Bomb Jump")
+local autoGetBomb = savedToggle("Auto-Get Fake Bomb")
+local cooldownUntil = 0
+local cooldownToken = 0
+local busy = false
+local busyUntil = 0
+local respawnedAt = -math.huge
 local bigButtonSize = CONFIG.DefaultSize
 local bindButtonSize = 0.11
-local bjBindButton = nil
-local bigBtnExists = false
-local bindBtnExists = false
 
 local BOMB_NAMES = {"FakeBomb"}
 
@@ -16899,35 +17237,36 @@ local function IsPlayerInAir()
     return math.abs(velocityY) > 0.5
 end
 
-local function ResetCooldown()
-    onCooldown = false
+local function onCooldown()
+    return os.clock() < cooldownUntil
+end
+
+local function showBombJumpText(text, waiting)
     local bigBtn = BBSystem.Buttons["VV2_BombJump_Big"]
-    if bigBtn then bigBtn.Text = "Bomb Jump" end
-    if bjBindButton then
-        BindableButtons.UpdateBButtonText("VV2_BombJump_Bind", "BJ", false, false)
-    end
+    if bigBtn then bigBtn.Text = text == "BJ" and "Bomb Jump" or text end
+    BindableButtons.UpdateBButtonText("VV2_BombJump_Bind", text, waiting, false)
+end
+
+local function ResetCooldown()
+    cooldownUntil = 0
+    cooldownToken = cooldownToken + 1
+    showBombJumpText("BJ", false)
 end
 
 local function StartCooldown()
-    onCooldown = true
-    debounce = false
-    local bigBtn = BBSystem.Buttons["VV2_BombJump_Big"]
-    if bigBtn then bigBtn.Text = "Wait" end
-    if bjBindButton then
-        BindableButtons.UpdateBButtonText("VV2_BombJump_Bind", "Wait", true, false)
-    end
+    cooldownUntil = os.clock() + CONFIG.CooldownTime
+    cooldownToken = cooldownToken + 1
+    local token = cooldownToken
+    showBombJumpText("Wait", true)
 
     vv2Spawn(function()
-        for i = CONFIG.CooldownTime, 1, -1 do
-            if not onCooldown then break end
-            local bigBtn = BBSystem.Buttons["VV2_BombJump_Big"]
-            if bigBtn then bigBtn.Text = tostring(i) end
-            if bjBindButton then
-                BindableButtons.UpdateBButtonText("VV2_BombJump_Bind", tostring(i), true, false)
-            end
-            task.wait(1)
+        while token == cooldownToken and alive and runtimeAlive do
+            local left = math.ceil(cooldownUntil - os.clock() - 0.05)
+            if left <= 0 then break end
+            showBombJumpText(tostring(left), true)
+            task.wait(math.clamp(cooldownUntil - os.clock() - (left - 1), 0.05, 1))
         end
-        if onCooldown then ResetCooldown() end
+        if token == cooldownToken then ResetCooldown() end
     end)
 end
 
@@ -16961,7 +17300,7 @@ local function UnequipBomb()
             for _, bombName in ipairs(BOMB_NAMES) do
                 local bomb = character:FindFirstChild(bombName)
                 if bomb then
-                    bomb.Parent = LocalPlayer.Backpack or character
+                    bomb.Parent = LocalPlayer:FindFirstChildOfClass("Backpack") or character
                     break
                 end
             end
@@ -16993,6 +17332,7 @@ local function GetAnyBomb()
         Services.ReplicatedStorage.Remotes.Extras.ReplicateToy:InvokeServer("FakeBomb")
     end)
 
+    backpack = LocalPlayer:FindFirstChild("Backpack")
     for _ = 1, 5 do
         for _, bombName in ipairs(BOMB_NAMES) do
             local bomb = character:FindFirstChild(bombName)
@@ -17013,49 +17353,59 @@ end
 
 local function FastBombJump()
     if not alive or not runtimeAlive then return end
+    if not IsPlayerInAir() then lastFailure = "you were not in the air"; return end
+    if onCooldown() then lastFailure = "on cooldown"; return end
+    if busy or os.clock() < busyUntil then return end
+    if os.clock() - respawnedAt < 1 then lastFailure = "you just respawned"; return end
+    busy = true
+    busyUntil = os.clock() + 0.5
     local actionCharacter=LocalPlayer.Character
-    if not IsPlayerInAir() then return end
-    if onCooldown or debounce or justRespawned then return end
-    debounce = true
 
-    local success, bomb = GetAnyBomb()
-    if not alive or not runtimeAlive or LocalPlayer.Character~=actionCharacter then return end
-    if success and bomb then
+    -- the whole jump is protected so a failure can never leave Bomb Jump stuck "busy"
+    local ok, err = pcall(function()
+        local success, bomb = GetAnyBomb()
+        if not alive or not runtimeAlive or LocalPlayer.Character~=actionCharacter then return end
+        if not (success and bomb) then
+            failure("couldn't get a Fake Bomb", true)
+            return
+        end
         local position = GetCenterPosition()
-        if position then
-            local remote = bomb:FindFirstChild("Remote")
-            if remote then
-                PlaySound(Sounds.Click)
-                pcall(function()
-                    remote:FireServer(CFrame.new(position), 50)
-                end)
-            end
+        if not position then failure("your character isn't loaded", false); return end
+        local remote = bomb:FindFirstChild("Remote")
+        if remote then
+            PlaySound(Sounds.Click)
+            pcall(function()
+                remote:FireServer(CFrame.new(position), 50)
+            end)
+        else
+            failure("the Fake Bomb has no Remote", true)
+        end
 
-            local char = LocalPlayer.Character
-            local root = char and char:FindFirstChild("HumanoidRootPart")
-            if root then
-                local currentVelocity = root.AssemblyLinearVelocity
-                root.AssemblyLinearVelocity = Vector3.new(currentVelocity.X, CONFIG.LaunchPower, currentVelocity.Z)
-            end
+        local char = LocalPlayer.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if root then
+            local currentVelocity = root.AssemblyLinearVelocity
+            root.AssemblyLinearVelocity = Vector3.new(currentVelocity.X, CONFIG.LaunchPower, currentVelocity.Z)
+        end
 
-            MakeCharacterJump()
-            UnequipBomb()
-            env.VisualsV2Runtime.JumpGunFollowup.Queue("BombJump",actionCharacter,function()
+        MakeCharacterJump()
+        UnequipBomb()
+        lastJumpAt = os.clock()
+        if remote then lastFailure = nil end
+        pcall(function()
+            runtime.JumpGunFollowup.Queue("BombJump",actionCharacter,function()
                 if not alive then return false,false end
                 return equipGunAfterJump,shootAfterJump
             end)
+        end)
 
-            vv2Spawn(function()
-                task.wait(0.1)
-                StartCooldown()
-            end)
-        end
-    end
-
-    vv2Spawn(function()
-        task.wait(0.5)
-        debounce = false
+        vv2Spawn(function()
+            task.wait(0.1)
+            StartCooldown()
+        end)
     end)
+    busy = false
+    if not ok then failure(tostring(err), true) end
 end
 
 local function IsHoldingBomb()
@@ -17091,7 +17441,7 @@ BombJumpMaid:GiveTasks(
         if gp then activeTouches[input] = nil return end
         local data = activeTouches[input]
         if data and not data.moved and tick() - data.startTime <= TAP_TIME_THRESHOLD then
-            if bombJumpEnabled and not onCooldown and not debounce then
+            if bombJumpEnabled and not onCooldown() and not busy then
                 if IsHoldingBomb() and IsPlayerInAir() then
                     FastBombJump()
                 end
@@ -17099,47 +17449,39 @@ BombJumpMaid:GiveTasks(
         end
         activeTouches[input] = nil
     end),
-    LocalPlayer.CharacterAdded:Connect(function()
+    LocalPlayer.CharacterAdded:Connect(function(character)
         ResetCooldown()
         activeTouches = {}
-        justRespawned = true
-        local expectedCharacter=LocalPlayer.Character
-        task.wait(1)
-        if not alive or not runtimeAlive or LocalPlayer.Character~=expectedCharacter then return end
-        justRespawned = false
+        respawnedAt = os.clock()
+        task.wait(1.2)
+        if not alive or not runtimeAlive or LocalPlayer.Character~=character then return end
         if autoGetBomb then
-            task.wait(0.2)
             pcall(function() Services.ReplicatedStorage.Remotes.Extras.ReplicateToy:InvokeServer("FakeBomb") end)
         end
     end)
 )
 
-local bindWatch = {}
-local function watchBindButton(id, text, clickFunc, isGold, wanted, onRebuilt)
-    local token = {}
-    bindWatch[id] = token
-    vv2Spawn(function()
-        while alive and runtimeAlive and bindWatch[id] == token and wanted() do
-            task.wait(1.5)
-            if not (alive and runtimeAlive and bindWatch[id] == token and wanted()) then return end
-            local button = BindableButtons.Buttons[id]
-            local gui = button and button:FindFirstAncestorOfClass("ScreenGui")
-            local healthy = button and button.Parent and button:IsDescendantOf(game)
-                and gui and gui.Enabled and button.Visible
-            if not healthy then
-                BindableButtons.DeleteBButton(id)
-                BindableButtons.AddBButton(id, text, clickFunc, isGold)
-                onRebuilt(BindableButtons.Buttons[id])
-            else
-                local px, py = button.Position.X.Scale, button.Position.Y.Scale
-                if px ~= px or py ~= py or px < -0.02 or px > 1.02 or py < -0.02 or py > 1.02 then
-                    button.Position = __UD2(math.clamp(px == px and px or 0.1, 0.03, 0.97), 0,
-                        math.clamp(py == py and py or 0.9, 0.03, 0.97), 0)
-                end
-            end
-        end
-    end)
+local function bindSize(size)
+    local camera = Services.Workspace.CurrentCamera
+    local screen = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+    if screen.X <= 1 or screen.Y <= 1 then screen = Vector2.new(1920, 1080) end
+    return __UD2(size * (screen.Y / screen.X), 0, size, 0)
 end
+
+buttonSpecs["VV2_BombJump_Big"] = {kind = "big", text = "Bomb Jump", click = FastBombJump, gold = false,
+    wanted = savedToggle("Enable BJ Big Button"),
+    style = function(button)
+        button.Size = __UD2(0, bigButtonSize, 0, bigButtonSize * 0.375)
+        local left = math.ceil(cooldownUntil - os.clock() - 0.05)
+        button.Text = left > 0 and tostring(left) or "Bomb Jump"
+    end}
+buttonSpecs["VV2_BombJump_Bind"] = {kind = "bind", text = "BJ", click = FastBombJump, gold = false,
+    wanted = savedToggle("Enable BJ Bind Button"),
+    style = function(button)
+        button.Size = bindSize(bindButtonSize)
+        local left = math.ceil(cooldownUntil - os.clock() - 0.05)
+        BindableButtons.UpdateBButtonText("VV2_BombJump_Bind", left > 0 and tostring(left) or "BJ", left > 0, false)
+    end}
 
 section:AddLabel("Bomb Jump Options")
 section:AddToggle("Equip Gun After Bomb Jump",function(value) equipGunAfterJump=value end)
@@ -17149,29 +17491,17 @@ section:AddToggle("Enable Auto Bomb Jump", function(bool) bombJumpEnabled = bool
 section:AddToggle("Auto-Get Fake Bomb", function(bool)
     autoGetBomb = bool
     if bool then
-        pcall(function() Services.ReplicatedStorage.Remotes.Extras.ReplicateToy:InvokeServer("FakeBomb") end)
+        task.spawn(function() pcall(function() Services.ReplicatedStorage.Remotes.Extras.ReplicateToy:InvokeServer("FakeBomb") end) end)
     end
 end)
 
 section:AddToggle("Enable BJ Big Button", function(e)
-    bigBtnExists = e
-    if e then
-        AddBigButton("VV2_BombJump_Big", "Bomb Jump", FastBombJump, false)
-        local btn = BBSystem.Buttons["VV2_BombJump_Big"]
-        if btn then
-            btn.Size = __UD2(0, bigButtonSize, 0, bigButtonSize * 0.375)
-        end
-    else
-        DeleteBigButton("VV2_BombJump_Big")
-    end
+    setButtonWanted("VV2_BombJump_Big", e)
 end)
 
 section:AddSlider("BJ Big Button Size", 50, 300, CONFIG.DefaultSize, function(value)
     bigButtonSize = value
-    local btn = BBSystem.Buttons["VV2_BombJump_Big"]
-    if btn then
-        btn.Size = __UD2(0, bigButtonSize, 0, bigButtonSize * 0.375)
-    end
+    styleButton("VV2_BombJump_Big")
 end)
 
 section:AddButton("Reset BJ Big Button Position", function()
@@ -17184,34 +17514,13 @@ section:AddButton("Reset BJ Big Button Position", function()
     shared.Notify("BJ Big button position reset", 2)
 end)
 
-local function applyBjBind(button)
-    bjBindButton = button
-    if bjBindButton then
-        local screen = Services.Workspace.CurrentCamera.ViewportSize
-        if screen.X <= 1 or screen.Y <= 1 then screen = Vector2.new(1920, 1080) end
-        bjBindButton.Size = __UD2(bindButtonSize * (screen.Y / screen.X), 0, bindButtonSize, 0)
-        BindableButtons.UpdateBButtonText("VV2_BombJump_Bind", onCooldown and "Wait" or "BJ", onCooldown, false)
-    end
-end
 section:AddToggle("Enable BJ Bind Button", function(e)
-    bindBtnExists = e
-    if e then
-        BindableButtons.AddBButton("VV2_BombJump_Bind", "BJ", FastBombJump, false)
-        applyBjBind(BindableButtons.Buttons["VV2_BombJump_Bind"])
-        watchBindButton("VV2_BombJump_Bind", "BJ", FastBombJump, false, function() return bindBtnExists end, applyBjBind)
-    else
-        bindWatch["VV2_BombJump_Bind"] = nil
-        BindableButtons.DeleteBButton("VV2_BombJump_Bind")
-        bjBindButton = nil
-    end
+    setButtonWanted("VV2_BombJump_Bind", e)
 end)
 
 section:AddSlider("BJ Bind Button Size", 5, 25, 11, function(value)
     bindButtonSize = value / 100
-    if bjBindButton then
-        local screen = Services.Workspace.CurrentCamera.ViewportSize
-        bjBindButton.Size = __UD2(bindButtonSize * (screen.Y / screen.X), 0, bindButtonSize, 0)
-    end
+    styleButton("VV2_BombJump_Bind")
 end)
 
 section:AddButton("Reset BJ Bind Button Position", function()
@@ -17219,10 +17528,6 @@ section:AddButton("Reset BJ Bind Button Position", function()
     savePositions(savedPositions)
     local btn = BindableButtons.Buttons["VV2_BombJump_Bind"]
     if btn then
-        local camera = Services.Workspace.CurrentCamera
-        local screen = camera.ViewportSize
-        local buttonSizeY = bindButtonSize
-        local widthScale = buttonSizeY * (screen.Y / screen.X)
         btn.Position = __UD2(0.1, 0, 0.9, 0)
     end
     shared.Notify("BJ Bind button position reset", 2)
@@ -17230,58 +17535,69 @@ end)
 
 section:AddKeybind("Bomb Jump Keybind", "E", FastBombJump)
 vv2Features.Jump=FastBombJump
+resetHooks[#resetHooks+1]=function()
+    equipGunAfterJump=false; shootAfterJump=false; bombJumpEnabled=false; autoGetBomb=false
+    ResetCooldown()
+end
+vv2Features.State=function()
+    return {cooldownLeft=math.max(0,cooldownUntil-os.clock()),busy=busy,sinceRespawn=os.clock()-respawnedAt,
+        inAir=IsPlayerInAir(),holdingBomb=IsHoldingBomb(),
+        flags={autoBombJump=bombJumpEnabled,autoGetBomb=autoGetBomb,equipGun=equipGunAfterJump,shoot=shootAfterJump}}
+end
 
 if _game == "Murder Mystery Modded" then
 
 local gbjSection = BombJump:AddSection("Gold Bomb Jump+", "MMV")
-local equipGunAfterGoldJump=false
-local shootAfterGoldJump=false
+local equipGunAfterGoldJump=savedToggle("Equip Gun After Gold Bomb Jump")
+local shootAfterGoldJump=savedToggle("Shoot Murderer After Gold Bomb Jump","Shoot Murderer After Gold Bomb Jump (ODH)")
 gbjSection:AddToggle("Equip Gun After Gold Bomb Jump",function(value) equipGunAfterGoldJump=value end)
 gbjSection:AddToggle("Shoot Murderer After Gold Bomb Jump",function(value) shootAfterGoldJump=value end,"Shoot Murderer After Gold Bomb Jump (ODH)")
 
-local gbjOnCooldown = false
-local goldBombJumpEnabled = false
-local gbjDebounce = false
-local autoGetGoldBomb = false
-local gbjJustRespawned = false
+local gbjCooldownUntil = 0
+local gbjCooldownToken = 0
+local goldBombJumpEnabled = savedToggle("Enable Auto Gold Bomb Jump")
+local gbjBusy = false
+local gbjBusyUntil = 0
+local autoGetGoldBomb = savedToggle("Auto-Get Gold Bomb")
+local gbjRespawnedAt = -math.huge
 local gbjBigButtonSize = 200
 local gbjBindButtonSize = 0.11
-local gbjBindButton = nil
 
 local GOLD_BOMB_NAME = "GoldBomb"
 
 local GoldBombJumpMaid = Maid.new()
 RootMaid:GiveTask(GoldBombJumpMaid)
 
-local function GBJResetCooldown()
-    gbjOnCooldown = false
+local function gbjOnCooldown()
+    return os.clock() < gbjCooldownUntil
+end
+
+local function showGoldText(text, waiting)
     local bigBtn = BBSystem.Buttons["VV2_GoldBombJump_Big"]
-    if bigBtn then bigBtn.Text = "Gold Bomb Jump" end
-    if gbjBindButton then
-        BindableButtons.UpdateBButtonText("VV2_GoldBombJump_Bind", "GBJ", false, true)
-    end
+    if bigBtn then bigBtn.Text = text == "GBJ" and "Gold Bomb Jump" or text end
+    BindableButtons.UpdateBButtonText("VV2_GoldBombJump_Bind", text, waiting, true)
+end
+
+local function GBJResetCooldown()
+    gbjCooldownUntil = 0
+    gbjCooldownToken = gbjCooldownToken + 1
+    showGoldText("GBJ", false)
 end
 
 local function GBJStartCooldown()
-    gbjOnCooldown = true
-    gbjDebounce = false
-    local bigBtn = BBSystem.Buttons["VV2_GoldBombJump_Big"]
-    if bigBtn then bigBtn.Text = "Wait" end
-    if gbjBindButton then
-        BindableButtons.UpdateBButtonText("VV2_GoldBombJump_Bind", "Wait", true, true)
-    end
+    gbjCooldownUntil = os.clock() + 4
+    gbjCooldownToken = gbjCooldownToken + 1
+    local token = gbjCooldownToken
+    showGoldText("Wait", true)
 
     vv2Spawn(function()
-        for i = 4, 1, -1 do
-            if not gbjOnCooldown then break end
-            local bigBtn = BBSystem.Buttons["VV2_GoldBombJump_Big"]
-            if bigBtn then bigBtn.Text = tostring(i) end
-            if gbjBindButton then
-                BindableButtons.UpdateBButtonText("VV2_GoldBombJump_Bind", tostring(i), true, true)
-            end
-            task.wait(1)
+        while token == gbjCooldownToken and alive and runtimeAlive do
+            local left = math.ceil(gbjCooldownUntil - os.clock() - 0.05)
+            if left <= 0 then break end
+            showGoldText(tostring(left), true)
+            task.wait(math.clamp(gbjCooldownUntil - os.clock() - (left - 1), 0.05, 1))
         end
-        if gbjOnCooldown then GBJResetCooldown() end
+        if token == gbjCooldownToken then GBJResetCooldown() end
     end)
 end
 
@@ -17314,7 +17630,7 @@ local function UnequipGoldBomb()
         if character then
             local bomb = character:FindFirstChild(GOLD_BOMB_NAME)
             if bomb then
-                bomb.Parent = LocalPlayer.Backpack or character
+                bomb.Parent = LocalPlayer:FindFirstChildOfClass("Backpack") or character
             end
         end
     end)
@@ -17341,6 +17657,7 @@ local function GetAnyGoldBomb()
     end)
 
     if success then
+        backpack = LocalPlayer:FindFirstChild("Backpack")
         for _ = 1, 5 do
             bomb = character:FindFirstChild(GOLD_BOMB_NAME)
             if bomb then return true, bomb end
@@ -17361,49 +17678,58 @@ end
 
 local function FastGoldBombJump()
     if not alive or not runtimeAlive then return end
+    if not IsPlayerInAir() then lastFailure = "you were not in the air"; return end
+    if gbjOnCooldown() then lastFailure = "Gold Bomb Jump is on cooldown"; return end
+    if gbjBusy or os.clock() < gbjBusyUntil then return end
+    if os.clock() - gbjRespawnedAt < 1 then lastFailure = "you just respawned"; return end
+    gbjBusy = true
+    gbjBusyUntil = os.clock() + 0.5
     local actionCharacter=LocalPlayer.Character
-    if not IsPlayerInAir() then return end
-    if gbjOnCooldown or gbjDebounce or gbjJustRespawned then return end
-    gbjDebounce = true
 
-    local success, bomb = GetAnyGoldBomb()
-    if not alive or not runtimeAlive or LocalPlayer.Character~=actionCharacter then return end
-    if success and bomb then
+    local ok, err = pcall(function()
+        local success, bomb = GetAnyGoldBomb()
+        if not alive or not runtimeAlive or LocalPlayer.Character~=actionCharacter then return end
+        if not (success and bomb) then
+            failure("couldn't get a Gold Bomb", true)
+            return
+        end
         local position = GBJGetCenterPosition()
-        if position then
-            local remote = bomb:FindFirstChild("Remote")
-            if remote then
-                PlaySound(Sounds.Click)
-                pcall(function()
-                    remote:FireServer(CFrame.new(position), 50)
-                end)
-            end
+        if not position then failure("your character isn't loaded", false); return end
+        local remote = bomb:FindFirstChild("Remote")
+        if remote then
+            PlaySound(Sounds.Click)
+            pcall(function()
+                remote:FireServer(CFrame.new(position), 50)
+            end)
+        else
+            failure("the Gold Bomb has no Remote", true)
+        end
 
-            local char = LocalPlayer.Character
-            local root = char and char:FindFirstChild("HumanoidRootPart")
-            if root then
-                local currentVelocity = root.AssemblyLinearVelocity
-                root.AssemblyLinearVelocity = Vector3.new(currentVelocity.X, CONFIG.LaunchPower, currentVelocity.Z)
-            end
+        local char = LocalPlayer.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if root then
+            local currentVelocity = root.AssemblyLinearVelocity
+            root.AssemblyLinearVelocity = Vector3.new(currentVelocity.X, CONFIG.LaunchPower, currentVelocity.Z)
+        end
 
-            GBJMakeCharacterJump()
-            UnequipGoldBomb()
-            env.VisualsV2Runtime.JumpGunFollowup.Queue("GoldBombJump",actionCharacter,function()
+        GBJMakeCharacterJump()
+        UnequipGoldBomb()
+        lastJumpAt = os.clock()
+        if remote then lastFailure = nil end
+        pcall(function()
+            runtime.JumpGunFollowup.Queue("GoldBombJump",actionCharacter,function()
                 if not alive then return false,false end
                 return equipGunAfterGoldJump,shootAfterGoldJump
             end)
+        end)
 
-            vv2Spawn(function()
-                task.wait(0.1)
-                GBJStartCooldown()
-            end)
-        end
-    end
-
-    vv2Spawn(function()
-        task.wait(0.5)
-        gbjDebounce = false
+        vv2Spawn(function()
+            task.wait(0.1)
+            GBJStartCooldown()
+        end)
     end)
+    gbjBusy = false
+    if not ok then failure(tostring(err), true) end
 end
 
 local function IsHoldingGoldBomb()
@@ -17431,7 +17757,7 @@ GoldBombJumpMaid:GiveTasks(
         if gp then gbjActiveTouches[input] = nil return end
         local data = gbjActiveTouches[input]
         if data and not data.moved and tick() - data.startTime <= TAP_TIME_THRESHOLD then
-            if goldBombJumpEnabled and not gbjOnCooldown and not gbjDebounce then
+            if goldBombJumpEnabled and not gbjOnCooldown() and not gbjBusy then
                 if IsHoldingGoldBomb() and IsPlayerInAir() then
                     FastGoldBombJump()
                 end
@@ -17439,48 +17765,49 @@ GoldBombJumpMaid:GiveTasks(
         end
         gbjActiveTouches[input] = nil
     end),
-    LocalPlayer.CharacterAdded:Connect(function()
+    LocalPlayer.CharacterAdded:Connect(function(character)
         GBJResetCooldown()
         gbjActiveTouches = {}
-        gbjJustRespawned = true
-        local expectedCharacter=LocalPlayer.Character
-        task.wait(1)
-        if not alive or not runtimeAlive or LocalPlayer.Character~=expectedCharacter then return end
-        gbjJustRespawned = false
+        gbjRespawnedAt = os.clock()
+        task.wait(1.2)
+        if not alive or not runtimeAlive or LocalPlayer.Character~=character then return end
         if autoGetGoldBomb then
-            task.wait(0.2)
             pcall(function() Services.ReplicatedStorage.Remotes.Extras.ReplicateToy:InvokeServer("GoldBomb") end)
         end
     end)
 )
+
+buttonSpecs["VV2_GoldBombJump_Big"] = {kind = "big", text = "Gold Bomb Jump", click = FastGoldBombJump, gold = true,
+    wanted = savedToggle("Enable GBJ Big Button"),
+    style = function(button)
+        button.Size = __UD2(0, gbjBigButtonSize, 0, gbjBigButtonSize * 0.375)
+        local left = math.ceil(gbjCooldownUntil - os.clock() - 0.05)
+        button.Text = left > 0 and tostring(left) or "Gold Bomb Jump"
+    end}
+buttonSpecs["VV2_GoldBombJump_Bind"] = {kind = "bind", text = "GBJ", click = FastGoldBombJump, gold = true,
+    wanted = savedToggle("Enable GBJ Bind Button"),
+    style = function(button)
+        button.Size = bindSize(gbjBindButtonSize)
+        local left = math.ceil(gbjCooldownUntil - os.clock() - 0.05)
+        BindableButtons.UpdateBButtonText("VV2_GoldBombJump_Bind", left > 0 and tostring(left) or "GBJ", left > 0, true)
+    end}
 
 gbjSection:AddToggle("Enable Auto Gold Bomb Jump", function(bool) goldBombJumpEnabled = bool end)
 
 gbjSection:AddToggle("Auto-Get Gold Bomb", function(bool)
     autoGetGoldBomb = bool
     if bool then
-        pcall(function() Services.ReplicatedStorage.Remotes.Extras.ReplicateToy:InvokeServer("GoldBomb") end)
+        task.spawn(function() pcall(function() Services.ReplicatedStorage.Remotes.Extras.ReplicateToy:InvokeServer("GoldBomb") end) end)
     end
 end)
 
 gbjSection:AddToggle("Enable GBJ Big Button", function(e)
-    if e then
-        AddBigButton("VV2_GoldBombJump_Big", "Gold Bomb Jump", FastGoldBombJump, true)
-        local btn = BBSystem.Buttons["VV2_GoldBombJump_Big"]
-        if btn then
-            btn.Size = __UD2(0, gbjBigButtonSize, 0, gbjBigButtonSize * 0.375)
-        end
-    else
-        DeleteBigButton("VV2_GoldBombJump_Big")
-    end
+    setButtonWanted("VV2_GoldBombJump_Big", e)
 end)
 
 gbjSection:AddSlider("GBJ Big Button Size", 50, 300, 200, function(value)
     gbjBigButtonSize = value
-    local btn = BBSystem.Buttons["VV2_GoldBombJump_Big"]
-    if btn then
-        btn.Size = __UD2(0, gbjBigButtonSize, 0, gbjBigButtonSize * 0.375)
-    end
+    styleButton("VV2_GoldBombJump_Big")
 end)
 
 gbjSection:AddButton("Reset GBJ Big Button Position", function()
@@ -17493,35 +17820,13 @@ gbjSection:AddButton("Reset GBJ Big Button Position", function()
     shared.Notify("GBJ Big button position reset", 2)
 end)
 
-local gbjBindWanted = false
-local function applyGbjBind(button)
-    gbjBindButton = button
-    if gbjBindButton then
-        local screen = Services.Workspace.CurrentCamera.ViewportSize
-        if screen.X <= 1 or screen.Y <= 1 then screen = Vector2.new(1920, 1080) end
-        gbjBindButton.Size = __UD2(gbjBindButtonSize * (screen.Y / screen.X), 0, gbjBindButtonSize, 0)
-        BindableButtons.UpdateBButtonText("VV2_GoldBombJump_Bind", gbjOnCooldown and "Wait" or "GBJ", gbjOnCooldown, true)
-    end
-end
 gbjSection:AddToggle("Enable GBJ Bind Button", function(e)
-    gbjBindWanted = e
-    if e then
-        BindableButtons.AddBButton("VV2_GoldBombJump_Bind", "GBJ", FastGoldBombJump, true)
-        applyGbjBind(BindableButtons.Buttons["VV2_GoldBombJump_Bind"])
-        watchBindButton("VV2_GoldBombJump_Bind", "GBJ", FastGoldBombJump, true, function() return gbjBindWanted end, applyGbjBind)
-    else
-        bindWatch["VV2_GoldBombJump_Bind"] = nil
-        BindableButtons.DeleteBButton("VV2_GoldBombJump_Bind")
-        gbjBindButton = nil
-    end
+    setButtonWanted("VV2_GoldBombJump_Bind", e)
 end)
 
 gbjSection:AddSlider("GBJ Bind Button Size", 5, 25, 11, function(value)
     gbjBindButtonSize = value / 100
-    if gbjBindButton then
-        local screen = Services.Workspace.CurrentCamera.ViewportSize
-        gbjBindButton.Size = __UD2(gbjBindButtonSize * (screen.Y / screen.X), 0, gbjBindButtonSize, 0)
-    end
+    styleButton("VV2_GoldBombJump_Bind")
 end)
 
 gbjSection:AddButton("Reset GBJ Bind Button Position", function()
@@ -17536,6 +17841,10 @@ end)
 
 gbjSection:AddKeybind("Gold Bomb Jump Keybind", "G", FastGoldBombJump)
 vv2Features.GoldJump=FastGoldBombJump
+resetHooks[#resetHooks+1]=function()
+    equipGunAfterGoldJump=false; shootAfterGoldJump=false; goldBombJumpEnabled=false; autoGetGoldBomb=false
+    GBJResetCooldown()
+end
 
 end
 
@@ -17557,6 +17866,51 @@ section:AddButton("VV2 Reset Bomb Jump Button Positions",function()
     shared.Notify("VV2 Bomb Jump button positions reset",2)
 end)
 
+vv2Features.GetDiagnostics=function()
+    local result={alive=alive,runtimeAlive=runtimeAlive,lastFailure=lastFailure,
+        lastJumpAgo=lastJumpAt and math.floor((os.clock()-lastJumpAt)*10)/10 or nil,buttons={}}
+    if vv2Features.State then
+        local ok,state=pcall(vv2Features.State)
+        if ok then result.state=state end
+    end
+    for id,spec in pairs(buttonSpecs) do
+        local button=liveButton(id)
+        local info={wanted=spec.wanted,live=button~=nil,built=spec.built or 0,error=spec.error}
+        if button then pcall(function() info.path=button:GetFullName();info.visible=button.Visible end) end
+        result.buttons[id]=info
+    end
+    return result
+end
+section:AddButton("VV2 Check Bomb Jump",function()
+    local d=vv2Features.GetDiagnostics()
+    local parts={}
+    for _,id in ipairs({"VV2_BombJump_Bind","VV2_BombJump_Big","VV2_GoldBombJump_Bind","VV2_GoldBombJump_Big"}) do
+        local info=d.buttons[id]
+        if info and info.wanted then
+            local name=id:gsub("^VV2_",""):gsub("_"," ")
+            parts[#parts+1]=name..(info.live and " ready" or (" missing"..(info.error and (" ("..info.error..")") or "")))
+        end
+    end
+    local state=d.state
+    if state then
+        if state.cooldownLeft>0 then parts[#parts+1]="cooldown "..math.ceil(state.cooldownLeft).."s" end
+        parts[#parts+1]=state.holdingBomb and "holding a Fake Bomb" or "Fake Bomb not equipped"
+    end
+    if d.lastJumpAgo then parts[#parts+1]="last jump "..math.floor(d.lastJumpAgo).."s ago" end
+    if d.lastFailure then parts[#parts+1]="last press: "..d.lastFailure end
+    if #parts==0 then parts[1]="no Bomb Jump buttons are turned on" end
+    shared.Notify("Bomb Jump: "..table.concat(parts,", "),3)
+end)
+
+-- build the saved buttons now, then keep them in place
+vv2Spawn(function()
+    for id in pairs(buttonSpecs) do pcall(ensureButton,id) end
+    while alive and runtimeAlive do
+        task.wait(1)
+        for id in pairs(buttonSpecs) do pcall(ensureButton,id) end
+    end
+end)
+
 vv2Features.Close=function()
     if not alive then return end
     alive=false
@@ -17566,12 +17920,23 @@ vv2Features.Close=function()
     end
     -- every step is protected so one failing control can't leave old buttons behind
     for _,controller in ipairs(vv2Controls) do pcall(function() controller:Set(false) end) end
+    for id in pairs(buttonSpecs) do pcall(removeButton,id) end
     for id in pairs(BBSystem.Buttons) do pcall(DeleteBigButton,id) end
     for id in pairs(BindableButtons.Buttons) do pcall(BindableButtons.DeleteBButton,id) end
     pcall(function() RootMaid:Destroy() end)
 end
-env.VisualsV2Runtime.VV2BombJump=vv2Features
-env.VisualsV2Runtime.RegisterReset(vv2Features.Close)
+runtime.VV2BombJump=vv2Features
+runtime.RegisterReset(function()
+    if runtimeAlive then
+        -- the settings file was reset: switch Bomb Jump's options off but keep it working
+        for _,controller in ipairs(vv2Controls) do pcall(function() controller:Set(false) end) end
+        for id,spec in pairs(buttonSpecs) do spec.wanted=false; pcall(removeButton,id) end
+        for _,hook in ipairs(resetHooks) do pcall(hook) end
+        table.clear(savedPositions)
+        return
+    end
+    vv2Features.Close()
+end)
 end)()
 
 ;(function()
@@ -18061,7 +18426,9 @@ local stretchToggle = addToggle(screenSection, "Stretch Screen", stretchScreenEn
     SetCfg("stretchScreenEnabled", state)
 end)
 
-RunService.RenderStepped:Connect(function()
+local stretchLoop
+stretchLoop=RunService.RenderStepped:Connect(function()
+    if not runtimeAlive then stretchLoop:Disconnect();return end
     camera = workspace.CurrentCamera
     if camera and stretchScreenEnabled then
         camera.CFrame = camera.CFrame * CFrame.new(
@@ -18191,7 +18558,9 @@ fogSection:AddColorpicker("Fog Color",fogColor,function(color)
     if fogEnabled and not fogRainbow and not fullbrightEnabled then applyFog() end
 end)
 
-RunService.RenderStepped:Connect(function()
+local fogLoop
+fogLoop=RunService.RenderStepped:Connect(function()
+    if not runtimeAlive then fogLoop:Disconnect();return end
     if fogEnabled and fogRainbow and not fullbrightEnabled then
         Lighting.FogColor=Color3.fromHSV((os.clock()%5)/5,1,1)
     end
@@ -18513,6 +18882,24 @@ local function discoverTargets(force)
     local seen={}
     local names={updateitemframe=true,onitemequipped=true,updatehotbar=true,updatetools=true,
         addtool=true,onbackpackchildadded=true,updatebackpack=true}
+    -- The scan used to look up the owning script (getfenv + GetFullName) and read the
+    -- constants of almost every function in memory, which took many seconds on phones, so
+    -- the extra slots often weren't ready when the round started. A function's source
+    -- already names its script, so those lookups are now only made where they can matter.
+    -- item frames in menus, trades and shops are drawn by shared code that must never be
+    -- patched (its numbers mean something else there)
+    local function foreign(source)
+        return source:find("trade",1,true) or source:find("trading",1,true)
+            or source:find("itemservice",1,true) or source:find("clientservices",1,true)
+            or source:find("inventorymodule",1,true) or source:find("shop",1,true)
+            or source:find("craft",1,true)
+    end
+    local function gameSource(source)
+        return source:find("playergui",1,true) or source:find("playerscripts",1,true)
+            or source:find("startergui",1,true) or source:find("starterplayer",1,true)
+            or source:find("replicatedstorage",1,true) or source:find("replicatedfirst",1,true)
+            or source:find("players.",1,true)
+    end
     local function inspect(f,inherited)
         if seen[f] or type(f)~="function" then return end
         seen[f]=true
@@ -18525,19 +18912,22 @@ local function discoverTargets(force)
             local ok,value=pcall(debugInfo,f,"n")
             if ok then name=tostring(value or ""):lower() end
         end
-        if source:find("trade",1,true) or source:find("trading",1,true) then return end
+        if foreign(source) then return end
         local contextual=inherited or source:find("backpack",1,true) or source:find("hotbar",1,true)
-        if not contextual and type(getfenv)=="function" then
+        local knownSource=#source>2 and source:find(".",1,true)~=nil
+        if not contextual and not knownSource and type(getfenv)=="function" then
             local ok,context=pcall(getfenv,f)
             local script=ok and type(context)=="table" and rawget(context,"script")
             if typeof(script)=="Instance" then
                 local path=script:GetFullName():lower()
-                if path:find("trade",1,true) or path:find("trading",1,true) then return end
+                if foreign(path) then return end
                 contextual=path:find("backpack",1,true) or path:find("hotbar",1,true)
+                source=path;knownSource=true
             end
         end
+        local candidate=names[name] or contextual or (name=="" and (not knownSource or gameSource(source)))
         local constants
-        if type(getconstants)=="function" and (names[name] or contextual or name=="") then
+        if type(getconstants)=="function" and candidate then
             local ok,result=pcall(getconstants,f)
             if ok and type(result)=="table" then constants=result end
         end
@@ -18561,6 +18951,8 @@ local function discoverTargets(force)
         if type(f)=="function" then inspect(f,false) end
         if os.clock()-slice>=0.004 then
             perf.scanYields=perf.scanYields+1
+            local log=env.VisualsV2Runtime.Perf
+            if log then log.Add("Increase Inventory scan",os.clock()-slice) end
             task.wait()
             slice=os.clock()
         end
@@ -18879,6 +19271,7 @@ requestRecovery=function(forceScan)
         local retryScans=0
         local nextCapacityCheck=startedAt+2
         local shortChecks=0
+        local shortNudges=0
         local lastCapacityRescan=-math.huge
         while isCurrentRecovery(token,char) and os.clock()<recoveryDeadline do
             local now=os.clock()
@@ -18915,14 +19308,23 @@ requestRecovery=function(forceScan)
                     else
                         shortChecks=0
                     end
-                    if shortChecks>=2 and now-lastCapacityRescan>=12 then
-                        shortChecks=0;lastCapacityRescan=now
+                    -- the hotbar only re-reads its size when its tools change: try re-adding a
+                    -- toy first, and only look for the limit again if that didn't help
+                    if shortChecks>=2 and shortNudges<2 and os.clock()-lastNudge>=3 then
+                        shortChecks=0;shortNudges=shortNudges+1
+                        task.defer(nudgeHotbar)
+                    elseif shortChecks>=2 and now-lastCapacityRescan>=12 then
+                        shortChecks=0;shortNudges=0;lastCapacityRescan=now
                         targetEpoch=targetEpoch+1
                         targetsScanned=false
                         lastTargetScan=-math.huge
                         force=true
                     end
                 end
+                -- a memory scan is a heavy single step; never start one while a trade is open
+                local trade=env.VisualsV2Runtime.Trade
+                local deferScan=force and trade and trade.active
+                if deferScan then force=false end
                 if inventoryEnabled and (force or (targetsScanned and now>=nextInventoryApply)) then
                     applyInventoryLimit(force)
                     nextInventoryApply=now+(now-startedAt>20 and 3 or 1)
@@ -18932,7 +19334,7 @@ requestRecovery=function(forceScan)
                         task.defer(nudgeHotbar)
                     end
                 end
-                rescanRequested=false
+                rescanRequested=deferScan and true or false
 
                 if autoGetTools then
                     local backpack=getBackpack()
@@ -19089,6 +19491,8 @@ local function watchPlayerGui(gui)
         if child.Name=="MainGUI" then queueGuiRecovery(true) end
     end)
     guiConnections[#guiConnections+1]=gui.DescendantAdded:Connect(function(child)
+        local trade=env.VisualsV2Runtime.Trade
+        if trade and trade.active then return end
         if child:IsA("ObjectValue") then cacheReference(child)
         elseif child:IsA("UIListLayout") and child.Parent then
             for _,slot in ipairs(child.Parent:GetChildren()) do
@@ -19096,6 +19500,19 @@ local function watchPlayerGui(gui)
             end
         elseif child.Name=="EquipButton" or child.Name=="TouchBinding" then queueGuiRecovery(false) end
     end)
+end
+
+-- hotbar changes made while a trade was open were skipped; pick them up afterwards
+do
+    local trade=env.VisualsV2Runtime.Trade
+    if trade then
+        trade.OnChanged(function(active)
+            if active or not alive or not runtimeAlive then return end
+            local gui=observedGui
+            if gui then task.defer(function() if observedGui==gui then scanSlotReferences(gui) end end) end
+            requestRecovery(false)
+        end)
+    end
 end
 
 local inventoryToggle=addToggle(section,"Increase Inventory",inventoryEnabled,function(state)
@@ -19224,6 +19641,21 @@ addToggle(miscSection,"Lock Bind Button POS",lockBindButtonPos,function(state)
     lockBindButtonPos=state
     SetCfg("lockBindButtonPos",state)
     BindableButtons:SetLocked("VisualsV2_SpeedBind",state)
+end)
+-- shows whether a freeze came from the add-on (its own work) or from the game itself
+miscSection:AddButton("VV2 Performance Report",function()
+    local perf=env.VisualsV2Runtime.Perf
+    if not perf then return end
+    local report=perf.Report()
+    local parts={}
+    for index=1,math.min(3,#report.top) do
+        local item=report.top[index]
+        parts[#parts+1]=string.format("%s %d ms",item[1],math.floor(item[2]*1000+0.5))
+    end
+    local text=string.format("Last 30s: add-on work %d ms%s. Longest frame %.2fs%s.",
+        math.floor(report.total*1000+0.5),#parts>0 and (" ("..table.concat(parts,", ")..")") or "",
+        report.longestFrame,report.trade and " (a trade was open)" or "")
+    pcall(shared.Notify,text,3)
 end)
 end)()
 
