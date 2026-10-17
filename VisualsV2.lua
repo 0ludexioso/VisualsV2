@@ -5295,28 +5295,12 @@ local function activateButton(target)
     if touch and tapButton(target,"mouse") then return true end
     return false
 end
--- Searching ODH's menus for the button takes a moment, so the clutch follow-up looks it
--- up right after the jump and the press itself reuses that (for up to 3 seconds).
-local cachedCandidates,cachedAt=nil,-math.huge
-local function currentCandidates(refresh)
-    if not refresh and cachedCandidates and #cachedCandidates>0 and os.clock()-cachedAt<3 then
-        local valid=true
-        for _,item in ipairs(cachedCandidates) do
-            if not item.Parent then valid=false;break end
-        end
-        if valid then return cachedCandidates end
-    end
+env.VisualsV2Runtime.ODHShootMurderer=function()
     local candidates=shootCandidates()
     if #candidates==0 then
         local legacy=button and button.Parent and button or findButton()
         if legacy then candidates[1]=legacy end
     end
-    cachedCandidates,cachedAt=candidates,os.clock()
-    return candidates
-end
-env.VisualsV2Runtime.ODHShootPrepare=function() currentCandidates(true) end
-env.VisualsV2Runtime.ODHShootMurderer=function()
-    local candidates=currentCandidates(false)
     if #candidates==0 then return false,"Could not find ODH's shoot button (enable it in ODH first)" end
     local inspect=getconnections or env.getconnections
     local fire=firesignal or env.firesignal
@@ -16207,41 +16191,14 @@ local function reportFailure(reason)
     stats.error=reason
     pcall(function() shared.Notify("Shoot after clutch: "..tostring(reason),3) end)
 end
-local shootDelays={}
-local function delayGroup(key)
-    key=tostring(key)
-    return key:find("BombJump",1,true) and "BombJump" or key
-end
-local function findGun(character)
-    local backpack=LocalPlayer:FindFirstChildOfClass("Backpack")
-    for _,container in pairs({character,backpack}) do
-        if container then
-            for _,tool in ipairs(container:GetChildren()) do
-                if tool:IsA("Tool") and runtime.ClientWeaponSkins.GetKind(tool)=="Gun" then return tool end
-            end
-        end
-    end
-end
--- The gun goes in hand as early as it safely can and ODH's shoot button is pressed the
--- moment it is there, so the shot leaves near the top of the clutch instead of on the
--- way down (the game still needs a moment to fire it after the press). A Fake Bomb only
--- stays in hand until its jump has reached the server: half a round trip plus a margin,
--- never more than 0.2 s. The optional delay sliders hold the press until that many
--- seconds after the jump.
-runtime.JumpGunFollowup={Queue=function(key,character,options,equipDelay)
+runtime.JumpGunFollowup={Queue=function(key,character,options,delayTime)
     local token={};pending[key]=token
-    local jumpedAt=os.clock()
-    local group=delayGroup(key)
-    if not equipDelay then
-        equipDelay=group=="BombJump" and math.clamp(networkPing()+0.05,0.1,0.2) or 0.04
+    -- Bomb jumps must keep the bomb equipped until the server has processed it,
+    -- so wait roughly one round trip before swapping to the gun.
+    if not delayTime and tostring(key):find("BombJump",1,true) then
+        delayTime=math.clamp(networkPing()*1.5+0.1,0.18,0.6)
     end
-    local timing={key=tostring(key)}
-    stats.last=timing
-    -- look ODH's shoot button up now, so pressing it later is instant
-    task.defer(function()
-        if pending[key]==token and runtime.ODHShootPrepare then pcall(runtime.ODHShootPrepare) end
-    end)
-    task.delay(equipDelay,function()
+    task.delay(delayTime or 0.06,function()
         local function current()
             return runtimeAlive and pending[key]==token and LocalPlayer.Character==character
         end
@@ -16249,44 +16206,47 @@ runtime.JumpGunFollowup={Queue=function(key,character,options,equipDelay)
         local equip,shoot=options()
         if not equip and not shoot then return end
         local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+        local backpack=LocalPlayer:FindFirstChildOfClass("Backpack")
         if not humanoid or humanoid.Health<=0 then return end
-        local gun=findGun(character)
+        local gun
+        for _,container in pairs({character,backpack}) do
+            if container then
+                for _,tool in ipairs(container:GetChildren()) do
+                    if tool:IsA("Tool") and runtime.ClientWeaponSkins.GetKind(tool)=="Gun" then gun=tool;break end
+                end
+            end
+            if gun then break end
+        end
         if not gun then stats.error="No gun in your character or backpack";return end
         if gun.Parent~=character then
             local ok=pcall(function() humanoid:EquipTool(gun) end)
             if not ok then stats.error="The gun could not be equipped";return end
         end
-        timing.equip=os.clock()-jumpedAt
         stats.equips=stats.equips+1
         if not shoot then stats.error=nil;return end
-        local deadline=os.clock()+0.6
-        while gun.Parent~=character and os.clock()<deadline do
-            task.wait()
+        -- wait for the gun to actually be in hand, then fire ODH's shoot button;
+        -- retry a few times because ODH ignores presses while the gun is still settling
+        local waited=0
+        while gun.Parent~=character and waited<0.6 do
+            task.wait(0.03);waited=waited+0.03
             if not current() or humanoid.Health<=0 then return end
         end
         if gun.Parent~=character then reportFailure("the gun never reached your hand");return end
-        timing.inHand=os.clock()-jumpedAt
-        -- one frame for the gun to settle (ODH ignores a press before that), then shoot
-        task.wait()
-        local hold=(shootDelays[group] or 0)-(os.clock()-jumpedAt)
-        if hold>0 then task.wait(hold) end
+        -- give the gun a couple of frames to settle, then press straight away
+        task.wait(0.05)
         local lastReason
-        for _=1,5 do
+        for attempt=1,5 do
             if not current() or humanoid.Health<=0 or gun.Parent~=character then return end
             local _,stillShoot=options()
             if not stillShoot then return end
-            local pressedAt=os.clock()-jumpedAt
             local fired,reason=runtime.ODHShootMurderer()
-            if fired then timing.pressed=pressedAt;stats.shots=stats.shots+1;stats.error=nil;return end
+            if fired then stats.shots=stats.shots+1;stats.error=nil;return end
             lastReason=reason
-            task.wait(0.05)
+            task.wait(0.08)
         end
         reportFailure(lastReason or "ODH's shoot button did not respond")
     end)
-end,SetShootDelay=function(group,seconds)
-    shootDelays[group]=math.clamp(tonumber(seconds) or 0,0,1)
-end,GetLastTiming=function() return stats.last end,
-GetDiagnostics=function() return table.clone(stats) end}
+end,GetDiagnostics=function() return table.clone(stats) end}
 runtime.RegisterReset(function() table.clear(pending) end)
 end)()
 
