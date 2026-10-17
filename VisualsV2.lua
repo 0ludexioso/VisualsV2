@@ -313,7 +313,7 @@ end
 
 loadConfig()
 
-env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-16-skins-2"}
+env.VisualsV2Runtime = {Resetters = {}, Build = "2026-10-17-fixes-1"}
 env.VisualsV2Runtime.RegisterReset = function(callback)
     if type(callback) == "function" then table.insert(env.VisualsV2Runtime.Resetters, callback) end
 end
@@ -3447,19 +3447,53 @@ local function emoteActive()
     return os.clock()<graceUntil
 end
 
+-- Same anti-fling behaviour, but each character's parts are collected once and kept
+-- up to date by events instead of calling GetDescendants on every player every frame.
+local partCache={}
+local function forgetCharacter(character)
+    local record=partCache[character]
+    if not record then return end
+    partCache[character]=nil
+    for _,conn in ipairs(record.conns) do pcall(function() conn:Disconnect() end) end
+end
+local function forgetAllCharacters()
+    for character in pairs(partCache) do forgetCharacter(character) end
+end
+local function cachedParts(character)
+    local record=partCache[character]
+    if record then return record.parts end
+    record={parts={},conns={}}
+    partCache[character]=record
+    for _,part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") then record.parts[part]=true end
+    end
+    record.conns[1]=character.DescendantAdded:Connect(function(part)
+        if part:IsA("BasePart") then record.parts[part]=true end
+    end)
+    record.conns[2]=character.DescendantRemoving:Connect(function(part) record.parts[part]=nil end)
+    record.conns[3]=character.AncestryChanged:Connect(function(_,parent)
+        if not parent then forgetCharacter(character) end
+    end)
+    return record.parts
+end
 local function applyStep()
+    local current={}
     for _,other in ipairs(Players:GetPlayers()) do
         if other~=player then
             local character=other.Character
             if character then
-                for _,part in ipairs(character:GetDescendants()) do
-                    if part:IsA("BasePart") and part.CanCollide then
+                current[character]=true
+                for part in pairs(cachedParts(character)) do
+                    if part.CanCollide then
                         changed[part]=true
                         part.CanCollide=false
                     end
                 end
             end
         end
+    end
+    for character in pairs(partCache) do
+        if not current[character] then forgetCharacter(character) end
     end
 end
 
@@ -3484,6 +3518,7 @@ local function stopProtection()
         stepConn=nil
         pcall(function() conn:Disconnect() end)
     end
+    forgetAllCharacters()
     local restored=restoreCollisions()
     if wasRunning or restored>0 then
         dprint("anti-fling OFF, restored",restored,"parts")
@@ -4616,11 +4651,44 @@ local function roots()
     pcall(function() add(player:FindFirstChildOfClass("PlayerGui")) end)
     return result
 end
+-- Menu entries (ours and ODH's own toggles) must never be mistaken for the
+-- on-screen shoot button: skip option-style labels and anything inside a scroll list.
+local function ownControlText(text)
+    local value=normalize(text)
+    for _,word in ipairs({"after","button","position","keybind","toggle","size"}) do
+        if value:find(word,1,true) then return true end
+    end
+    for _,prefix in ipairs({"vv2","reset","enable","auto","hide","lock","allow"}) do
+        if value:sub(1,#prefix)==prefix then return true end
+    end
+    return false
+end
+local function inMenuList(item)
+    local current=item.Parent
+    while current and current~=game do
+        if current:IsA("ScrollingFrame") then return true end
+        current=current.Parent
+    end
+    return false
+end
+local function onScreen(item)
+    local current=item
+    while current and current~=game do
+        if current:IsA("GuiObject") and not current.Visible then return false end
+        if current:IsA("LayerCollector") and not current.Enabled then return false end
+        current=current.Parent
+    end
+    return item.AbsoluteSize.Magnitude>0
+end
 local function isTarget(item)
-    if not item or not item:IsA("TextButton") then return false end
-    if normalize(item.Text):find("shootmurderer",1,true) then return true end
+    if not item or not item:IsA("TextButton") or inMenuList(item) then return false end
+    local text=normalize(item.Text)
+    if text:find("shootmurderer",1,true) and not ownControlText(text) then return true end
     local label=item:FindFirstChildWhichIsA("TextLabel",true)
-    if label and normalize(label.Text):find("shootmurderer",1,true) then return true end
+    if label then
+        local labelText=normalize(label.Text)
+        if labelText:find("shootmurderer",1,true) and not ownControlText(labelText) then return true end
+    end
     return item:GetAttribute("ShootMurderButton")==true
 end
 local function findButton()
@@ -4774,31 +4842,133 @@ resetShootMurdererPosition=function()
     end
 end
 env.VisualsV2ResetShootMurdererPosition=resetShootMurdererPosition
-env.VisualsV2Runtime.ODHShootMurderer=function()
-    local target=button and button.Parent and button or findButton()
-    if not target then return false,"Enable ODH's Shoot Murderer button first" end
+-- Shoot-after-clutch support. ODH keeps its shoot button inside its own hidden
+-- ScreenGui, so look there first (anchored on the "Identity" CanvasGroup), then
+-- fall back to scanning every GUI root. Text is matched exactly (never our own
+-- "Shoot Murderer After ..." toggles) and the button is activated through its
+-- connections first, then firesignal.
+local odhShootAnchor
+local SHOOT_PREFIXES={"shootmurderer","flickshoot","silentshoot"}
+local function shootRank(value)
+    local text=normalize(value)
+    if text=="" or ownControlText(text) then return nil end
+    for index,prefix in ipairs(SHOOT_PREFIXES) do
+        if text:sub(1,#prefix)==prefix then return index end
+    end
+    return nil
+end
+local function buttonRank(item)
+    if not item or not item:IsA("GuiButton") or inMenuList(item) then return nil end
+    local rank=item:IsA("TextButton") and shootRank(item.Text)
+    if not rank then
+        local label=item:FindFirstChildWhichIsA("TextLabel",true)
+        rank=label and shootRank(label.Text)
+    end
+    if not rank and item:GetAttribute("ShootMurderButton")==true then rank=1 end
+    return rank
+end
+local function isShootButton(item) return buttonRank(item)~=nil end
+local function getOdhGui()
+    local cached=odhShootAnchor
+    if cached and cached.Parent and cached.Parent.Parent and cached.Parent.Parent.Parent then
+        local imageLabel=cached.Parent
+        local canvasGroup=imageLabel.Parent
+        local screenGui=canvasGroup.Parent
+        if imageLabel:IsA("ImageLabel") and canvasGroup:IsA("CanvasGroup") and screenGui:IsA("ScreenGui") then
+            return screenGui
+        end
+    end
+    odhShootAnchor=nil
+    for _,root in ipairs(roots()) do
+        local ok,descendants=pcall(function() return root:GetDescendants() end)
+        if ok then
+            for _,item in ipairs(descendants) do
+                if item.Name=="Identity" and item:IsA("CanvasGroup") then
+                    local imageLabel=item.Parent
+                    local canvasGroup=imageLabel and imageLabel.Parent
+                    local screenGui=canvasGroup and canvasGroup.Parent
+                    if imageLabel and imageLabel:IsA("ImageLabel") and canvasGroup
+                        and canvasGroup:IsA("CanvasGroup") and screenGui and screenGui:IsA("ScreenGui") then
+                        odhShootAnchor=item
+                        return screenGui
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+local function shootCandidates()
+    local found,seen={},{}
+    local function scan(root)
+        if typeof(root)~="Instance" then return end
+        local ok,descendants=pcall(function() return root:GetDescendants() end)
+        if not ok then return end
+        for _,item in ipairs(descendants) do
+            if not seen[item] and isShootButton(item) then
+                seen[item]=true
+                found[#found+1]=item
+            end
+        end
+    end
+    local odh=getOdhGui()
+    if odh then scan(odh) end
+    if #found==0 then
+        for _,root in ipairs(roots()) do scan(root) end
+    end
+    local ranks={}
+    for _,item in ipairs(found) do
+        ranks[item]=(buttonRank(item) or 9)+(onScreen(item) and 0 or 10)
+    end
+    table.sort(found,function(a,b) return ranks[a]<ranks[b] end)
+    return found
+end
+local function activateButton(target)
     local inspect=getconnections or env.getconnections
     if type(inspect)=="function" then
-        for _,signal in ipairs({target.MouseButton1Click,target.Activated}) do
-            local ok,callbacks=pcall(inspect,signal)
+        for _,signal in ipairs({target.MouseButton1Click,target.Activated,target.MouseButton1Down,target.MouseButton1Up}) do
             local fired=false
+            local ok,callbacks=pcall(inspect,signal)
             if ok and type(callbacks)=="table" then
                 for _,connection in ipairs(callbacks) do
                     local readable,callback,enabled=pcall(function() return connection.Function,connection.Enabled end)
-                    if readable and type(callback)=="function" and not ourClickCallbacks[callback]
-                        and enabled~=false then
-                        task.spawn(callback)
-                        fired=true
+                    if readable and enabled~=false and not (type(callback)=="function" and ourClickCallbacks[callback]) then
+                        if type(callback)=="function" then
+                            task.spawn(callback)
+                            fired=true
+                        elseif type(connection.Fire)=="function" then
+                            fired=pcall(connection.Fire,connection) or fired
+                        end
                     end
                 end
             end
             if fired then return true end
         end
-        return false,"ODH's Shoot Murderer callback is not available yet"
     end
     local fire=firesignal or env.firesignal
-    if type(fire)=="function" then return pcall(fire,target.MouseButton1Click) end
-    return false,"This executor cannot activate ODH's Shoot Murderer button"
+    if type(fire)=="function" then
+        for _,signal in ipairs({target.MouseButton1Click,target.Activated}) do
+            if pcall(fire,signal) then return true end
+        end
+    end
+    return false
+end
+env.VisualsV2Runtime.ODHShootMurderer=function()
+    local candidates=shootCandidates()
+    if #candidates==0 then
+        local legacy=button and button.Parent and button or findButton()
+        if legacy then candidates[1]=legacy end
+    end
+    if #candidates==0 then return false,"Could not find ODH's shoot button (enable it in ODH first)" end
+    local inspect=getconnections or env.getconnections
+    local fire=firesignal or env.firesignal
+    if type(inspect)~="function" and type(fire)~="function" then
+        return false,"This executor cannot activate ODH's shoot button"
+    end
+    for _,target in ipairs(candidates) do
+        if activateButton(target) then return true end
+    end
+    return false,"ODH's shoot button did not respond"
 end
 
 local customToggle=addToggle(section,"Enable Button Customization",customEnabled,function(v)
@@ -6734,6 +6904,24 @@ if not scopeOnly then data.gunBehavior["SnowcannonRed"]={["shoot"]={["RollOffMin
 if not scopeOnly then data.gunBehavior["SnowcannonSilver"]={["shoot"]={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381"},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["type"]="ColorSequence",["points"]={{["value"]={["type"]="Color3",["v"]={0.88505381,0.92541391,0.99165332}},["time"]=0},{["value"]={["type"]="Color3",["v"]={0.88505381,0.92541391,0.99165332}},["time"]=1}}},["Width0"]=0.5,["Transparency"]={["type"]="NumberSequence",["points"]={{["value"]=0.40000001,["time"]=0,["envelope"]=0},{["value"]=0.40000001,["time"]=1,["envelope"]=0}}},["Segments"]=10,["Width1"]=0.5,["LightEmission"]=0.5,["CurveSize0"]=0,["CurveSize1"]=0,["Texture"]=""},["animations"]={}} end
 data.gunBehavior["Voidscope"]=scopeOnly and {["shoot"]={["RollOffMinDistance"]=9.17886162,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1,["RollOffMaxDistance"]=9178.86230469,["Volume"]=0.5,["SoundId"]="rbxassetid://130113322",["equalizer"]={["Enabled"]=true,["LowGain"]=-5,["HighGain"]=0,["MidGain"]=0,["Priority"]=0}},["reload"]={["RollOffMinDistance"]=9.17886162,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=0.80000001,["RollOffMaxDistance"]=9178.86230469,["Volume"]=0.5,["SoundId"]="rbxassetid://130113370",["equalizer"]={["Enabled"]=true,["LowGain"]=-5,["HighGain"]=0,["MidGain"]=0,["Priority"]=0}},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["points"]={{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=0},{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=1}},["type"]="ColorSequence"},["Segments"]=10,["Transparency"]={["points"]={{["value"]=0,["time"]=0,["envelope"]=0},{["value"]=0,["time"]=1,["envelope"]=0}},["type"]="NumberSequence"},["Width0"]=0.2,["Width1"]=0.2,["LightEmission"]=0.5,["CurveSize1"]=0,["CurveSize0"]=0,["Texture"]=""},["hold"]="rbxassetid://134818020160275",["animations"]={["CustomHold"]="rbxassetid://134818020160275",["Shoot"]="rbxassetid://124281955370937",["Reload"]="rbxassetid://127786188145385"},["flicker"]={["interval"]=0.01666667,["colors"]={{["type"]="ColorSequence",["points"]={{["time"]=0,["value"]={["type"]="Color3",["v"]={1,1,1}}},{["time"]=1,["value"]={["type"]="Color3",["v"]={1,1,1}}}}},{["type"]="ColorSequence",["points"]={{["time"]=0,["value"]={["type"]="Color3",["v"]={0,0,0}}},{["time"]=1,["value"]={["type"]="Color3",["v"]={0,0,0}}}}}}}} or {["shoot"]={["RollOffMinDistance"]=9.17886162,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1,["RollOffMaxDistance"]=9178.86230469,["Volume"]=0.5,["SoundId"]="rbxassetid://130113322",["equalizer"]={["Enabled"]=true,["LowGain"]=-5,["HighGain"]=0,["MidGain"]=0,["Priority"]=0}},["reload"]={["RollOffMinDistance"]=9.17886162,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=0.80000001,["RollOffMaxDistance"]=9178.86230469,["Volume"]=0.5,["SoundId"]="rbxassetid://130113370",["equalizer"]={["Enabled"]=true,["LowGain"]=-5,["HighGain"]=0,["MidGain"]=0,["Priority"]=0}},["beam"]={["Enabled"]=true,["FaceCamera"]=false,["Color"]={["points"]={{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=0},{["value"]={["v"]={1,1,1},["type"]="Color3"},["time"]=1}},["type"]="ColorSequence"},["Segments"]=10,["Transparency"]={["points"]={{["value"]=0,["time"]=0,["envelope"]=0},{["value"]=0,["time"]=1,["envelope"]=0}},["type"]="NumberSequence"},["Width0"]=0.2,["Width1"]=0.2,["LightEmission"]=0.5,["CurveSize1"]=0,["CurveSize0"]=0,["Texture"]=""},["hold"]="rbxassetid://15666234025",["animations"]={["CustomHold"]="rbxassetid://15666234025",["Shoot"]="rbxassetid://124281955370937",["Reload"]="rbxassetid://127786188145385"},["flicker"]={["interval"]=0.01666667,["colors"]={{["type"]="ColorSequence",["points"]={{["time"]=0,["value"]={["type"]="Color3",["v"]={1,1,1}}},{["time"]=1,["value"]={["type"]="Color3",["v"]={1,1,1}}}}},{["type"]="ColorSequence",["points"]={{["time"]=0,["value"]={["type"]="Color3",["v"]={0,0,0}}},{["time"]=1,["value"]={["type"]="Color3",["v"]={0,0,0}}}}}}}}
 end)()
+-- Default reload sound for every Snow-cannon, Raygun, Ice-piercer, Harvester and
+-- Ginger-scope (trophies included). Without an explicit reload entry these either
+-- stayed silent (scopes mute the native reload) or inherited ODH's custom shoot sound.
+;(function()
+    local families={"snowcannon","raygun","icepiercer","harvester","gingerscope"}
+    for id,behavior in pairs(data.gunBehavior) do
+        if type(id)=="string" and type(behavior)=="table" and behavior.reload==nil then
+            local lower=id:lower()
+            for _,family in ipairs(families) do
+                if lower:find(family,1,true) then
+                    behavior.reload={["SoundId"]="rbxassetid://4753414199",["Volume"]=1,["PlaybackSpeed"]=1,
+                        ["RollOffMode"]="Enum.RollOffMode.Inverse",["RollOffMinDistance"]=10,["RollOffMaxDistance"]=10000}
+                    break
+                end
+            end
+        end
+    end
+end)()
 ;(function()
 if not scopeOnly then data.metadata.Gun["Ace"]={["image"]="http://www.roblox.com/Thumbs/Asset.ashx?format=png&width=250&height=250&assetId=238546577",["itemid"]=238546577,["rarity"]="Rare",["itemname"]="Ace"} end
 if not scopeOnly then data.metadata.Gun["AduriteGun"]={["image"]="http://www.roblox.com/Thumbs/Asset.ashx?format=png&width=250&height=250&assetId=175668921",["itemid"]=196752289,["rarity"]="Uncommon",["itemname"]="Adurite"} end
@@ -8077,7 +8265,7 @@ if not scopeOnly then
         if id:find("Snowcannon",1,true) then behavior.shoot={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=0.5,["SoundId"]="rbxassetid://76834305559381"} end
     end
     for id,behavior in pairs(data.gunBehavior) do
-        if id:find("Raygun",1,true) then behavior.shoot={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=1,["SoundId"]="rbxassetid://76985543647435",["equalizer"]={["Enabled"]=true,["LowGain"]=-5,["HighGain"]=0,["MidGain"]=0,["Priority"]=0}} end
+        if id:find("Raygun",1,true) then behavior.shoot={["RollOffMinDistance"]=10,["RollOffMode"]="Enum.RollOffMode.Inverse",["PlaybackSpeed"]=1.39999998,["RollOffMaxDistance"]=10000,["Volume"]=1,["SoundId"]="rbxassetid://127697544541654",["equalizer"]={["Enabled"]=true,["LowGain"]=-5,["HighGain"]=0,["MidGain"]=0,["Priority"]=0}} end
     end
 end
 
@@ -8116,11 +8304,27 @@ local function create(record,id,category)
     local weapon=category=="Gun" or category=="Knife"
     local grip=weapon and weaponGrip(category,id,record) or record.grip
     if grip then model:SetAttribute("VisualsV2_CapturedGrip",decode(grip)) end
+    local realMeshes={}
+    local assetService=game:GetService("AssetService")
     for _,node in ipairs(record.nodes) do
         local unnecessary=weapon and (node.class=="Sound" or node.class=="EqualizerSoundEffect"
             or node.class=="Animation" or node.class=="BillboardGui" or node.class=="ImageLabel")
         if allowed[node.class] and not unnecessary then
-            local object=Instance.new(node.class=="MeshPart" and "Part" or node.class=="Tool" and "Folder" or node.class)
+            local object
+            if weapon and node.class=="MeshPart" and node.properties and node.properties.MeshId
+                and tostring(node.properties.MeshId)~="" then
+                -- A real MeshPart keeps the pivot (bounding-box centre) every captured
+                -- CFrame/attachment was recorded against and supports SurfaceAppearance.
+                local okMesh,meshPart=pcall(function()
+                    return assetService:CreateMeshPartAsync(node.properties.MeshId)
+                end)
+                if okMesh and typeof(meshPart)=="Instance" and meshPart:IsA("MeshPart") then
+                    object=meshPart;realMeshes[node.nodeId]=true
+                end
+            end
+            if not object then
+                object=Instance.new(node.class=="MeshPart" and "Part" or node.class=="Tool" and "Folder" or node.class)
+            end
             object.Name=node.name
             objects[node.nodeId]=object
             object.Parent=model
@@ -8136,16 +8340,40 @@ local function create(record,id,category)
                     pcall(function() object[key]=decode(value,objects) end)
                 end
             end
+            if node.class=="MeshPart" and realMeshes[node.nodeId] then
+                local textureId=node.properties.TextureID
+                if type(textureId)~="string" or textureId=="" then
+                    -- SurfaceAppearance maps can't always be written from a client, so also
+                    -- give the part its colour map as a plain texture
+                    for _,candidate in ipairs(record.nodes) do
+                        if candidate.class=="SurfaceAppearance" and candidate.parentId==node.nodeId
+                            and candidate.properties and type(candidate.properties.ColorMap)=="string" then
+                            textureId=candidate.properties.ColorMap;break
+                        end
+                    end
+                end
+                if type(textureId)=="string" and textureId~="" then pcall(function() object.TextureID=textureId end) end
+            end
             for key,value in pairs(node.attributes or {}) do pcall(function() object:SetAttribute(key,decode(value,objects)) end) end
             if node.class=="Tool" and node.properties.Grip then
                 model:SetAttribute("VisualsV2_CapturedGrip",decode(node.properties.Grip))
             end
-            if node.class=="MeshPart" then
+            if node.class=="MeshPart" and not realMeshes[node.nodeId] then
                 local mesh=Instance.new("SpecialMesh")
                 mesh.Name="VisualsV2_CapturedMesh"
                 mesh.MeshType=Enum.MeshType.FileMesh
                 mesh.MeshId=node.properties.MeshId or ""
-                mesh.TextureId=node.properties.TextureID or ""
+                local textureId=node.properties.TextureID or ""
+                if textureId=="" then
+                    -- SurfaceAppearance only works on real MeshParts, so carry its colour map over
+                    for _,candidate in ipairs(record.nodes) do
+                        if candidate.class=="SurfaceAppearance" and candidate.parentId==node.nodeId
+                            and candidate.properties and type(candidate.properties.ColorMap)=="string" then
+                            textureId=candidate.properties.ColorMap;break
+                        end
+                    end
+                end
+                mesh.TextureId=textureId
                 local size=node.properties.Size and decode(node.properties.Size) or Vector3.new(1,1,1)
                 local bounds=node.properties.MeshSize and decode(node.properties.MeshSize) or size
                 mesh.Scale=Vector3.new(size.X/math.max(bounds.X,0.000001),size.Y/math.max(bounds.Y,0.000001),size.Z/math.max(bounds.Z,0.000001))
@@ -9366,6 +9594,56 @@ local function gripAttachment(handle)
     return attachment and attachment:IsA("Attachment") and attachment or nil
 end
 
+-- Most guns are only recorded as their belt display. Their CustomAttachment is the
+-- holster mount (tilted for the belt), not where the hand holds the gun, so using it
+-- as the grip left guns such as Chroma Sunrise and Chroma Sands tilted/offset in the
+-- hand. Derive the hand grip from the holster mount using guns whose real held grip
+-- was recorded (same holster tilt = same holster-to-hand relation).
+local GRIP_GROUPS={
+    {rel=CFrame.new(0,0,0,1,0,0,0,0.642767,-0.766069,0,0.766069,0.642767),offset=Vector3.new(0.0000,0.0317,0.4175)}, -- Raygun/SnowcannonChroma
+    {rel=CFrame.new(0,0,0,1,0,0,0,0.207891,-0.978154,0,0.978154,0.207891),offset=Vector3.new(-0.0476,-0.1683,0.4494)}, -- Amerilaser/SharkSeeker
+    {rel=CFrame.new(0,0,0,1,0,0,0,0.707134,-0.707084,0,0.707084,0.707134),offset=Vector3.new(-0.1299,-0.4000,0.8250)}, -- Gingerscope
+    {rel=CFrame.new(0,0,0,2.33013e-05,1,-5.96407e-05,-0.499996,-4.19615e-05,-0.866023,-0.866023,4.73202e-05,0.499996),offset=Vector3.new(-0.1299,-0.5109,0.2655)}, -- Harvester
+    {rel=CFrame.new(0,0,0,1,0,0,0,0,-1,0,1,0),offset=Vector3.new(-0.1500,-0.2443,0.1668)}, -- RedLuger
+    {rel=CFrame.new(0,0,0,1,-8.11207e-06,-1.15843e-05,-8.11207e-06,0.173612,-0.984819,1.15843e-05,0.984819,0.173612),offset=Vector3.new(-0.1000,-0.3337,0.4030)}, -- ElderwoodGun
+}
+-- Exact held grips recorded in MM2, keyed by model mesh. The 2024-2026 event guns
+-- (Floral, Aquarium, Duckies, ... 46 in total) all share mesh 6600918074.
+local KNOWN_GRIPS={
+    ["6600918074"]={size=Vector3.new(1.83,0.95,0.325),
+        grip=CFrame.new(0.6997261,-0.3059801,0.0010891,0,0,1,0,1,0,-1,0,0)},
+}
+local function snapAxis(v)
+    local ax,ay,az=math.abs(v.X),math.abs(v.Y),math.abs(v.Z)
+    if ax>=ay and ax>=az then return Vector3.new(v.X>0 and 1 or -1,0,0) end
+    if ay>=az then return Vector3.new(0,v.Y>0 and 1 or -1,0) end
+    return Vector3.new(0,0,v.Z>0 and 1 or -1)
+end
+local function axisError(frame)
+    local total=0
+    for _,value in ipairs({select(4,frame:GetComponents())}) do
+        local magnitude=math.abs(value)
+        total=total+math.min(magnitude,math.abs(1-magnitude))
+    end
+    return total
+end
+local function estimateHandGrip(holster)
+    local best,bestError
+    for _,group in ipairs(GRIP_GROUPS) do
+        local err=axisError(holster.Rotation*group.rel)
+        if not bestError or err<bestError then best,bestError=group,err end
+    end
+    if not best or bestError>0.5 then return nil end
+    local rotated=holster.Rotation*best.rel
+    local x=snapAxis(rotated.XVector)
+    local y=snapAxis(rotated.YVector)
+    if y.Y<-0.5 then y=-y end
+    if math.abs(x:Dot(y))>0.01 then return nil end
+    local z=x:Cross(y)
+    local basis=CFrame.fromMatrix(Vector3.zero,x,y,z)
+    return CFrame.fromMatrix(holster.Position+basis:VectorToWorldSpace(best.offset),x,y,z)
+end
+
 local function cloneObject(source)
     local previous=source.Archivable
     pcall(function() source.Archivable=true end)
@@ -9548,6 +9826,34 @@ local function buildTemplate(entry)
     while ancestor and ancestor~=clone do
         if ancestor:IsA("Tool") then grip=ancestor.Grip; break end
         ancestor=ancestor.Parent
+    end
+    if entry.kind=="Gun" and not useToolGrip then
+        local meshId
+        if root:IsA("MeshPart") then meshId=assetId(root.MeshId)
+        else
+            local mesh=root:FindFirstChildWhichIsA("SpecialMesh")
+            meshId=mesh and assetId(mesh.MeshId)
+        end
+        local known=meshId and KNOWN_GRIPS[meshId]
+        if known then
+            local scale=Vector3.new(root.Size.X/known.size.X,root.Size.Y/known.size.Y,root.Size.Z/known.size.Z)
+            grip=CFrame.new(known.grip.Position*scale)*known.grip.Rotation
+            useToolGrip=true
+        end
+    end
+    if entry.kind=="Gun" and not useToolGrip and attachment and attachment.Name=="CustomAttachment" and attachmentGrip then
+        local estimated=estimateHandGrip(attachmentGrip)
+        if estimated then grip=estimated;useToolGrip=true end
+    elseif entry.kind=="Gun" and not useToolGrip and not attachment then
+        -- Older guns have no attachment at all. Classic (tall) models share the classic
+        -- grip recorded on Adurite/Predator; modern (long) models use the Raygun-style
+        -- upright grip. Holding a classic gun natively gives the same result as before.
+        local size=root.Size
+        if size.Y>=size.X and size.Y>=size.Z then
+            grip=CFrame.new(0,-0.7*size.Y/1.83,-0.3*size.Z/1.03,1,0,0,0,0,-1,0,1,0);useToolGrip=true
+        elseif size.Z>=size.X then
+            grip=CFrame.new(0,-0.2*size.Y,0.21*size.Z);useToolGrip=true
+        end
     end
 
     local allowed={Model=true,Folder=true,Attachment=true,Bone=true,SurfaceAppearance=true,
@@ -10047,12 +10353,38 @@ local function restoreVisuals(state)
     state.welds=nil
 end
 
+local function meshedParent(decal)
+    local parent=decal.Parent
+    if parent and parent:IsA("BasePart") and not parent:IsA("MeshPart") then
+        for _,child in ipairs(parent:GetChildren()) do
+            if child:IsA("SpecialMesh") and child.MeshType==Enum.MeshType.FileMesh then return parent,child end
+        end
+    end
+end
 local function chromaTargets(model,root)
     local targets={}
+    local seenParts={}
+    for _,decal in ipairs(model:GetDescendants()) do
+        -- A decal only paints the hidden brick, never the mesh, so it shows up as a flat slab
+        -- floating beside the hand. Hide it and tint the mesh itself instead.
+        if decal:IsA("Decal") then
+            local part=meshedParent(decal)
+            if part then
+                local name=compact(decal.Name)
+                if name=="chroma" or name=="glow" or decal:GetAttribute("Chroma")==true then
+                    decal.Transparency=1
+                    if name~="glow" and not seenParts[part] then
+                        seenParts[part]=true
+                        targets[#targets+1]=part
+                    end
+                end
+            end
+        end
+    end
     for _,part in ipairs(model:GetDescendants()) do
         if part:IsA("Decal") and (part:GetAttribute("Chroma")==true or compact(part.Name)=="chroma") then
-            targets[#targets+1]=part
-        elseif part:IsA("BasePart") then
+            if not meshedParent(part) then targets[#targets+1]=part end
+        elseif part:IsA("BasePart") and not seenParts[part] then
             local marked=part:GetAttribute("Chroma")==true or compact(part.Name):find("chroma",1,true)~=nil
             for _,child in ipairs(part:GetChildren()) do
                 if child:IsA("DataModelMesh") and compact(child.Name):find("chroma",1,true) then marked=true end
@@ -10567,7 +10899,7 @@ env.VisualsV2Runtime.ClientWeaponSkins={
     end,
     GetNativeHolster=function(kind) return nativeHolster(player.Character,kind) end,
     GetDiagnostics=function()
-        local report={build="2026-10-16-skins-2",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
+        local report={build="2026-10-17-fixes-1",stats=table.clone(skinStats),errors=table.clone(recentErrors),weapons={}}
         for kind,settings in pairs(kinds) do
             local entry=catalog[kind][settings.selected]
             local key=entry and cacheKey(entry)
@@ -12218,15 +12550,57 @@ end
 local hudNames={equip=true,equipbutton=true,touchbinding=true,touchbindings=true,backpack=true,inventory=true,inventory2=true,
     hotbar=true,toolbar=true,toolslots=true,itembar=true,tools=true,mobile=true,phone=true,touch=true}
 local excluded={shop=true,trade=true,trading=true,spectate=true,
-    spectating=true,roundend=true,endround=true,roundresults=true,victory=true,results=true}
+    spectating=true,roundend=true,endround=true,roundresults=true,victory=true,results=true,
+    emotesmenu=true,emotes=true,emote=true,emoteslist=true,emotewheel=true,playerlist=true,
+    settingsshield=true,ingamemenu=true,topbarapp=true,experiencechat=true,bubblechat=true}
+-- Large menus (Roblox's emote list, MM2's trade inventory) add hundreds of images at
+-- once; checking every sibling for each one froze the game. Names are cached, a cheap
+-- name-only pass rejects irrelevant menus first, and slot lookups are memoised per frame.
+local nameCache=setmetatable({}, {__mode="k"})
+local function compactName(object)
+    local name=object.Name
+    local cached=nameCache[object]
+    if cached and cached[1]==name then return cached[2] end
+    local value=name:lower():gsub("[^%w]","")
+    nameCache[object]={name,value}
+    return value
+end
+local function excludedName(name)
+    return excluded[name] or name:find("trade",1,true)~=nil or name:find("emote",1,true)~=nil
+end
+local referenceMemo=setmetatable({}, {__mode="k"})
+local referenceFrame=0
+connections[#connections+1]=RunService.Heartbeat:Connect(function() referenceFrame=referenceFrame+1 end)
+local function referenceKind(current)
+    local memo=referenceMemo[current]
+    if memo and memo.frame==referenceFrame then return memo.kind,memo.ambiguous end
+    local candidate,ambiguous
+    local references=current:GetChildren()
+    local refs=current:FindFirstChild("Values") or current:FindFirstChild("Data")
+    if refs then for _,reference in ipairs(refs:GetChildren()) do references[#references+1]=reference end end
+    for _,reference in ipairs(references) do
+        if reference:IsA("ObjectValue") and reference.Value and reference.Value:IsA("Tool") then
+            local kind=skins.GetKind(reference.Value)
+            if candidate and kind and candidate~=kind then ambiguous=true;break end
+            candidate=kind or candidate
+        end
+    end
+    referenceMemo[current]={frame=referenceFrame,kind=candidate,ambiguous=ambiguous}
+    return candidate,ambiguous
+end
 local function context(object)
+    local probe=object
+    while probe and not hudRoots[probe] do
+        if excludedName(compactName(probe)) then return nil end
+        probe=probe.Parent
+    end
+    if not probe then return nil end
     local current=object
     local allowed=false
     local fixed
     while current and not hudRoots[current] do
         if current:GetAttribute("VisualsV2_InventoryVisual") then return nil end
-        local name=current.Name:lower():gsub("[^%w]","")
-        if excluded[name] then return nil end
+        local name=compactName(current)
         if name=="inventory" or name=="inventory2" then
             local main=current:FindFirstChild("Main") or current
             if main:FindFirstChild("Weapons") or main:FindFirstChild("Effects") or main:FindFirstChild("Pets") then return nil end
@@ -12235,17 +12609,7 @@ local function context(object)
             or name:find("backpack",1,true) or name:find("hotbar",1,true) or name:find("toolbar",1,true) then allowed=true end
         if not fixed and (name=="gun" or name=="knife") then fixed=name=="gun" and "Gun" or "Knife" end
         if not fixed then
-            local candidate,ambiguous
-            local references=current:GetChildren()
-            local refs=current:FindFirstChild("Values") or current:FindFirstChild("Data")
-            if refs then for _,reference in ipairs(refs:GetChildren()) do references[#references+1]=reference end end
-            for _,reference in ipairs(references) do
-                if reference:IsA("ObjectValue") and reference.Value and reference.Value:IsA("Tool") then
-                    local kind=skins.GetKind(reference.Value)
-                    if candidate and kind and candidate~=kind then ambiguous=true;break end
-                    candidate=kind or candidate
-                end
-            end
+            local candidate,ambiguous=referenceKind(current)
             if not ambiguous then fixed=candidate;if candidate then allowed=true end end
         end
         current=current.Parent
@@ -12361,6 +12725,7 @@ local function bindGui()
             local connected,connection=pcall(function() return root.DescendantAdded:Connect(function(object)
                 pcall(consider,object)
                 if object:IsA("ObjectValue") and object.Parent then
+                    referenceMemo[object.Parent]=nil
                     task.defer(function()
                         if not alive or not runtimeAlive or not object.Parent then return end
                         for _,image in ipairs(object.Parent:GetDescendants()) do pcall(consider,image) end
@@ -12421,7 +12786,7 @@ local effects=env.VisualsV2Runtime.ClientKnifeEffects
 local pets=env.VisualsV2Runtime.ClientPets
 local storage=game:GetService("ReplicatedStorage")
 local mmv=game.GameId==10413186812 or game.PlaceId==93017634738276
-section:AddParagraph("Client-Sided Visuals","Weapons / Knife Effects / Pets\n\nMay be buggy.\n\nOnly enable the visuals you use to improve game performance.\n\nYou can find all visuals in your MM2 inventory.")
+section:AddParagraph("Client-Sided Visuals","Weapons / Knife Effects / Pets\n\nMay be buggy.\n\nOnly enable the visuals you use to improve game performance.\n\nYou can find all visuals in your MM2/MMV inventory.")
 local gunAudio=env.VisualsV2Runtime.GunCosmetics
 addToggle(section,"Use Weapon Shoot Sounds",gunAudio.GetSoundsEnabled(),function(value)
     gunAudio.SetSoundsEnabled(value)
@@ -12463,10 +12828,19 @@ local function disconnect(items)
     table.clear(items)
 end
 
+local inventoryNames=setmetatable({}, {__mode="k"})
+local function inventoryName(object)
+    local name=object.Name
+    local cached=inventoryNames[object]
+    if cached and cached[1]==name then return cached[2] end
+    local value=name:lower():gsub("[^%w]","")
+    inventoryNames[object]={name,value}
+    return value
+end
 local function excludedInventory(object)
     local current=object
     while current and current~=playerGui do
-        local name=current.Name:lower():gsub("[^%w]","")
+        local name=inventoryName(current)
         if name:find("trade",1,true) or name:find("trading",1,true) or name=="shop"
             or name=="spectate" or name=="inspectinventory" or name=="viewinventory" then return true end
         current=current.Parent
@@ -12476,7 +12850,7 @@ end
 
 local function tradeRoot(object)
     if not (object:IsA("GuiObject") or object:IsA("ScreenGui")) or object:IsA("GuiButton") then return false end
-    local name=object.Name:lower():gsub("[^%w]","")
+    local name=inventoryName(object)
     return name=="trade" or name=="trading" or name=="tradegui" or name=="tradinggui"
         or name=="tradeframe" or name=="tradewindow" or name=="tradescreen"
 end
@@ -13372,6 +13746,7 @@ local function bindGui()
                 for _,record in pairs(records) do suspendRecord(record) end
                 schedule()
             end
+            if next(tradeRoots) and inTrade() and not object:GetAttribute(MARKER) then return end
             if own(object) then
                 if object:GetAttribute(MARKER) and excludedInventory(object) then
                     task.defer(function() if object.Parent and excludedInventory(object) then object:Destroy() end end)
@@ -14917,39 +15292,32 @@ local fonts={
     ["Starborn"]=true,
 }
 local fontNames={"SourceSansBold (Original)","Gotham","Arcade","Arial","ArialBold","Cartoon","Fantasy","Highway","Code","Legacy","Starborn"}
--- Starborn by Darrell Flood / Hawtpixel, original TTF, personal-use edition.
--- Source and licensing: https://www.dafont.com/starborn.font
-local starbornFace=nil
-local starbornAttempted=false
-local function loadStarborn()
-    if starbornAttempted then return starbornFace end
-    starbornAttempted=true
-    local asset=getcustomasset or getsynasset or env.getcustomasset or env.getsynasset
-    if type(asset)~="function" or type(write)~="function" then
-        pcall(shared.Notify,"Starborn needs custom-font support in your executor",4)
-        return nil
+for _,entry in ipairs({
+    {"Bangers","Bangers"},{"Creepster","Creepster"},{"Fredoka One","FredokaOne"},
+    {"Luckiest Guy","LuckiestGuy"},{"Permanent Marker","PermanentMarker"},
+    {"Special Elite","SpecialElite"},{"Sarpanch","Sarpanch"},{"Jura","Jura"},
+    {"Oswald","Oswald"},{"Nunito","Nunito"},{"Indie Flower","IndieFlower"},
+    {"Titillium Web","TitilliumWeb"},
+}) do
+    local okFont,value=pcall(function() return Enum.Font[entry[2]] end)
+    if okFont and value and not fonts[entry[1]] then
+        fonts[entry[1]]=value
+        fontNames[#fontNames+1]=entry[1]
     end
-    local ok,result=pcall(function()
-        local encoded="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A4IF/QbtAA0AGwAAATMWHQEUAwYHJjU0EzQlMxYdARQDBgcmNTQTNAGzF9LGQ3jpmARKF9LGQ3jpmAbtK5s6yP67TREvuy0BSOIqK5s6yP67TREvuy0BSOIAAAAAAwAyAIUHAQJbABMAJwA7AAABFxYVFA8BBiMiLwEmNTQ/ATYzMgUXFhUUDwEGIyIvASY1ND8BNjMyBRcWFRQPAQYjIi8BJjU0PwE2MzIBfx9qHRJbXzIzHmodElxeMgKvHmodEltfMjMeah4RXF8xAq8eax4RXF8xMx9pHRJbXzECPhJbXzIzHmodEltfMjIfah0SW18yMx5qHRJbXzIyH2odEltfMjMeah0SW18xMx9qAAAAAQAy/8YGzgZWACgAAAEzMhcVBisBIicEFRYVFAciFRY7ATI3MjcyFxQFByADNCcmNTQ3EiU2BHuA21Q5mSMdb/7FmK+AWb86rb0dQLsj/ee7/e/ldF71kAFO3wZW0l66Iz5aWJGXRxeAowz18ZAMAd5rIVtsn1UBWLVeAAEAMgINApwEVAAOAAABMhMUBwYrASIvATU2NzQBef4luhQnLuJZDD7DBFT+xqVcDK9GXdYUCwAAAAABAAAlvgABBkgYAAAKDbAABAAL/5gABAAO/5gABAAP/3gABAAQ/5gABAAT/5gABAAX/3gABAAZ/5gABAAe/3gABAAf/5gABAAj/5gABAAk/5gABAAl/3gABAAm/5gABAAn/3gABAAq/5gABAAr/5gABAAy/5gABAA0/5gABAA4/5gABABB/5gABABC/3gABABF/5gABABH/5gABABI/5gABABJ/5gABABP/5gABABQ/5gABQAE/3IABQAO/3IABQAPAJYABQAQ/7EABQARAJYABQAS/rUABQAW/7EABQAX/1IABQAe/3IABQAk/rUABQAl/5EABQAr/5EABQAt/pUABQAw/1IABQA9/7EABQBCAJYABQBH/5EABQBI/7EABQBOAJYABQBP/3IABgAE/5gABgAM/3kABgAP/1kABgAR/5gABgAS/5gABgAW/5gABgAX/5gABgAa/5gABgAe/5gABgAi/zoABgAk/3kABgAl/5gABgAt/5gABgAw/5gABgA9/5gABgBA/3kABgBC/3kABgBO/5gABwAH/3oABwAV/5kABwAi/5kABwA2/3oABwBB/3oABwBD/5kABwBL/5kABwBN/5kACAAM/68ACAAO/1AACAAP/68ACAAQ/48ACAAe/68ACAAl/68ACAAr/68ACABH/48ACABI/68ACABJ/68ACABP/1AACABQ/68ACQAF/vwACQAH/zsACQAK/vwACQAN/vwACQAO/zsACQAQ/vwACQAT/5oACQAU/xwACQAV/5oACQAX/5oACQAa/vwACQAc/t0ACQAf/t0ACQAg/5oACQAh/1sACQAi/vwACQAj/3oACQAm/5oACQAq/3oACQAr/5oACQAy/5oACQAz/vwACQA0/5oACQA1/vwACQA2/zsACQA3/vwACQA5/vwACQA6/vwACQA8/vwACQA//vwACQBB/l8ACQBD/3oACQBF/5oACQBH/zsACQBI/3oACQBJ/3oACQBK/vwACQBL/t0ACQBM/vwACQBN/t0ACQBP/xwACQBQ/xwACgAE/3sACgAPAJYACgARAJYACgAS/t0ACgAX/3sACgAe/5oACgAk/t0ACgAl/5oACgAr/5oACgAt/p4ACgAw/3sACgBCAJYACgBOAJYACgBP/5oACwAE/6YACwAG/6YACwAH/2cACwAL/4cACwAO/wkACwAQ/wkACwAR/6YACwAT/0gACwAV/4cACwAX/ygACwAZ/4cACwAc/2cACwAf/wkACwAg/6YACwAj/ygACwAm/0gACwAp/6YACwAq/ygACwAr/0gACwAt/6YACwAy/0gACwA0/0gACwA2/2cACwA4/6YACwBB/ygACwBD/2cACwBF/0gACwBH/wkACwBI/wkACwBJ/ygACwBL/6YACwBN/6YACwBP/wkACwBQ/wkADAAE/7IADAAM/5MADAAP/1QADAAR/7IADAAS/7IADAAW/7IADAAe/7IADAAi/7IADAAk/3MADAAl/7IADAAw/7IADABA/7IADABC/1QADABO/7IADQAE/4UADQAM/6UADQAP/wcADQAR/koADQAS/ycADQAe/0YADQAk/wcADQAl/6UADQAt/ycADQAw/2YADQBC/BMADQBO/sgADgAE/3wADgAF/10ADgAI/10ADgAM/z0ADgAP/10ADgAR/t8ADgAS/5wADgAU/v4ADgAV/3wADgAW/t8ADgAa/oAADgAe/5wADgAi/r8ADgAk/10ADgAl/5wADgAt/5wADgAz/t8ADgA1/v4ADgA3/t8ADgA5/10ADgA6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/34ARAAf/50ARAAj/50ARAAk/34ARAAl/34ARAAm/50ARAAn/50ARAAo/34ARAAq/50ARAAr/50ARAAt/14ARAAw/34ARAAy/50ARAA0/50ARAA9/50ARABB/50ARABC/34ARABF/50ARABH/50ARABI/50ARABJ/50ARABO/14ARABP/50ARABQ/50ARQAM/6YARQAP/4cARQAU/6YARQAa/wkARQAe/6YARQAi/soARQAk/6YARQAl/6YARQAz/2cARQA1/4cARQA3/4cARQA5/4cARQA6/6YARQA7/4cARQA8/2cARQA//4cARQBA/6YARQBC/4cARwAE/4wARwAM/w4ARwAP/y0ARwAR/s8ARwAS/2wARwAW/y0ARwAa/s8ARwAe/6sARwAi/s8ARwAk/y0ARwAl/6sARwAt/2wARwAw/6sARwAz/6sARwA3/6sARwA8/6sARwA9/2wARwA//6sARwBA/q8ARwBC+/oARwBO/y0ASAAa/5oASAAe/5oASAAi/xwASQAO/tMASQAQ/tMASQAT/68ASQAX/5AASQAf/vIASQAj/5AASQAm/68ASQAq/5AASQAr/68ASQAy/68ASQA0/68ASQBB/5AASQBF/68ASQBH/tMASQBI/3AASQBJ/5AASQBP/zEASQBQ/tMASgAE/0IASgAG/6EASgAH/6EASgAL/4EASgAO/uQASgAPAJYASgAQ/yMASgARAJYASgAS/icASgAT/0IASgAW/6EASgAX/sQASgAZ/0IASgAc/6EASgAd/2IASgAe/uQASgAf/0IASgAj/2IASgAk/icASgAl/0IASgAm/2IASgAn/2IASgAo/0IASgAp/4EASgAq/0IASgAr/0IASgAt/mYASgAw/uQASgAx/6EASgAy/0IASgA0/0IASgA2/6EASgA9/6EASgBB/4EASgBCAJYASgBF/0IASgBH/wMASgBI/yMASgBJ/0IASgBL/6EASgBN/6EASgBOAJYASgBP/uQASgBQ/0IASwAE/2IASwAO/uQASwAPAJYASwAQ/yMASwARAJYASwAS/icASwAT/2IASwAX/sQASwAZ/2IASwAd/2IASwAe/uQASwAf/0IASwAj/4EASwAk/icASwAl/2IASwAm/4EASwAn/6EASwAo/2IASwAq/0IASwAr/2IASwAt/oUASwAw/wMASwAy/2IASwA0/2IASwBB/6EASwBCAJYASwBF/2IASwBH/wMASwBI/yMASwBJ/0IASwBOAJYASwBP/uQASwBQ/0IATAAE/1MATAAG/5IATAAH/5IATAAI/7IATAAL/3MATAAO/tUATAAPAJYATAAQ/xQATAARAJYATAAS/hgATAAT/1MATAAV/7IATAAW/7IATAAX/rYATAAZ/zQATAAc/5IATAAd/3MATAAe/vUATAAf/1MATAAj/3MATAAk/hgATAAl/1MATAAm/1MATAAn/1MATAAo/zQATAAp/5IATAAq/1MATAAr/zQATAAs/7IATAAt/lcATAAw/tUATAAx/5IATAAy/1MATAA0/1MATAA2/5IATAA4/7IATAA9/5IATABB/3MATABCAJYATABD/7IATABF/1MATABH/vUATABI/zQATABJ/zQATABL/7IATABN/7IATABOAJYATABP/tUATABQ/zQATQAE/3MATQAL/7IATQAO/tUATQAPAJYATQAQ/xQATQARAJYATQAS/hgATQAT/1MATQAX/rYATQAZ/1MATQAc/7IATQAd/3MATQAe/vUATQAf/1MATQAj/5IATQAk/jgATQAl/3MATQAm/3MATQAn/5IATQAo/1MATQAp/7IATQAq/1MATQAr/3MATQAt/pYATQAw/xQATQAx/7IATQAy/1MATQA0/1MATQA9/7IATQBB/5IATQBCAJYATQBF/1MATQBH/vUATQBI/zQATQBJ/zQATQBOAJYATQBP/tUATQBQ/zQATgAFAJYATgAH/ywATgAKAJYATgAN/hAATgAO/4oATgAQ/ywATgAU/ywATgAV/4oATgAa/o4ATgAc/0sATgAf/wwATgAh/6oATgAi/u0ATgAz/s0ATgA1/wwATgA2/ywATgA3/q4ATgA5/jAATgA6/ywATgA8/s0ATgA//q4ATgBBAJYATgBD/4oATgBH/4oATgBJ/2sATgBKAJYATgBLAJYATgBMAJYATgBNAJYATgBP/4oATgBQ/2sATwAF/34ATwAH/z8ATwAK/34ATwAN/34ATwAO/34ATwAQ/wAATwAU/34ATwAV/54ATwAa/34ATwAc/z8ATwAf/wAATwAh/54ATwAi/34ATwAz/34ATwA1/34ATwA2/18ATwA3/34ATwA5/34ATwA6/34ATwA8/34ATwA//34ATwBB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"
-        local alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-        local values={}
-        for i=1,#alphabet do values[alphabet:sub(i,i)]=i-1 end
-        local bytes={}
-        for i=1,#encoded,4 do
-            local a,b,c,d=encoded:sub(i,i),encoded:sub(i+1,i+1),encoded:sub(i+2,i+2),encoded:sub(i+3,i+3)
-            local n=values[a]*262144+values[b]*4096+(values[c] or 0)*64+(values[d] or 0)
-            bytes[#bytes+1]=string.char(math.floor(n/65536)%256)
-            if c~="=" then bytes[#bytes+1]=string.char(math.floor(n/256)%256) end
-            if d~="=" then bytes[#bytes+1]=string.char(n%256) end
-        end
-        write("VisualsV2_Starborn.ttf",table.concat(bytes))
-        local fontAsset=asset("VisualsV2_Starborn.ttf")
-        write("VisualsV2_Starborn.json",HttpService:JSONEncode({name="Starborn",faces={
-            {name="Regular",weight=400,style="normal",assetId=fontAsset}}}))
-        return Font.new(asset("VisualsV2_Starborn.json"),Enum.FontWeight.Regular,Enum.FontStyle.Normal)
-    end)
-    if ok then starbornFace=result
-    else pcall(shared.Notify,"Starborn could not load on this executor; keeping the original font",4) end
+end
+-- "Starborn" is built on Roblox's own Michroma face (wide, squared techno letters,
+-- the closest built-in match to the Starborn look). It needs no custom-font support,
+-- so it works on every executor.
+local starbornFace=nil
+local function loadStarborn()
+    if starbornFace then return starbornFace end
+    local ok,result=pcall(function() return Font.fromEnum(Enum.Font.Michroma) end)
+    if not ok or not result then
+        ok,result=pcall(function()
+            return Font.new("rbxasset://fonts/families/Michroma.json",Enum.FontWeight.Regular,Enum.FontStyle.Normal)
+        end)
+    end
+    if ok and result then starbornFace=result end
     return starbornFace
 end
 
@@ -15272,8 +15640,24 @@ end)()
 local pending={}
 local runtime=env.VisualsV2Runtime
 local stats={equips=0,shots=0}
+local function networkPing()
+    local ok,value=pcall(function()
+        return game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    value=ok and tonumber(value) or 100
+    return math.clamp(value,0,1000)/1000
+end
+local function reportFailure(reason)
+    stats.error=reason
+    pcall(function() shared.Notify("Shoot after clutch: "..tostring(reason),3) end)
+end
 runtime.JumpGunFollowup={Queue=function(key,character,options,delayTime)
     local token={};pending[key]=token
+    -- Bomb jumps must keep the bomb equipped until the server has processed it,
+    -- so wait roughly one round trip before swapping to the gun.
+    if not delayTime and tostring(key):find("BombJump",1,true) then
+        delayTime=math.clamp(networkPing()*1.5+0.1,0.18,0.6)
+    end
     task.delay(delayTime or 0.06,function()
         local function current()
             return runtimeAlive and pending[key]==token and LocalPlayer.Character==character
@@ -15286,23 +15670,40 @@ runtime.JumpGunFollowup={Queue=function(key,character,options,delayTime)
         if not humanoid or humanoid.Health<=0 then return end
         local gun
         for _,container in pairs({character,backpack}) do
-            for _,tool in ipairs(container:GetChildren()) do
-                if tool:IsA("Tool") and runtime.ClientWeaponSkins.GetKind(tool)=="Gun" then gun=tool;break end
+            if container then
+                for _,tool in ipairs(container:GetChildren()) do
+                    if tool:IsA("Tool") and runtime.ClientWeaponSkins.GetKind(tool)=="Gun" then gun=tool;break end
+                end
             end
             if gun then break end
         end
         if not gun then stats.error="No gun in your character or backpack";return end
-        local ok=pcall(function() humanoid:EquipTool(gun) end)
-        if not ok then stats.error="The gun could not be equipped";return end
+        if gun.Parent~=character then
+            local ok=pcall(function() humanoid:EquipTool(gun) end)
+            if not ok then stats.error="The gun could not be equipped";return end
+        end
         stats.equips=stats.equips+1
         if not shoot then stats.error=nil;return end
-        task.delay(0.08,function()
+        -- wait for the gun to actually be in hand, then fire ODH's shoot button;
+        -- retry a few times because ODH ignores presses while the gun is still settling
+        local waited=0
+        while gun.Parent~=character and waited<0.6 do
+            task.wait(0.03);waited=waited+0.03
+            if not current() or humanoid.Health<=0 then return end
+        end
+        if gun.Parent~=character then reportFailure("the gun never reached your hand");return end
+        task.wait(0.1)
+        local lastReason
+        for attempt=1,4 do
             if not current() or humanoid.Health<=0 or gun.Parent~=character then return end
             local _,stillShoot=options()
             if not stillShoot then return end
             local fired,reason=runtime.ODHShootMurderer()
-            if fired then stats.shots=stats.shots+1;stats.error=nil else stats.error=reason end
-        end)
+            if fired then stats.shots=stats.shots+1;stats.error=nil;return end
+            lastReason=reason
+            task.wait(0.12)
+        end
+        reportFailure(lastReason or "ODH's shoot button did not respond")
     end)
 end,GetDiagnostics=function() return table.clone(stats) end}
 runtime.RegisterReset(function() table.clear(pending) end)
@@ -15953,6 +16354,8 @@ local function Bind_GetStorage()
         sg.Parent = parent
         RootMaid:GiveTask(sg)
     end
+    sg.Enabled = true
+    sg.DisplayOrder = 50
     return sg
 end
 
@@ -15984,10 +16387,12 @@ local function Bind_MakeDraggable(gui, maid, ripple, sound, clickFunc)
                         bind_safecallback(clickFunc)
                     end
 
-                    if not lockBindButtonPos then
+                    local px, py = gui.Position.X.Scale, gui.Position.Y.Scale
+                    local sane = px == px and py == py and math.abs(px) < 10 and math.abs(py) < 10
+                    if not lockBindButtonPos and sane then
                         savedPositions[gui.Name] = {
-                            xs = gui.Position.X.Scale, xo = gui.Position.X.Offset,
-                            ys = gui.Position.Y.Scale, yo = gui.Position.Y.Offset
+                            xs = px, xo = gui.Position.X.Offset,
+                            ys = py, yo = gui.Position.Y.Offset
                         }
                         savePositions(savedPositions)
                     end
@@ -16010,6 +16415,7 @@ local function Bind_MakeDraggable(gui, maid, ripple, sound, clickFunc)
             local delta = input.Position - dragStart
             if delta.Magnitude > 7 then hasMoved = true end
             local screen = gui.Parent.AbsoluteSize
+            if screen.X <= 1 or screen.Y <= 1 then return end
             gui.Position = __UD2(startPos.X.Scale + (delta.X / screen.X), 0, startPos.Y.Scale + (delta.Y / screen.Y), 0)
         end
     end))
@@ -16021,14 +16427,16 @@ function BindableButtons.AddBButton(id, text, clickFunc, isGold)
     local buttonMaid = Maid.new()
     local camera = workspace.CurrentCamera
     local screen = camera.ViewportSize
+    if screen.X <= 1 or screen.Y <= 1 then screen = __V2(1920, 1080) end
     local buttonSizeY = 0.11
     local widthScale = buttonSizeY * (screen.Y / screen.X)
 
     local sp = savedPositions[id]
+    local function finite(value) return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge end
     local xPos, yPos
-    if sp then
-        xPos = sp.xs
-        yPos = sp.ys
+    if sp and finite(sp.xs) and finite(sp.ys) then
+        xPos = math.clamp(sp.xs, 0.03, 0.97)
+        yPos = math.clamp(sp.ys, 0.03, 0.97)
     else
         xPos = 0.1 + ((BindableButtons.Count % 8) * (widthScale + 0.005))
         yPos = 0.9 - (math.floor(BindableButtons.Count / 8) * (buttonSizeY + 0.015))
@@ -16143,7 +16551,7 @@ hiddenGui.IgnoreGuiInset = true
 hiddenGui.Parent = GetSafeGuiRoot()
 RootMaid:GiveTask(hiddenGui)
 
-local section=mainTab:AddSection("Bomb Jump+","Utilities")
+local section=mainTab:AddSection("Bomb Jump Clutch","Utilities")
 local vv2Controls={}
 local function settingKey(label)
     return "vv2BombJump_"..label:gsub("[^%w]","")
@@ -16156,8 +16564,8 @@ local proxy={}
 function proxy:AddLabel(label)
     return section:AddLabel(controlLabel(label))
 end
-function proxy:AddToggle(label,callback)
-    local key=settingKey(label)
+function proxy:AddToggle(label,callback,legacyLabel)
+    local key=settingKey(legacyLabel or label)
     local controller=addToggle(section,controlLabel(label),C(key,false),function(value)
         SetCfg(key,value)
         callback(value)
@@ -16204,7 +16612,7 @@ local _game = game.GameId==10413186812 and "Murder Mystery Modded"
 
 if _game == "Murder Mystery 2" or _game == "Murder Mystery Modded" then
 
-local section = BombJump:AddSection("Bomb Jump+", "MM2/MMV")
+local section = BombJump:AddSection("Bomb Jump Clutch", "MM2/MMV")
 
 local CONFIG = {
     CooldownTime = 22.0,
@@ -16487,9 +16895,36 @@ BombJumpMaid:GiveTasks(
     end)
 )
 
+local bindWatch = {}
+local function watchBindButton(id, text, clickFunc, isGold, wanted, onRebuilt)
+    local token = {}
+    bindWatch[id] = token
+    vv2Spawn(function()
+        while alive and runtimeAlive and bindWatch[id] == token and wanted() do
+            task.wait(1.5)
+            if not (alive and runtimeAlive and bindWatch[id] == token and wanted()) then return end
+            local button = BindableButtons.Buttons[id]
+            local gui = button and button:FindFirstAncestorOfClass("ScreenGui")
+            local healthy = button and button.Parent and button:IsDescendantOf(game)
+                and gui and gui.Enabled and button.Visible
+            if not healthy then
+                BindableButtons.DeleteBButton(id)
+                BindableButtons.AddBButton(id, text, clickFunc, isGold)
+                onRebuilt(BindableButtons.Buttons[id])
+            else
+                local px, py = button.Position.X.Scale, button.Position.Y.Scale
+                if px ~= px or py ~= py or px < -0.02 or px > 1.02 or py < -0.02 or py > 1.02 then
+                    button.Position = __UD2(math.clamp(px == px and px or 0.1, 0.03, 0.97), 0,
+                        math.clamp(py == py and py or 0.9, 0.03, 0.97), 0)
+                end
+            end
+        end
+    end)
+end
+
 section:AddLabel("Bomb Jump Options")
 section:AddToggle("Equip Gun After Bomb Jump",function(value) equipGunAfterJump=value end)
-section:AddToggle("Shoot Murderer After Bomb Jump (ODH)",function(value) shootAfterJump=value end)
+section:AddToggle("Shoot Murderer After Bomb Jump",function(value) shootAfterJump=value end,"Shoot Murderer After Bomb Jump (ODH)")
 section:AddToggle("Enable Auto Bomb Jump", function(bool) bombJumpEnabled = bool end)
 
 section:AddToggle("Auto-Get Fake Bomb", function(bool)
@@ -16530,17 +16965,23 @@ section:AddButton("Reset BJ Big Button Position", function()
     shared.Notify("BJ Big button position reset", 2)
 end)
 
+local function applyBjBind(button)
+    bjBindButton = button
+    if bjBindButton then
+        local screen = Services.Workspace.CurrentCamera.ViewportSize
+        if screen.X <= 1 or screen.Y <= 1 then screen = Vector2.new(1920, 1080) end
+        bjBindButton.Size = __UD2(bindButtonSize * (screen.Y / screen.X), 0, bindButtonSize, 0)
+        BindableButtons.UpdateBButtonText("VV2_BombJump_Bind", onCooldown and "Wait" or "BJ", onCooldown, false)
+    end
+end
 section:AddToggle("Enable BJ Bind Button", function(e)
     bindBtnExists = e
     if e then
         BindableButtons.AddBButton("VV2_BombJump_Bind", "BJ", FastBombJump, false)
-        bjBindButton = BindableButtons.Buttons["VV2_BombJump_Bind"]
-        if bjBindButton then
-            local screen = Services.Workspace.CurrentCamera.ViewportSize
-            bjBindButton.Size = __UD2(bindButtonSize * (screen.Y / screen.X), 0, bindButtonSize, 0)
-            BindableButtons.UpdateBButtonText("VV2_BombJump_Bind", onCooldown and "Wait" or "BJ", onCooldown, false)
-        end
+        applyBjBind(BindableButtons.Buttons["VV2_BombJump_Bind"])
+        watchBindButton("VV2_BombJump_Bind", "BJ", FastBombJump, false, function() return bindBtnExists end, applyBjBind)
     else
+        bindWatch["VV2_BombJump_Bind"] = nil
         BindableButtons.DeleteBButton("VV2_BombJump_Bind")
         bjBindButton = nil
     end
@@ -16577,7 +17018,7 @@ local gbjSection = BombJump:AddSection("Gold Bomb Jump+", "MMV")
 local equipGunAfterGoldJump=false
 local shootAfterGoldJump=false
 gbjSection:AddToggle("Equip Gun After Gold Bomb Jump",function(value) equipGunAfterGoldJump=value end)
-gbjSection:AddToggle("Shoot Murderer After Gold Bomb Jump (ODH)",function(value) shootAfterGoldJump=value end)
+gbjSection:AddToggle("Shoot Murderer After Gold Bomb Jump",function(value) shootAfterGoldJump=value end,"Shoot Murderer After Gold Bomb Jump (ODH)")
 
 local gbjOnCooldown = false
 local goldBombJumpEnabled = false
@@ -16833,16 +17274,24 @@ gbjSection:AddButton("Reset GBJ Big Button Position", function()
     shared.Notify("GBJ Big button position reset", 2)
 end)
 
+local gbjBindWanted = false
+local function applyGbjBind(button)
+    gbjBindButton = button
+    if gbjBindButton then
+        local screen = Services.Workspace.CurrentCamera.ViewportSize
+        if screen.X <= 1 or screen.Y <= 1 then screen = Vector2.new(1920, 1080) end
+        gbjBindButton.Size = __UD2(gbjBindButtonSize * (screen.Y / screen.X), 0, gbjBindButtonSize, 0)
+        BindableButtons.UpdateBButtonText("VV2_GoldBombJump_Bind", gbjOnCooldown and "Wait" or "GBJ", gbjOnCooldown, true)
+    end
+end
 gbjSection:AddToggle("Enable GBJ Bind Button", function(e)
+    gbjBindWanted = e
     if e then
         BindableButtons.AddBButton("VV2_GoldBombJump_Bind", "GBJ", FastGoldBombJump, true)
-        gbjBindButton = BindableButtons.Buttons["VV2_GoldBombJump_Bind"]
-        if gbjBindButton then
-            local screen = Services.Workspace.CurrentCamera.ViewportSize
-            gbjBindButton.Size = __UD2(gbjBindButtonSize * (screen.Y / screen.X), 0, gbjBindButtonSize, 0)
-            BindableButtons.UpdateBButtonText("VV2_GoldBombJump_Bind", gbjOnCooldown and "Wait" or "GBJ", gbjOnCooldown, true)
-        end
+        applyGbjBind(BindableButtons.Buttons["VV2_GoldBombJump_Bind"])
+        watchBindButton("VV2_GoldBombJump_Bind", "GBJ", FastGoldBombJump, true, function() return gbjBindWanted end, applyGbjBind)
     else
+        bindWatch["VV2_GoldBombJump_Bind"] = nil
         BindableButtons.DeleteBButton("VV2_GoldBombJump_Bind")
         gbjBindButton = nil
     end
@@ -17318,7 +17767,7 @@ end)
 local equipGunToggle=addToggle(section,"Equip Gun After Firefly Clutch",equipGunAfterClutch,function(value)
     equipGunAfterClutch=value;SetCfg("fireflyEquipGun",value)
 end)
-local shootToggle=addToggle(section,"Shoot Murderer After Firefly Clutch (ODH)",shootAfterClutch,function(value)
+local shootToggle=addToggle(section,"Shoot Murderer After Firefly Clutch",shootAfterClutch,function(value)
     shootAfterClutch=value;SetCfg("fireflyShootMurderer",value)
 end)
 local timerToggle=addToggle(section,"Enable Firefly Timer",timerEnabled,function(state)
@@ -17813,6 +18262,21 @@ local function disconnectAll(connections)
     table.clear(connections)
 end
 
+-- Patched closures belong to a GUI script; when the game rebuilds its hotbar (round
+-- start, respawn) the old script is destroyed but its closures linger, so applying the
+-- limit to them "works" without changing the live inventory. Detect that and rescan.
+local function targetsStale()
+    if #targetFunctions==0 or type(getfenv)~="function" then return false end
+    for _,f in ipairs(targetFunctions) do
+        local ok,context=pcall(getfenv,f)
+        local script=ok and type(context)=="table" and rawget(context,"script")
+        if typeof(script)~="Instance" then return false end
+        local inGame,attached=pcall(function() return script:IsDescendantOf(game) end)
+        if not inGame or attached then return false end
+    end
+    return true
+end
+
 local function discoverTargets(force)
     if scanningTargets or (targetsScanned and not force) or os.clock()-lastTargetScan<2 then return end
     if type(getgc)~="function" or not ((type(getupvalues)=="function" and type(setupvalue)=="function")
@@ -18104,6 +18568,26 @@ local function orderSelectedTools(char,backpack,token)
     end
     return true
 end
+-- The hotbar only re-reads its capacity when its tool list changes, which is why the
+-- extra slots appeared when the Sheriff gun was handed out. After patching, nudge it
+-- once by re-adding a toy locally (no weapon is touched; nothing is sent to the server).
+local nudgedEpoch,nudgedCharacter,lastNudge=nil,nil,-math.huge
+local function nudgeHotbar()
+    if not alive or not runtimeAlive or not inventoryEnabled or os.clock()-lastNudge<3 then return end
+    local backpack=getBackpack()
+    if not backpack then return end
+    local skins=env.VisualsV2Runtime.ClientWeaponSkins
+    local candidate
+    for _,tool in ipairs(backpack:GetChildren()) do
+        if tool:IsA("Tool") and not (skins and skins.GetKind(tool)) then candidate=tool end
+    end
+    if not candidate then return end
+    lastNudge=os.clock()
+    orderingBackpack=true
+    pcall(function() candidate.Parent=nil;candidate.Parent=backpack end)
+    orderingBackpack=false
+    toyOrderDirty=true
+end
 local function cancelToyRequests()
     for _,attempt in pairs(toyAttempts) do
         if attempt.thread and type(task.cancel)=="function" then pcall(task.cancel,attempt.thread) end
@@ -18147,8 +18631,14 @@ requestRecovery=function(forceScan)
         local scanIndex=1
         local nextInventoryApply=0
         local nextToyRequest=0
+        local nextStaleCheck=0
+        local lastRetryScan=startedAt
+        local retryScans=0
         while isCurrentRecovery(token,char) and os.clock()<recoveryDeadline do
             local now=os.clock()
+            -- keep maintaining the limit for as long as Increase Inventory is on, not
+            -- only for 20 seconds after spawning
+            if inventoryEnabled then recoveryDeadline=math.max(recoveryDeadline,now+20) end
             local humanoid=char:FindFirstChildOfClass("Humanoid")
             if humanoid and humanoid.Health>0 then
                 local force=rescanRequested
@@ -18157,9 +18647,28 @@ requestRecovery=function(forceScan)
                     repeat scanIndex=scanIndex+1
                     until not scanTimes[scanIndex] or now-startedAt<scanTimes[scanIndex]
                 end
+                if inventoryEnabled then
+                    if targetsScanned and now>=nextStaleCheck then
+                        nextStaleCheck=now+1
+                        if targetsStale() then
+                            targetEpoch=targetEpoch+1
+                            targetsScanned=false
+                            lastTargetScan=-math.huge
+                            force=true
+                        end
+                    elseif not targetsScanned and not scanTimes[scanIndex] and retryScans<6 and now-lastRetryScan>=15 then
+                        lastRetryScan=now;retryScans=retryScans+1
+                        force=true
+                    end
+                end
                 if inventoryEnabled and (force or (targetsScanned and now>=nextInventoryApply)) then
                     applyInventoryLimit(force)
-                    nextInventoryApply=now+1
+                    nextInventoryApply=now+(now-startedAt>20 and 3 or 1)
+                    local key=targetEpoch..":"..inventoryLimit
+                    if perf.patchedLimits>0 and (nudgedEpoch~=key or nudgedCharacter~=char) then
+                        nudgedEpoch=key;nudgedCharacter=char
+                        task.defer(nudgeHotbar)
+                    end
                 end
                 rescanRequested=false
 
@@ -18383,7 +18892,7 @@ lifecycleConnections[#lifecycleConnections+1]=player.CharacterAdded:Connect(func
     removingCharacter=nil
     watchCharacter(char)
     watchBackpack(player:FindFirstChildOfClass("Backpack"))
-    requestRecovery(false)
+    requestRecovery(inventoryEnabled)
 end)
 lifecycleConnections[#lifecycleConnections+1]=player.ChildAdded:Connect(function(child)
     if child:IsA("Backpack") then
